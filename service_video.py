@@ -76,7 +76,10 @@ def probe(path: str) -> dict:
         "-of", "json",
         path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # stdin=DEVNULL: never let ffprobe/ffmpeg try to read from whatever
+    # stdin this script itself was given — see trim_clip()'s docstring
+    # note for why that matters here specifically.
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         sys.exit(f"ffprobe failed on {path!r}:\n{result.stderr}")
 
@@ -99,6 +102,43 @@ def probe(path: str) -> dict:
         "fps": fps,
         "has_audio": has_audio,
     }
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+# Used for a still-image intro/outro when no intro_duration/outro_duration is
+# configured, so forgetting to set one doesn't hard-fail a stitch.
+DEFAULT_IMAGE_DURATION = 5.0
+
+
+def is_image_file(path: str) -> bool:
+    """Whether a path looks like a still image (by extension) rather than a
+    video — intro/outro can be either: a still image gets looped into a
+    fixed-length clip via ffmpeg's image2 demuxer instead of being probed
+    for its own duration (most single images have none to probe)."""
+    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def probe_image_dimensions(path: str) -> dict:
+    """Return width/height for a still image via ffprobe. Separate from
+    probe() because a lone image file typically has no "duration" entry at
+    all in ffprobe's output (probe() would KeyError on it) — a still
+    image's duration is a config choice (see stitch()'s intro_duration/
+    outro_duration), not something to read off the file."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        sys.exit(f"ffprobe failed on {path!r}:\n{result.stderr}")
+    streams = json.loads(result.stdout).get("streams") or []
+    if not streams:
+        sys.exit(f"{path!r} has no readable image stream.")
+    return {"width": streams[0]["width"], "height": streams[0]["height"]}
 
 
 def build_filter_complex(
@@ -166,8 +206,13 @@ def expand_output_path(path: str) -> str:
 def stitch(
     intro: str, main_clip: str, outro: str, output: str = "output.mp4",
     transition_duration: float = 1.0, transition: str = "fade", crf: int = 18,
+    intro_duration: float | None = None, outro_duration: float | None = None,
 ) -> str:
-    """Crossfade an intro, main body, and outro clip into one video.
+    """Crossfade an intro, main body, and outro clip into one video. intro/
+    outro can each be either a video or a still image (jpg/png/etc.) — a
+    still image is looped into a fixed-length clip using intro_duration/
+    outro_duration (falling back to DEFAULT_IMAGE_DURATION if not given).
+    main_clip must be a real video (it's the trimmed recording).
     Returns the resolved output path (after strftime expansion)."""
     output = expand_output_path(output)
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
@@ -177,8 +222,24 @@ def stitch(
     for p in paths:
         if not Path(p).is_file():
             sys.exit(f"Input file not found: {p}")
+    if is_image_file(main_clip):
+        sys.exit(f"Main clip must be a video, not a still image: {main_clip!r}")
 
-    clips = [probe(p) for p in paths]
+    is_image_flags = [is_image_file(p) for p in paths]
+    duration_overrides = [intro_duration, None, outro_duration]
+
+    clips = []
+    for p, is_image, override in zip(paths, is_image_flags, duration_overrides):
+        if not is_image:
+            clips.append(probe(p))
+            continue
+        duration = override if override is not None else DEFAULT_IMAGE_DURATION
+        if duration <= 0:
+            sys.exit(f"{p!r} is a still image; its duration must be positive (got {duration}).")
+        if override is None:
+            print(f"No duration set for still image {p!r} — using the default {DEFAULT_IMAGE_DURATION}s.")
+        dims = probe_image_dimensions(p)
+        clips.append({"duration": duration, "width": dims["width"], "height": dims["height"], "has_audio": False})
 
     for name, clip in zip(("intro", "main", "outro"), clips):
         if clip["duration"] <= transition_duration:
@@ -193,9 +254,15 @@ def stitch(
     width -= width % 2
     height -= height % 2
 
-    cmd = ["ffmpeg", "-y"]
-    for p in paths:
-        cmd += ["-i", p]
+    cmd = ["ffmpeg", "-y", "-nostdin"]
+    for p, is_image, clip in zip(paths, is_image_flags, clips):
+        if is_image:
+            # -loop 1: repeat the single frame indefinitely; -t: cut that
+            # off at exactly the chosen duration. Both are input options,
+            # so they have to come before this input's -i.
+            cmd += ["-loop", "1", "-t", f"{clip['duration']:.3f}", "-i", p]
+        else:
+            cmd += ["-i", p]
 
     # Any clip without an audio track gets a silent track generated so the
     # audio crossfade chain always has three real streams to work with.
@@ -226,7 +293,7 @@ def stitch(
     ]
 
     print("Running:", " ".join(cmd))
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         sys.exit("ffmpeg failed.")
 
@@ -390,7 +457,7 @@ def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18) -> st
     the file that actually got written."""
     dst = expand_output_path(dst)
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-y", "-nostdin",
         "-i", src,
         "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
         "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
@@ -398,7 +465,16 @@ def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18) -> st
         dst,
     ]
     print("Running:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    # -nostdin plus stdin=DEVNULL, belt and suspenders: since watch() added
+    # a background thread reading this script's own stdin (for the manual
+    # mark_begin/mark_end/prerender commands) and the GUI now keeps that
+    # stdin open as a pipe rather than leaving it unset/closed, ffmpeg
+    # would otherwise inherit that same pipe and — on at least some
+    # platforms — treat it as something to read interactive keyboard
+    # commands from ("Press [q] to stop, [?] for help"), which can make it
+    # hang waiting on stdin instead of just encoding and exiting. ffmpeg
+    # has no legitimate reason to ever want that here.
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
     return dst
 
 
@@ -477,7 +553,141 @@ def render(state: dict):
             transition_duration=stitch_cfg.get("transition_duration", 1.0),
             transition=stitch_cfg.get("transition", "fade"),
             crf=stitch_cfg.get("crf", 18),
+            intro_duration=stitch_cfg.get("intro_duration"),
+            outro_duration=stitch_cfg.get("outro_duration"),
         )
+
+
+def _write_render_state(recording_path: str, raw_begin_offset: float, raw_end_offset: float, trim_cfg: dict, stitch_cfg: dict) -> tuple[dict, Path]:
+    """Builds the render-state dict and writes it to a timestamped file
+    (base name from trim.state_output) — the same self-contained record
+    documented in the README, used both by the normal end-of-recording
+    path and by prerender, so a render-state file looks identical
+    regardless of which one produced it."""
+    render_state = {
+        "recording_path": recording_path,
+        "raw_begin_offset": format_timestamp(raw_begin_offset),
+        "raw_end_offset": format_timestamp(raw_end_offset),
+        "trim": trim_cfg,
+        "stitch": stitch_cfg,
+    }
+    state_base = Path(trim_cfg.get("state_output", "render_state.json"))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    state_path = state_base.with_name(f"{state_base.stem}_{timestamp}{state_base.suffix}")
+    state_path.write_text(json.dumps(render_state, indent=2))
+    print(f"[watcher] wrote render state -> {state_path}")
+    print(f"[watcher] to redo just the trim/stitch later (no OBS/ProPresenter needed): python {Path(__file__).name} render {state_path}")
+    return render_state, state_path
+
+
+# --------------------------------------------------------------------------
+# Prerender — trim+stitch early, while OBS is still recording, instead of
+# waiting for the recording to actually stop. Only ever triggered manually
+# (see watch()'s "manual" event handling for the 'prerender'/'skip_render'
+# commands).
+# --------------------------------------------------------------------------
+
+RECORDING_EXTENSIONS = {".mkv", ".mp4", ".mov", ".flv", ".ts", ".m4v", ".avi"}
+
+
+def find_active_recording_file(directory: str, max_age_seconds: float = 120.0) -> str | None:
+    """The video file in `directory` most likely to be the one OBS is
+    currently recording to: whichever video file has the newest
+    modification time, since OBS keeps appending to it continuously —
+    everything else in a dedicated recording folder should be static by
+    comparison. Nothing is returned (rather than guessing) if there are no
+    video files at all, or if even the newest one hasn't been touched more
+    recently than max_age_seconds — a plain sanity check against picking a
+    stale file, since a real in-progress recording should be updated far
+    more often than that even accounting for OBS's own write-buffering."""
+    try:
+        candidates = [p for p in Path(directory).iterdir() if p.suffix.lower() in RECORDING_EXTENSIONS]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    if time.time() - newest.stat().st_mtime > max_age_seconds:
+        return None
+    return str(newest)
+
+
+def prerender_worker(events_q: "queue.Queue", recording_path: str, raw_begin_offset: float, raw_end_offset: float, trim_cfg: dict, stitch_cfg: dict):
+    """Runs the real trim+stitch against the recording while OBS is still
+    writing to it, reading only the byte range through raw_end_offset — by
+    the time this is ever called (only valid once an end has been
+    marked), OBS has already moved on to writing the rest of the service
+    past that point. This writes the render-state file and the actual
+    configured trim/stitch outputs, exactly as if recording had already
+    stopped — watch()'s own end-of-recording render is skipped once this
+    succeeds (see the "prerender_result" handling below), so there's no
+    double work and no chance of the two racing on the same output files.
+
+    Relies on Matroska (MKV) not needing a finalized index to be read,
+    unlike MP4's `moov` atom — but a second process reading a file another
+    process still holds open for writing isn't universally guaranteed to
+    work, and there's a real lag between what's been recorded and what's
+    actually been flushed to disk and safe to read (encoder lookahead,
+    Matroska's cluster-based writes) — trying again a little later if this
+    fails is expected and fine, not a sign it'll never work.
+
+    Reports back over events_q rather than returning anything, since this
+    runs in its own background thread — the main watch() loop is what
+    updates its own bookkeeping and prints the final status line."""
+    try:
+        start_offset, end_offset = compute_trim_offsets(
+            raw_begin_offset, raw_end_offset,
+            trim_cfg.get("pad_start_seconds", 0.0), trim_cfg.get("pad_end_seconds", 0.0),
+        )
+        _write_render_state(recording_path, raw_begin_offset, raw_end_offset, trim_cfg, stitch_cfg)
+        trimmed_path = trim_clip(
+            recording_path, trim_cfg.get("output", "body_trimmed.mp4"), start_offset, end_offset,
+            crf=trim_cfg.get("crf", 18),
+        )
+        print(f"[watcher] prerender: trimmed -> {trimmed_path}")
+        if stitch_cfg.get("auto"):
+            final_path = stitch(
+                stitch_cfg["intro"], trimmed_path, stitch_cfg["outro"],
+                output=stitch_cfg.get("output", "final.mp4"),
+                transition_duration=stitch_cfg.get("transition_duration", 1.0),
+                transition=stitch_cfg.get("transition", "fade"),
+                crf=stitch_cfg.get("crf", 18),
+                intro_duration=stitch_cfg.get("intro_duration"),
+                outro_duration=stitch_cfg.get("outro_duration"),
+            )
+            print(f"[watcher] prerender complete -> {final_path}")
+        else:
+            print("[watcher] prerender: trim only (stitch.auto is off)")
+        events_q.put(("prerender_result", time.time(), {"succeeded": True, "recording_path": recording_path}))
+    except SystemExit as e:
+        # trim_clip/stitch/compute_trim_offsets call sys.exit() on error —
+        # in this background thread that only ends the thread (Python's
+        # threading module doesn't propagate SystemExit to the process),
+        # so this is just here to log it cleanly instead of a bare
+        # traceback. watch()'s own end-of-recording render still runs
+        # normally as a fallback once recording actually stops.
+        print(f"[watcher] prerender failed: {e}", file=sys.stderr)
+        events_q.put(("prerender_result", time.time(), {"succeeded": False, "recording_path": recording_path}))
+    except Exception as e:
+        print(f"[watcher] prerender failed: {e!r}", file=sys.stderr)
+        events_q.put(("prerender_result", time.time(), {"succeeded": False, "recording_path": recording_path}))
+
+
+def _get_record_dir(obs_req_client) -> str | None:
+    """Best-effort, for prerender only: learn OBS's recording directory. If
+    this fails for any reason (older OBS/obs-websocket, permissions,
+    whatever), prerender just silently won't be offered for this run —
+    nothing else depends on it."""
+    try:
+        resp = obs_req_client.get_record_directory()
+        return getattr(resp, "record_directory", None) or None
+    except Exception as e:
+        print(
+            f"[watcher] could not determine the OBS recording directory "
+            f"(prerender won't be available this run): {e!r}",
+            file=sys.stderr,
+        )
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -518,6 +728,11 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     t_begin = None
     t_end = None
     output_path = None
+    record_dir = None
+    prerender_thread: threading.Thread | None = None
+    prerendered = False
+    prerender_recording_path: str | None = None
+    skip_render = False
 
     if already_recording:
         print(
@@ -528,6 +743,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
         )
         t0 = time.time()
         state = "WAIT_BEGIN_SLIDE"
+        record_dir = _get_record_dir(obs_req_client)
     else:
         state = "WAIT_RECORD_START"
 
@@ -546,6 +762,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                     t0 = ts
                     state = "WAIT_BEGIN_SLIDE"
                     print(f"[watcher] recording started -> state = {state}")
+                    record_dir = _get_record_dir(obs_req_client)
                 elif out_state == "OBS_WEBSOCKET_OUTPUT_STOPPED":
                     output_path = getattr(payload, "output_path", None)
                     print(f"[watcher] recording stopped, file: {output_path}")
@@ -599,29 +816,117 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                         print(f"[watcher] manually marked end (offset {t_end - t0:.2f}s) -> state = {state}")
                     else:
                         print(f"[watcher] manually re-marked end (offset {t_end - t0:.2f}s)")
+                elif payload == "prerender":
+                    # See prerender_worker()'s docstring. Only meaningful
+                    # once both a start and an end are marked (by either
+                    # means); doesn't change `state` at all, doesn't touch
+                    # t_begin/t_end, and runs in its own background thread
+                    # so the real state machine above keeps running
+                    # undisturbed while it works. If it succeeds, it's
+                    # treated as the real render — watch()'s own end-of-
+                    # recording render is skipped once recording actually
+                    # stops (see the "prerender_result" handling below).
+                    if state != "WAIT_RECORD_STOP":
+                        print(f"[watcher] ignoring prerender — not applicable in state {state}", file=sys.stderr)
+                    elif skip_render:
+                        print("[watcher] ignoring prerender — render was already marked to be skipped", file=sys.stderr)
+                    elif prerendered:
+                        print("[watcher] ignoring prerender — one already completed successfully", file=sys.stderr)
+                    elif prerender_thread is not None and prerender_thread.is_alive():
+                        print("[watcher] ignoring prerender — one is already running", file=sys.stderr)
+                    elif record_dir is None:
+                        print(
+                            "[watcher] ignoring prerender — couldn't determine the OBS "
+                            "recording directory when recording started",
+                            file=sys.stderr,
+                        )
+                    else:
+                        candidate = find_active_recording_file(record_dir)
+                        if candidate is None:
+                            print(
+                                f"[watcher] prerender: couldn't identify an in-progress "
+                                f"recording file in {record_dir} (no video file there was "
+                                "modified recently) — skipping (the real render at end of "
+                                "recording is unaffected)",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(f"[watcher] prerender: starting early trim+stitch from {candidate} in the background")
+                            print("[watcher] prerender status = RUNNING")
+                            prerender_recording_path = candidate
+                            prerender_thread = threading.Thread(
+                                target=prerender_worker,
+                                args=(events_q, candidate, t_begin - t0, t_end - t0, trim_cfg, stitch_cfg),
+                                daemon=True,
+                            )
+                            prerender_thread.start()
+                elif payload == "skip_render":
+                    # Also only meaningful once an end is marked. A one-
+                    # way decision for this run, same as a successful
+                    # prerender — there's nothing to "undo" back to once
+                    # you've said you'll adjust and render this by hand
+                    # later. The render-state file still gets written
+                    # normally once recording stops; only the automatic
+                    # trim+stitch is skipped.
+                    if state != "WAIT_RECORD_STOP":
+                        print(f"[watcher] ignoring skip_render — not applicable in state {state}", file=sys.stderr)
+                    elif prerendered or (prerender_thread is not None and prerender_thread.is_alive()):
+                        print("[watcher] ignoring skip_render — prerender already ran or is running", file=sys.stderr)
+                    elif skip_render:
+                        print("[watcher] ignoring skip_render — already set", file=sys.stderr)
+                    else:
+                        skip_render = True
+                        print("[watcher] render will be skipped once recording stops (the render-state file will still be written)")
+                        print("[watcher] prerender status = SKIPPED")
                 else:
                     print(f"[watcher] ignoring manual command {payload!r} — not applicable in state {state}", file=sys.stderr)
+
+            elif kind == "prerender_result":
+                if payload["succeeded"]:
+                    prerendered = True
+                    print("[watcher] prerender status = DONE")
+                else:
+                    print("[watcher] prerender status = FAILED")
     except KeyboardInterrupt:
         sys.exit("\nInterrupted, exiting without trimming.")
 
     if state == "ABORT" or output_path is None:
         sys.exit(1)
 
-    render_state = {
-        "recording_path": output_path,
-        "raw_begin_offset": format_timestamp(t_begin - t0),
-        "raw_end_offset": format_timestamp(t_end - t0),
-        "trim": trim_cfg,
-        "stitch": stitch_cfg,
-    }
-    state_base = Path(trim_cfg.get("state_output", "render_state.json"))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    state_path = state_base.with_name(f"{state_base.stem}_{timestamp}{state_base.suffix}")
-    state_path.write_text(json.dumps(render_state, indent=2))
-    print(f"[watcher] wrote render state -> {state_path}")
-    print(f"[watcher] to redo just the trim/stitch later (no OBS/ProPresenter needed): python {Path(__file__).name} render {state_path}")
+    if prerender_thread is not None and prerender_thread.is_alive():
+        print("[watcher] waiting for the in-progress prerender to finish before deciding on the final render...")
+        prerender_thread.join()
+        # prerender_thread.join() only waits for the thread; the
+        # "prerender_result" event it puts on events_q still needs to be
+        # drained and processed so `prerendered` reflects the outcome.
+        while True:
+            kind, ts, payload = events_q.get()
+            if kind == "prerender_result":
+                if payload["succeeded"]:
+                    prerendered = True
+                    print("[watcher] prerender status = DONE")
+                else:
+                    print("[watcher] prerender status = FAILED")
+                break
 
-    render(render_state)
+    if prerendered and prerender_recording_path is not None and Path(prerender_recording_path) == Path(output_path):
+        print(f"[watcher] prerender already produced the final result from {output_path} — skipping the normal render")
+    elif skip_render:
+        _write_render_state(output_path, t_begin - t0, t_end - t0, trim_cfg, stitch_cfg)
+        print("[watcher] render skipped (Skip Render was used) — adjust the state file above and render it manually when ready")
+    else:
+        if prerendered:
+            # prerender ran, but against a file that turned out not to be
+            # the actual final recording (a heuristic mismatch) — fall
+            # back to the normal render rather than trust a result that
+            # might be wrong.
+            print(
+                f"[watcher] prerender used {prerender_recording_path!r} but the final "
+                f"recording is {output_path!r} — running the normal render instead",
+                file=sys.stderr,
+            )
+        render_state, _state_path = _write_render_state(output_path, t_begin - t0, t_end - t0, trim_cfg, stitch_cfg)
+        render(render_state)
 
 
 # --------------------------------------------------------------------------
@@ -650,6 +955,8 @@ def main():
     p_stitch.add_argument("-d", "--transition-duration", type=float, default=1.0, help="Crossfade duration in seconds (default: 1.0)")
     p_stitch.add_argument("-t", "--transition", default="fade", help="ffmpeg xfade transition name (default: fade, i.e. a simple crossfade)")
     p_stitch.add_argument("--crf", type=int, default=18, help="x264 CRF quality, lower is better (default: 18)")
+    p_stitch.add_argument("--intro-duration", type=float, default=None, help=f"Seconds to show the intro for, if it's a still image (default: {DEFAULT_IMAGE_DURATION})")
+    p_stitch.add_argument("--outro-duration", type=float, default=None, help=f"Seconds to show the outro for, if it's a still image (default: {DEFAULT_IMAGE_DURATION})")
 
     args = parser.parse_args()
 
@@ -657,6 +964,7 @@ def main():
         stitch(
             args.intro, args.main_clip, args.outro, output=args.output,
             transition_duration=args.transition_duration, transition=args.transition, crf=args.crf,
+            intro_duration=args.intro_duration, outro_duration=args.outro_duration,
         )
         return
 

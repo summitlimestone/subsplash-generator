@@ -38,13 +38,18 @@ those in before running Watch or Learn. Two windows:
 each week. A Live/Offline notebook plus the console:
 
 - **Live** — the watch pipeline. Only the fields that tend to change week
-  to week live here: intro clip, outro clip, and output path. Everything
+  to week live here: intro clip, outro clip, and output path. Intro/outro
+  can each be a video or a still image — a Duration field next to each
+  sets how long to show it for if it is one (ignored otherwise). Everything
   else (connection details, slide matching, trim padding) comes from
   Config. Start/Stop, a status readout tracking the state machine (waiting
-  for recording, waiting for begin/end slide, rendering, done), Mark
-  Sermon Start/Mark Sermon End buttons for manually overriding ProPresenter
-  slide detection live if something goes wrong (each enabled only when
-  it's actually meaningful for the current state), and the render-state
+  for recording, waiting for begin/end slide, rendering, done — plus
+  Prerendering/Done (Prerendered)/Done (Skipped Render), each in their own
+  color, once Prerender or Skip Render is used — see below), Mark Sermon
+  Start/Mark Sermon End buttons for manually overriding ProPresenter slide
+  detection live if something goes wrong, Prerender/Skip Render buttons
+  (see below) for once an end is marked, each enabled only when it's
+  actually meaningful for the current state, and the render-state
   file path captured once Watch finishes, with a button to jump straight
   to Offline if a redo is needed.
 - **Offline** — crossfade an intro, main clip, and outro into the final
@@ -107,11 +112,23 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 | `-d`, `--transition-duration` | `1.0` | Crossfade length in seconds |
 | `-t`, `--transition` | `fade` | Any ffmpeg `xfade` transition name |
 | `--crf` | `18` | x264 quality (lower = better) |
+| `--intro-duration` | `5.0` | Seconds to show `intro` for, **if it's a still image** |
+| `--outro-duration` | `5.0` | Seconds to show `outro` for, **if it's a still image** |
 
 It normalizes all three clips to the main clip's resolution/framerate
 before crossfading (so mismatched intro/outro resolutions are fine), and
 backfills a silent audio track for any clip that doesn't have one so the
 audio crossfade never breaks.
+
+`intro` and `outro` can each be either a video or a still image (jpg, png,
+bmp, tif/tiff, webp) — `main` (the body clip) must always be a video. An
+image is looped into a fixed-length clip using `--intro-duration`/
+`--outro-duration` (or the config/render-state equivalents,
+`stitch.intro_duration`/`stitch.outro_duration`); leaving it unset falls
+back to 5 seconds rather than failing, so forgetting to set one for a
+still-image intro/outro doesn't break the render. It's ignored entirely
+for a clip that's a video — that clip's own duration is used, same as
+always.
 
 Output paths (`-o` here, `trim.output`/`stitch.output` in config/render-
 state files) accept strftime placeholders in the filename, filled in with
@@ -168,6 +185,49 @@ re-marks it at the new time rather than being ignored, so a mistaken mark
 can be corrected. Once an end is marked, start locks — nothing later can
 re-open it.
 
+**Prerender** — once an end is marked, sending `prerender` (the GUI's
+"Prerender" button) starts the real trim+stitch early, reading the
+recording while OBS is still writing the rest of the service, instead of
+waiting for the recording to actually stop. It's treated as the actual
+render, not a preview: it writes the render-state file and the configured
+`trim.output`/`stitch.output` paths, same as if recording had already
+ended, and `watch`'s own end-of-recording render is skipped once it
+succeeds — so there's no double work and no risk of the two racing on the
+same output files. The GUI's status label reads "Prerendering" (blue)
+while it runs and "Done (Prerendered)" (green) once it succeeds.
+
+This relies on Matroska (MKV) not needing a finalized index to be read,
+unlike MP4's `moov` atom — but a second process reading a file OBS still
+holds open for writing isn't universally guaranteed to work, and testing
+this while building it turned up a real, expected failure mode worth
+knowing about: there's a lag between what's been recorded and what's
+actually flushed to disk and safe to read (encoder lookahead, Matroska's
+cluster-based writes) — a couple of seconds isn't necessarily enough,
+even once the on-screen recording time is well past what you need. If
+it's clicked too soon, it just fails and logs why (the status label and
+buttons revert so it's obvious this happened); it's safe to try again a
+bit later.
+
+It finds the in-progress recording file itself, since OBS doesn't expose
+that while still recording (only once it stops) — it asks OBS for the
+configured recording directory, then picks whichever video file there has
+been modified most recently, on the assumption that OBS is the only thing
+actively appending to a file in that folder. That's why it's important
+this points at a directory OBS actually uses for recording and not
+something shared with other video files being actively touched by
+something else.
+
+**Skip Render** — also only available once an end is marked, `skip_render`
+(the GUI's "Skip Render" button) is for when you already know the timing
+will need adjusting by hand afterward: the render-state file still gets
+written normally when recording stops, but the automatic trim+stitch is
+skipped, so nothing runs (and nothing needs cancelling) before you make
+that adjustment and render it yourself via the Offline tab or `render`.
+The status label reads "Done (Skipped Render)" (yellow) as soon as it's
+used — it's a one-way decision for that run, same as a successful
+prerender, so Mark Start/Mark End/Prerender/Skip Render are all disabled
+afterward; there's nothing left to decide.
+
 ### `learn` — find your begin/end slide UIDs
 
 ```
@@ -216,7 +276,8 @@ ProPresenter or OBS is made.
    Step through your slides in ProPresenter — copy the two UIDs you need
    into `begin_slide.uid` / `end_slide.uid` in the config.
 6. Fill in `stitch.intro` / `stitch.outro` with your intro/outro clip
-   paths.
+   paths — each can be a video or a still image; if it's an image, also
+   set `stitch.intro_duration` / `stitch.outro_duration` (in seconds).
 7. Before a real service, do a dry run with `watch -c config.json --debug`
    and confirm the begin/end slides are detected correctly.
 
@@ -246,8 +307,10 @@ ProPresenter or OBS is made.
   },
   "stitch": {
     "auto": true,
-    "intro": "intro.mp4",
-    "outro": "outro.mp4",
+    "intro": "intro.mp4",                 // video, or a still image (jpg/png/bmp/tif/tiff/webp)
+    "outro": "outro.mp4",                 // same
+    "intro_duration": 5.0,                // optional, default 5.0 — only used if intro is a still image
+    "outro_duration": 5.0,                // optional, default 5.0 — only used if outro is a still image
     "output": "final.mp4",
     "transition_duration": 1.0,
     "transition": "fade",                 // optional, default "fade" — any ffmpeg xfade transition name
@@ -259,6 +322,10 @@ ProPresenter or OBS is made.
 `pad_start_seconds`/`pad_end_seconds` accept fractional seconds and
 negative values. Both use the same sign convention: positive pushes that
 cut point forward (later) in time, negative pushes it back (earlier).
+
+`intro_duration`/`outro_duration` are ignored for a video clip (its own
+duration is used, same as always) — they only matter when `intro`/`outro`
+is a still image, since an image has no duration of its own to read.
 
 `stitch.transition` and `stitch.crf` apply to the *final* crossfaded
 output produced by `render`'s auto-stitch step, separately from

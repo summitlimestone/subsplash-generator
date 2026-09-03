@@ -80,6 +80,8 @@ def default_config() -> dict:
             "auto": True,
             "intro": "",
             "outro": "",
+            "intro_duration": DEFAULT_IMAGE_DURATION,
+            "outro_duration": DEFAULT_IMAGE_DURATION,
             "output": "final.mp4",
             "transition_duration": 1.0,
             "transition": "fade",
@@ -89,6 +91,7 @@ def default_config() -> dict:
 STATE_RE = re.compile(r"state = (\w+)")
 RENDER_STATE_PATH_RE = re.compile(r"wrote render state -> (.+)$")
 SLIDE_RE = re.compile(r'^uid: "(.*)"\s+text: (.*)$')
+PRERENDER_STATUS_RE = re.compile(r"prerender status = (\w+)")
 
 # service_video.py's internal state machine names, relabeled for display —
 # names not listed here (WAIT_RECORD_START etc.) show as-is.
@@ -98,6 +101,13 @@ WATCH_STATE_LABELS = {
 
 JSON_FILETYPES = [("JSON files", "*.json"), ("All files", "*.*")]
 VIDEO_FILETYPES = [("Video files", "*.mp4 *.mov *.mkv *.m4v *.avi"), ("All files", "*.*")]
+# Intro/outro can be either a video or a still image (see IMAGE_DURATION_HELP) —
+# their Browse buttons use this instead of VIDEO_FILETYPES.
+INTRO_OUTRO_FILETYPES = [
+    ("Video/image files", "*.mp4 *.mov *.mkv *.m4v *.avi *.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
+    ("All files", "*.*"),
+]
+DEFAULT_IMAGE_DURATION = 5.0
 
 # Matches the Summit Limestone brand palette used by the companion
 # subsplash-form site (summitlimestone.github.io/subsplash-form) — its
@@ -119,6 +129,10 @@ PALETTE = {
     "danger": "#c0392b",        # site --error (same in both modes)
     "danger_hover": "#cb5d51",
     "success": "#78a22f",
+    # Not from the site's own palette (it has no info/warning roles) —
+    # picked to match its muted, earthy tone rather than a neon blue/gold.
+    "info": "#3f7fb3",
+    "warning": "#c9971f",
     # Shared across every button style's disabled state (plain, accent,
     # danger alike) — darker than --bg itself so a disabled button still
     # reads as a recessed element instead of blending into the page.
@@ -227,6 +241,27 @@ TIMESTAMP_HELP = (
     "final_2026-09-01_14-30-05.mp4. Common codes: %Y year, %m month, %d "
     "day, %H hour (24h), %M minute, %S second. Only the filename itself "
     "is expanded, not any folder in the path."
+)
+
+PRERENDER_HELP = (
+    "Starts trim+stitch now, reading the recording while OBS is still "
+    "writing it, instead of waiting for the recording to stop. Counts as "
+    "the real render — nothing more runs automatically once recording "
+    "actually ends. Can fail if clicked too soon after marking the end "
+    "(the encoder hasn't flushed that far yet) — safe to just try again."
+)
+
+SKIP_RENDER_HELP = (
+    "Writes the render-state file as usual when recording stops, but "
+    "skips the automatic trim+stitch — for when you already know the "
+    "timing will need adjusting by hand afterward. Use the Offline tab or "
+    "'render' on that file whenever you're ready."
+)
+
+IMAGE_DURATION_HELP = (
+    "Only used if the clip above is a still image (jpg/png/etc.) rather "
+    f"than a video — how long to show it for. Ignored for a video clip. "
+    f"Defaults to {DEFAULT_IMAGE_DURATION}s if left blank."
 )
 
 
@@ -351,6 +386,14 @@ class App(tk.Tk):
         # recording/offset info; cleared (or left stale but unused) when
         # Main clip no longer matches — see _run_render().
         self._offline_raw_state: dict | None = None
+        # Set once Prerender succeeds or Skip Render is used, so that
+        # terminal status ("Done (Prerendered)"/"Done (Skipped Render)")
+        # sticks instead of being overwritten by the state-machine
+        # transitions (e.g. "-> state = TRIM" when recording stops) or the
+        # generic "done" the process exiting would otherwise set — see
+        # _handle_watch_line()/_on_process_exit(). Reset at the start of
+        # each watch run.
+        self._prerender_locked = False
         self._queue: "queue.Queue" = queue.Queue()
         self.runner = ProcessRunner(
             on_line=lambda line: self._queue.put(("line", line)),
@@ -876,17 +919,25 @@ class App(tk.Tk):
             "then trims and stitches automatically. Connection, slide-matching, and "
             "trim settings live in Config.",
             style="Muted.TLabel", wraplength=760, justify="left",
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
 
         self._labeled_entry(frame, 1, "Intro clip", "stitch_intro")
-        self._add_browse(frame, 1, "stitch_intro", filetypes=VIDEO_FILETYPES)
+        self._add_browse(frame, 1, "stitch_intro", filetypes=INTRO_OUTRO_FILETYPES)
+        self._labeled_spinbox(
+            frame, 1, "Duration (s)", "stitch_intro_duration", from_=0.1, to=120.0,
+            default=str(DEFAULT_IMAGE_DURATION), width=6, col=4, help_text=IMAGE_DURATION_HELP,
+        )
         self._labeled_entry(frame, 2, "Outro clip", "stitch_outro")
-        self._add_browse(frame, 2, "stitch_outro", filetypes=VIDEO_FILETYPES)
+        self._add_browse(frame, 2, "stitch_outro", filetypes=INTRO_OUTRO_FILETYPES)
+        self._labeled_spinbox(
+            frame, 2, "Duration (s)", "stitch_outro_duration", from_=0.1, to=120.0,
+            default=str(DEFAULT_IMAGE_DURATION), width=6, col=4, help_text=IMAGE_DURATION_HELP,
+        )
         self._labeled_entry(frame, 3, "Output path", "stitch_output", help_text=TIMESTAMP_HELP)
         self._add_browse(frame, 3, "stitch_output", save=True, filetypes=VIDEO_FILETYPES)
 
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 10))
+        btn_row.grid(row=4, column=0, columnspan=6, sticky="w", pady=(10, 10))
         start_btn = ttk.Button(btn_row, text="Start Watch", style="Accent.TButton", command=self._run_watch)
         start_btn.pack(side="left")
         self._start_buttons.append(start_btn)
@@ -898,13 +949,23 @@ class App(tk.Tk):
             btn_row, text="Mark Sermon End", command=self._mark_sermon_end, state="disabled",
         )
         self.mark_end_btn.pack(side="left", padx=(8, 0))
+        self.prerender_btn = ttk.Button(
+            btn_row, text="Prerender", command=self._prerender, state="disabled",
+        )
+        self.prerender_btn.pack(side="left", padx=(8, 0))
+        Tooltip(self.prerender_btn, PRERENDER_HELP, font=self.ui_font)
+        self.skip_render_btn = ttk.Button(
+            btn_row, text="Skip Render", command=self._skip_render, state="disabled",
+        )
+        self.skip_render_btn.pack(side="left", padx=(8, 0))
+        Tooltip(self.skip_render_btn, SKIP_RENDER_HELP, font=self.ui_font)
         self.watch_debug_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn_row, text="Debug (print every raw message)", variable=self.watch_debug_var).pack(
+        ttk.Checkbutton(btn_row, text="Debug", variable=self.watch_debug_var).pack(
             side="left", padx=(10, 0)
         )
 
         status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
-        status_frame.grid(row=5, column=0, columnspan=3, sticky="ew")
+        status_frame.grid(row=5, column=0, columnspan=6, sticky="ew")
         self.watch_state_var = tk.StringVar(value="idle")
         self.watch_status_label = ttk.Label(
             status_frame, textvariable=self.watch_state_var,
@@ -913,7 +974,7 @@ class App(tk.Tk):
         self.watch_status_label.pack(side="left")
 
         state_path_frame = ttk.Frame(frame, padding=(0, 10, 0, 0))
-        state_path_frame.grid(row=6, column=0, columnspan=3, sticky="ew")
+        state_path_frame.grid(row=6, column=0, columnspan=6, sticky="ew")
         ttk.Label(state_path_frame, text="Last render-state file:").pack(side="left")
         self.render_state_var = tk.StringVar()
         ttk.Entry(state_path_frame, textvariable=self.render_state_var, state="readonly").pack(
@@ -948,18 +1009,26 @@ class App(tk.Tk):
             "Main clip is assumed to already be trimmed and the timestamps are "
             "ignored. Doesn't need a config file or any live connection either way.",
             style="Muted.TLabel", wraplength=760, justify="left",
-        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
+        ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
         ttk.Button(frame, text="Load from JSON…", command=self._browse_render_state).grid(
             row=1, column=0, sticky="w", pady=(0, 10)
         )
 
         self._labeled_entry(frame, 2, "Intro clip", "st_intro", colspan=3)
-        self._add_browse(frame, 2, "st_intro", filetypes=VIDEO_FILETYPES, col=3)
+        self._add_browse(frame, 2, "st_intro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
+        self._labeled_spinbox(
+            frame, 2, "Duration (s)", "st_intro_duration", from_=0.1, to=120.0,
+            default=str(DEFAULT_IMAGE_DURATION), width=6, col=5, help_text=IMAGE_DURATION_HELP,
+        )
         self._labeled_entry(frame, 3, "Main clip", "st_main", colspan=3)
         self._add_browse(frame, 3, "st_main", filetypes=VIDEO_FILETYPES, col=3)
         self._labeled_entry(frame, 4, "Outro clip", "st_outro", colspan=3)
-        self._add_browse(frame, 4, "st_outro", filetypes=VIDEO_FILETYPES, col=3)
+        self._add_browse(frame, 4, "st_outro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
+        self._labeled_spinbox(
+            frame, 4, "Duration (s)", "st_outro_duration", from_=0.1, to=120.0,
+            default=str(DEFAULT_IMAGE_DURATION), width=6, col=5, help_text=IMAGE_DURATION_HELP,
+        )
         self._labeled_entry(frame, 5, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
         self._add_browse(frame, 5, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
         self.vars["st_output"].set("output.mp4")
@@ -1001,6 +1070,10 @@ class App(tk.Tk):
             self.vars["st_intro"].set(stitch_cfg["intro"])
         if "outro" in stitch_cfg:
             self.vars["st_outro"].set(stitch_cfg["outro"])
+        if "intro_duration" in stitch_cfg:
+            self.vars["st_intro_duration"].set(str(stitch_cfg["intro_duration"]))
+        if "outro_duration" in stitch_cfg:
+            self.vars["st_outro_duration"].set(str(stitch_cfg["outro_duration"]))
         if "output" in stitch_cfg:
             self.vars["st_output"].set(stitch_cfg["output"])
         if "transition_duration" in stitch_cfg:
@@ -1156,6 +1229,8 @@ class App(tk.Tk):
         self.vars["stitch_auto"].set(bool(stitch.get("auto", True)))
         self.vars["stitch_intro"].set(stitch.get("intro", ""))
         self.vars["stitch_outro"].set(stitch.get("outro", ""))
+        self.vars["stitch_intro_duration"].set(str(stitch.get("intro_duration", DEFAULT_IMAGE_DURATION)))
+        self.vars["stitch_outro_duration"].set(str(stitch.get("outro_duration", DEFAULT_IMAGE_DURATION)))
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
         self.vars["stitch_transition_duration"].set(str(stitch.get("transition_duration", 1.0)))
         self.vars["stitch_transition"].set(stitch.get("transition", "fade"))
@@ -1228,6 +1303,12 @@ class App(tk.Tk):
                 "auto": bool(v["stitch_auto"].get()),
                 "intro": v["stitch_intro"].get().strip(),
                 "outro": v["stitch_outro"].get().strip(),
+                "intro_duration": to_float(
+                    v["stitch_intro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Intro duration"
+                ),
+                "outro_duration": to_float(
+                    v["stitch_outro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
+                ),
                 "output": v["stitch_output"].get().strip() or "final.mp4",
                 "transition_duration": to_float(
                     v["stitch_transition_duration"].get().strip() or "1.0", "Transition duration"
@@ -1315,11 +1396,17 @@ class App(tk.Tk):
             self._log(f"[gui] {label} exited with code {code}.\n")
         if label == "watch":
             # render() doesn't print another "state = ..." line, so the
-            # status label would otherwise freeze on the last live state.
-            self.watch_state_var.set("done" if code == 0 else f"stopped (exit {code})")
-            self.watch_status_label.configure(
-                foreground=PALETTE["success"] if code == 0 else PALETTE["danger"]
-            )
+            # status label would otherwise freeze on the last live state —
+            # except when Prerender/Skip Render already set a terminal
+            # status (_prerender_locked), which should stick rather than
+            # being overwritten by a plain "done". A real failure (nonzero
+            # exit) still always gets surfaced, locked or not.
+            if code != 0:
+                self.watch_state_var.set(f"stopped (exit {code})")
+                self.watch_status_label.configure(foreground=PALETTE["danger"])
+            elif not self._prerender_locked:
+                self.watch_state_var.set("done")
+                self.watch_status_label.configure(foreground=PALETTE["success"])
             self._update_mark_buttons(None)
         self._current_command = None
         self._set_busy(False)
@@ -1339,27 +1426,81 @@ class App(tk.Tk):
         m = STATE_RE.search(line)
         if m:
             raw_state = m.group(1)
-            self.watch_state_var.set(WATCH_STATE_LABELS.get(raw_state, raw_state))
-            self.watch_status_label.configure(foreground=PALETTE["accent"])
+            # Once Prerender/Skip Render has set a terminal status, later
+            # state-machine transitions (recording stopping moves the
+            # internal state to TRIM even though nothing more will
+            # actually render) shouldn't overwrite it.
+            if not self._prerender_locked:
+                self.watch_state_var.set(WATCH_STATE_LABELS.get(raw_state, raw_state))
+                self.watch_status_label.configure(foreground=PALETTE["accent"])
             self._update_mark_buttons(raw_state)
         m2 = RENDER_STATE_PATH_RE.search(line)
         if m2:
             path = m2.group(1).strip()
             self.render_state_var.set(path)
             self._log(f"[gui] captured render-state path for the Offline tab: {path}")
+        m3 = PRERENDER_STATUS_RE.search(line)
+        if m3:
+            self._handle_prerender_status(m3.group(1))
 
     def _update_mark_buttons(self, raw_state: str | None):
         """Mirrors service_video.py's own guard on manual mark_begin/
-        mark_end commands (see watch()'s "manual" event handling) so a
-        click is never possible when the backend would just ignore it:
-        Mark Start is live in WAIT_BEGIN_SLIDE (first mark) and
-        WAIT_END_SLIDE (re-mark); Mark End is live in WAIT_END_SLIDE
-        (first mark) and WAIT_RECORD_STOP (re-mark) — and once end is
-        marked, start locks (WAIT_RECORD_STOP has Start disabled)."""
+        mark_end/prerender/skip_render commands (see watch()'s "manual"
+        event handling) so a click is never possible when the backend
+        would just ignore it: Mark Start is live in WAIT_BEGIN_SLIDE
+        (first mark) and WAIT_END_SLIDE (re-mark); Mark End is live in
+        WAIT_END_SLIDE (first mark) and WAIT_RECORD_STOP (re-mark) — and
+        once end is marked, start locks (WAIT_RECORD_STOP has Start
+        disabled). Prerender/Skip Render both need an end already marked."""
         start_enabled = raw_state in ("WAIT_BEGIN_SLIDE", "WAIT_END_SLIDE")
         end_enabled = raw_state in ("WAIT_END_SLIDE", "WAIT_RECORD_STOP")
+        # Prerender is deliberately left clickable throughout
+        # WAIT_RECORD_STOP rather than disabling after one use: it can
+        # fail simply from being tried too soon after the end was marked
+        # (the encoder hasn't flushed that far yet, not a real
+        # incompatibility), so retrying needs to stay possible — the
+        # backend's own "one already running"/"already done" guards are
+        # what actually prevent redoing it once it's succeeded. Once it
+        # actually succeeds (or Skip Render is used), _handle_prerender_
+        # status() takes over and locks all four buttons for the rest of
+        # this run — that's not state-driven, so it can't be expressed
+        # here (this only fires on a genuine "state = ..." transition).
+        prerender_enabled = raw_state == "WAIT_RECORD_STOP"
         self.mark_start_btn.configure(state="normal" if start_enabled else "disabled")
         self.mark_end_btn.configure(state="normal" if end_enabled else "disabled")
+        self.prerender_btn.configure(state="normal" if prerender_enabled else "disabled")
+        self.skip_render_btn.configure(state="normal" if prerender_enabled else "disabled")
+
+    def _handle_prerender_status(self, status: str):
+        if status == "RUNNING":
+            self.watch_state_var.set("Prerendering")
+            self.watch_status_label.configure(foreground=PALETTE["info"])
+            self._set_prerender_buttons(enabled=False)
+        elif status == "DONE":
+            self.watch_state_var.set("Done (Prerendered)")
+            self.watch_status_label.configure(foreground=PALETTE["success"])
+            self._set_prerender_buttons(enabled=False)
+            self._prerender_locked = True
+        elif status == "SKIPPED":
+            self.watch_state_var.set("Done (Skipped Render)")
+            self.watch_status_label.configure(foreground=PALETTE["warning"])
+            self._set_prerender_buttons(enabled=False)
+            self._prerender_locked = True
+        elif status == "FAILED":
+            self._log("[gui] prerender failed — see the console output above for why; safe to try again")
+            # Back to the ordinary WAIT_RECORD_STOP button state so
+            # retrying (prerender again, or Skip Render instead) is
+            # possible — nothing was actually marked done.
+            self._update_mark_buttons("WAIT_RECORD_STOP")
+            self.watch_state_var.set(WATCH_STATE_LABELS.get("WAIT_RECORD_STOP", "WAIT_RECORD_STOP"))
+            self.watch_status_label.configure(foreground=PALETTE["accent"])
+
+    def _set_prerender_buttons(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        self.mark_start_btn.configure(state=state)
+        self.mark_end_btn.configure(state=state)
+        self.prerender_btn.configure(state=state)
+        self.skip_render_btn.configure(state=state)
 
     def _mark_sermon_start(self):
         self.runner.send_line("mark_begin")
@@ -1368,6 +1509,14 @@ class App(tk.Tk):
     def _mark_sermon_end(self):
         self.runner.send_line("mark_end")
         self._log("[gui] sent: mark sermon end")
+
+    def _prerender(self):
+        self.runner.send_line("prerender")
+        self._log("[gui] sent: prerender")
+
+    def _skip_render(self):
+        self.runner.send_line("skip_render")
+        self._log("[gui] sent: skip render")
 
     # -- per-mode run handlers ---------------------------------------------
 
@@ -1382,6 +1531,7 @@ class App(tk.Tk):
         args = ["watch", "-c", self.config_path_var.get().strip()]
         if self.watch_debug_var.get():
             args.append("--debug")
+        self._prerender_locked = False
         self.watch_state_var.set("starting…")
         self.watch_status_label.configure(foreground=PALETTE["accent"])
         self._update_mark_buttons(None)
@@ -1397,6 +1547,12 @@ class App(tk.Tk):
             return
         try:
             duration = to_float(self.vars["st_duration"].get().strip() or "1.0", "Transition duration")
+            intro_duration = to_float(
+                self.vars["st_intro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Intro duration"
+            )
+            outro_duration = to_float(
+                self.vars["st_outro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
+            )
             crf = self.vars["st_crf"].get()
             start_ts = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
             end_ts = to_timestamp(self.vars["st_end"].get().strip() or "00:00:00.000", "Sermon end")
@@ -1439,6 +1595,8 @@ class App(tk.Tk):
                     "auto": True,
                     "intro": intro,
                     "outro": outro,
+                    "intro_duration": intro_duration,
+                    "outro_duration": outro_duration,
                     "output": output,
                     "transition_duration": duration,
                     "transition": transition,
@@ -1453,6 +1611,7 @@ class App(tk.Tk):
             args = [
                 "stitch", intro, main_clip, outro,
                 "-o", output, "-d", str(duration), "-t", transition, "--crf", str(crf),
+                "--intro-duration", str(intro_duration), "--outro-duration", str(outro_duration),
             ]
             self._start("stitch", args)
 
