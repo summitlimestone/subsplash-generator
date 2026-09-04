@@ -77,6 +77,15 @@ each week. A Live/Offline notebook plus the console:
   you then change Main clip to something else, the timestamps stop
   applying and Run goes back to a plain crossfade (`stitch`) of whatever's
   in the fields, on the assumption that clip is already trimmed.
+  "Export to JSON" is the reverse of "Load from JSON": it writes a
+  `render_state_*.json` file — the same format Watch itself writes — from
+  whatever's currently in the fields, treating Main clip as the raw
+  recording and Sermon start/Sermon end as the exact cut points, whether or
+  not that JSON was ever loaded from a real Watch run. Useful for building
+  a render-state file by hand (e.g. from a recording that was never run
+  through Watch/ProPresenter at all) to hand off or run later with
+  `render`, rather than only ever being able to redo one Watch already
+  produced.
 
 **Config window** — everything set once and rarely touched again, opened
 via the main window's "Config" button. Hidden rather than closed when

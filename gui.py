@@ -41,6 +41,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -1031,8 +1032,11 @@ class App(tk.Tk):
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
-        ttk.Button(frame, text="Load from JSON…", command=self._browse_render_state).grid(
-            row=1, column=0, sticky="w", pady=(0, 10)
+        load_export_row = ttk.Frame(frame)
+        load_export_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        ttk.Button(load_export_row, text="Load from JSON…", command=self._browse_render_state).pack(side="left")
+        ttk.Button(load_export_row, text="Export to JSON…", command=self._export_render_state).pack(
+            side="left", padx=(8, 0)
         )
 
         self._labeled_entry(frame, 2, "Intro clip", "st_intro", colspan=3)
@@ -1588,14 +1592,19 @@ class App(tk.Tk):
         self._update_mark_buttons(None)
         self._start("watch", args)
 
-    def _run_render(self):
+    def _collect_offline_fields(self, error_title: str = "Render") -> dict | None:
+        """Validate and collect the Offline tab's fields as a plain dict —
+        shared by _run_render() and _export_render_state(), since both
+        need the same inputs (just doing different things with them
+        afterward). Returns None (after showing an error dialog titled
+        `error_title`) if something required is missing or invalid."""
         intro = self.vars["st_intro"].get().strip()
         main_clip = self.vars["st_main"].get().strip()
         outro = self.vars["st_outro"].get().strip()
         output = self.vars["st_output"].get().strip() or "output.mp4"
         if not intro or not main_clip or not outro:
-            messagebox.showerror("Render", "Intro, main clip, and outro paths are all required.")
-            return
+            messagebox.showerror(error_title, "Intro, main clip, and outro paths are all required.")
+            return None
         try:
             duration = to_float(self.vars["st_duration"].get().strip() or "1.0", "Transition duration")
             intro_duration = to_float(
@@ -1610,14 +1619,60 @@ class App(tk.Tk):
             start_ts = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
             end_ts = to_timestamp(self.vars["st_end"].get().strip() or "00:00:00.000", "Sermon end")
         except ValueError as e:
-            messagebox.showerror("Render", str(e))
-            return
+            messagebox.showerror(error_title, str(e))
+            return None
         transition = self.vars["st_transition"].get().strip() or "fade"
+        return {
+            "intro": intro, "main_clip": main_clip, "outro": outro, "output": output,
+            "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
+            "crf": crf, "trim_fast_copy": trim_fast_copy, "stitch_fast_copy": stitch_fast_copy,
+            "start_ts": start_ts, "end_ts": end_ts, "transition": transition,
+        }
+
+    @staticmethod
+    def _build_render_state(f: dict, trim_output: str, state_output: str) -> dict:
+        """A render_state dict from _collect_offline_fields()'s result —
+        i.e. everything 'watch' writes after a live run, but built from
+        fields picked by hand instead. trim_output/state_output are
+        threaded through separately since where they come from differs
+        between callers: an already-loaded file's own values when
+        re-trimming it (_run_render), or generic defaults when there's no
+        loaded file to inherit them from (_export_render_state)."""
+        return {
+            "recording_path": f["main_clip"],
+            "raw_begin_offset": format_timestamp(f["start_ts"]),
+            "raw_end_offset": format_timestamp(f["end_ts"]),
+            "trim": {
+                "output": trim_output,
+                "state_output": state_output,
+                "pad_start_seconds": 0,
+                "pad_end_seconds": 0,
+                "crf": f["crf"],
+                "fast_copy": f["trim_fast_copy"],
+            },
+            "stitch": {
+                "auto": True,
+                "intro": f["intro"],
+                "outro": f["outro"],
+                "intro_duration": f["intro_duration"],
+                "outro_duration": f["outro_duration"],
+                "output": f["output"],
+                "transition_duration": f["duration"],
+                "transition": f["transition"],
+                "crf": f["crf"],
+                "fast_copy": f["stitch_fast_copy"],
+            },
+        }
+
+    def _run_render(self):
+        f = self._collect_offline_fields()
+        if f is None:
+            return
 
         raw = self._offline_raw_state
-        use_raw_trim = raw is not None and raw["recording_path"] == main_clip
+        use_raw_trim = raw is not None and raw["recording_path"] == f["main_clip"]
 
-        if not use_raw_trim and (start_ts or end_ts):
+        if not use_raw_trim and (f["start_ts"] or f["end_ts"]):
             self._log(
                 "[gui] note: the sermon start/end timestamps are ignored — Main "
                 "clip isn't the raw recording from a loaded render-state file "
@@ -1633,43 +1688,47 @@ class App(tk.Tk):
             # timestamps a person picked by eye, not a raw/pad split (there's
             # no slide detection here), so pass them straight through as the
             # offsets with zero padding.
-            render_state = {
-                "recording_path": raw["recording_path"],
-                "raw_begin_offset": format_timestamp(start_ts),
-                "raw_end_offset": format_timestamp(end_ts),
-                "trim": {
-                    "output": raw["trim_output"],
-                    "state_output": raw["state_output"],
-                    "pad_start_seconds": 0,
-                    "pad_end_seconds": 0,
-                    "crf": crf,
-                    "fast_copy": trim_fast_copy,
-                },
-                "stitch": {
-                    "auto": True,
-                    "intro": intro,
-                    "outro": outro,
-                    "intro_duration": intro_duration,
-                    "outro_duration": outro_duration,
-                    "output": output,
-                    "transition_duration": duration,
-                    "transition": transition,
-                    "crf": crf,
-                    "fast_copy": stitch_fast_copy,
-                },
-            }
+            render_state = self._build_render_state(f, raw["trim_output"], raw["state_output"])
             state_path = raw["state_path"]
             Path(state_path).write_text(json.dumps(render_state, indent=2))
             self._log(f"[gui] updated {state_path} with the current timestamps/settings")
             self._start("render", ["render", state_path])
         else:
             args = [
-                "stitch", intro, main_clip, outro,
-                "-o", output, "-d", str(duration), "-t", transition, "--crf", str(crf),
-                "--intro-duration", str(intro_duration), "--outro-duration", str(outro_duration),
-                "--fast-copy" if stitch_fast_copy else "--no-fast-copy",
+                "stitch", f["intro"], f["main_clip"], f["outro"],
+                "-o", f["output"], "-d", str(f["duration"]), "-t", f["transition"], "--crf", str(f["crf"]),
+                "--intro-duration", str(f["intro_duration"]), "--outro-duration", str(f["outro_duration"]),
+                "--fast-copy" if f["stitch_fast_copy"] else "--no-fast-copy",
             ]
             self._start("stitch", args)
+
+    def _export_render_state(self):
+        """Build a render_state.json from whatever's currently in the
+        Offline tab's fields — Main clip is always treated as the raw
+        recording here (unlike _run_render(), which only does that when it
+        happens to match a previously-loaded file), since the point of
+        this button is authoring a render-state file from scratch rather
+        than redoing an existing one. The result is exactly what a live
+        Watch run would have written, and works the same afterward: open
+        it with "Load from JSON" here, or run it directly with
+        `render <file>`."""
+        f = self._collect_offline_fields(error_title="Export to JSON")
+        if f is None:
+            return
+        if f["end_ts"] <= f["start_ts"]:
+            messagebox.showerror("Export to JSON", "Sermon end must be after Sermon start.")
+            return
+
+        render_state = self._build_render_state(f, "body_trimmed.mp4", "render_state.json")
+        default_name = f"render_state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(
+            title="Export render-state JSON", defaultextension=".json",
+            initialfile=default_name, initialdir=str(SCRIPT_DIR), filetypes=JSON_FILETYPES,
+        )
+        if not path:
+            return
+        Path(path).write_text(json.dumps(render_state, indent=2))
+        self._log(f"[gui] exported render-state JSON -> {path}")
 
     def _on_close(self):
         if self.runner.running():
