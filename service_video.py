@@ -67,12 +67,12 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 def probe(path: str) -> dict:
-    """Return duration, width, height, fps, and whether an audio stream
-    exists for a media file, via ffprobe."""
+    """Return duration, width, height, fps, video codec, and whether an
+    audio stream exists for a media file, via ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-show_entries", "stream=width,height,avg_frame_rate,codec_type",
+        "-show_entries", "stream=width,height,avg_frame_rate,codec_type,codec_name",
         "-of", "json",
         path,
     ]
@@ -101,6 +101,11 @@ def probe(path: str) -> dict:
         "height": video_stream["height"],
         "fps": fps,
         "has_audio": has_audio,
+        # Used by the fast-copy trim/stitch paths to decide whether a
+        # stream copy can safely sit next to a fresh libx264 re-encode in
+        # the same concatenated output — see find_next_keyframe()/
+        # _fast_copy_trim()/_fast_copy_stitch().
+        "video_codec": video_stream.get("codec_name"),
     }
 
 
@@ -139,6 +144,129 @@ def probe_image_dimensions(path: str) -> dict:
     if not streams:
         sys.exit(f"{path!r} has no readable image stream.")
     return {"width": streams[0]["width"], "height": streams[0]["height"]}
+
+
+# --------------------------------------------------------------------------
+# Fast-copy trim/stitch — re-encode only the small windows that actually
+# need it (the keyframe-alignment sliver at a cut point, and the crossfade
+# transitions), and stream-copy everything else instead of decoding and
+# re-encoding the whole main clip. See trim_clip()/stitch()'s fast_copy
+# parameter docs for the full picture; the pieces below are the shared
+# machinery both use.
+# --------------------------------------------------------------------------
+
+def find_next_keyframe(path: str, start: float, windows: tuple[float, ...] = (30.0, 300.0)) -> float | None:
+    """Return the timestamp (seconds) of the first video keyframe at or
+    after `start` in path's video stream, or None if none turns up within
+    the largest window tried. Scans via ffprobe's -read_intervals (which
+    seeks straight there rather than reading from the start of the file)
+    combined with -skip_frame nokey (which only decodes keyframes, not
+    everything in between), so this stays fast and cheap no matter how
+    long `path` is or how far into it `start` falls — critical, since the
+    whole point of the fast-copy path is to avoid touching the rest of the
+    file. Tries progressively wider windows in case a single one lands
+    entirely between two keyframes (an unusually long GOP, or a search
+    window that happens to start right after one)."""
+    for window in windows:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-skip_frame", "nokey",
+            "-read_intervals", f"{start}%+{window}",
+            "-show_entries", "frame=pts_time",
+            "-of", "csv=p=0",
+            path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode != 0:
+            return None
+        # -read_intervals' "%" seek lands at/before `start` (it's a
+        # keyframe seek), so the earliest entries can be before `start` —
+        # only a timestamp actually at or after it is usable here. csv=p=0
+        # still trails a stray "," on at least the first row of some
+        # ffprobe builds — stripped here rather than relied on to be absent.
+        tokens = [t.strip().rstrip(",") for t in result.stdout.split()]
+        times = sorted(float(t) for t in tokens if t)
+        for t in times:
+            if t >= start - 0.001:
+                return t
+    return None
+
+
+def probe_bitrate(path: str) -> int | None:
+    """Video stream bitrate in bits/sec, or None if ffprobe can't report
+    one (some containers, e.g. Matroska, only expose an overall
+    format-level bitrate rather than a per-stream one — checked as a
+    fallback). Used so a fast-copy stitch's re-encoded segments (the
+    crossfade windows, and any looped-image intro/outro) can target
+    roughly the same bitrate as the untouched, copied middle of the main
+    clip, rather than an arbitrary configured CRF that might look like a
+    quality jump at the seams."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=bit_rate", "-of", "json", path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    bit_rate = None
+    if result.returncode == 0:
+        streams = json.loads(result.stdout).get("streams") or []
+        if streams:
+            bit_rate = streams[0].get("bit_rate")
+    if bit_rate is None:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=bit_rate", "-of", "json", path]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode == 0:
+            bit_rate = json.loads(result.stdout).get("format", {}).get("bit_rate")
+    try:
+        return int(bit_rate)
+    except (TypeError, ValueError):
+        return None
+
+
+def _quality_match_args(reference_path: str, crf: int) -> list[str]:
+    """ffmpeg video-encode args for a fast-copy segment that needs to
+    visually match a reference clip's own quality (the untouched, copied
+    footage it'll be concatenated next to) rather than an arbitrary
+    configured CRF: target that clip's actual bitrate if ffprobe can
+    report one, with modest headroom for the encoder to work with; fall
+    back to the configured CRF (the old, pre-fast-copy behavior) if it
+    can't — still functional, just without the quality-matching
+    guarantee, so this never blocks the fast path outright."""
+    bit_rate = probe_bitrate(reference_path)
+    if bit_rate is None:
+        print(f"[stitch] fast copy: couldn't read {reference_path!r}'s bitrate — using CRF {crf} for the "
+              "re-encoded segments instead of matching it", file=sys.stderr)
+        return ["-crf", str(crf)]
+    return ["-b:v", str(bit_rate), "-maxrate", str(int(bit_rate * 1.5)), "-bufsize", str(bit_rate * 2)]
+
+
+def _concat_list_entry(path: Path) -> str:
+    """Quote a path for the ffmpeg concat demuxer's list file format:
+    single-quoted, with any literal single quote escaped as '\\''."""
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
+def _run_concat(parts: list[Path], output: str, faststart: bool = False):
+    """Join `parts` (already-produced media files, in order) into `output`
+    via the concat demuxer with -c copy — a fast, no-re-encode join, used
+    to reassemble a fast-copy trim/stitch's separately-produced segments.
+    The list file is written next to `output` and always cleaned up.
+
+    faststart: pass True when `output` is a final deliverable meant for
+    web/streaming playback (mirrors stitch()'s old path, which always sets
+    this) rather than an intermediate file like trim_clip()'s output —
+    just rewrites where the moov atom sits, no re-encoding involved."""
+    list_path = Path(output).with_name(f".{Path(output).stem}.concat.txt")
+    list_path.write_text("".join(f"file {_concat_list_entry(p)}\n" for p in parts))
+    try:
+        cmd = ["ffmpeg", "-y", "-nostdin", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy"]
+        if faststart:
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(output)
+        print("Running:", " ".join(cmd))
+        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
+    finally:
+        list_path.unlink(missing_ok=True)
 
 
 def build_filter_complex(
@@ -182,6 +310,173 @@ def build_filter_complex(
     return ";".join(parts), "[vout]", "[aout]"
 
 
+def _clip_input_args(path: str, is_image: bool, duration: float) -> list[str]:
+    """ffmpeg input-side args to read a whole clip — a still image gets
+    looped for `duration` via the image2 demuxer (same as stitch()'s main
+    input-building loop); a video is just -i."""
+    if is_image:
+        return ["-loop", "1", "-t", f"{duration:.3f}", "-i", path]
+    return ["-i", path]
+
+
+def _build_pair_xfade_cmd(
+    input_args_a: list[str], has_audio_a: bool, duration_a: float,
+    input_args_b: list[str], has_audio_b: bool, duration_b: float,
+    width: int, height: int, fps: float, transition: str, transition_duration: float,
+    video_encode_args: list[str], output: str,
+) -> list[str]:
+    """Build an ffmpeg command crossfading exactly two inputs (each
+    described by its own input-side ffmpeg args) into `output` — the
+    two-clip version of build_filter_complex()'s chained three-clip
+    crossfade, used by _fast_copy_stitch() for the short intro/main-start
+    and main-end/outro transition windows."""
+    cmd = ["ffmpeg", "-y", "-nostdin", *input_args_a, *input_args_b]
+
+    audio_inputs = []
+    next_input_index = 2
+    for i, (has_audio, duration) in enumerate(((has_audio_a, duration_a), (has_audio_b, duration_b))):
+        if has_audio:
+            audio_inputs.append(f"{i}:a")
+        else:
+            cmd += [
+                "-f", "lavfi", "-t", f"{duration:.3f}",
+                "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            ]
+            audio_inputs.append(f"{next_input_index}:a")
+            next_input_index += 1
+
+    offset = duration_a - transition_duration
+    filter_complex = (
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v0];"
+        f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v1];"
+        f"[v0][v1]xfade=transition={transition}:duration={transition_duration}:offset={offset:.3f}[vout];"
+        f"[{audio_inputs[0]}][{audio_inputs[1]}]acrossfade=d={transition_duration}[aout]"
+    )
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", *video_encode_args, "-preset", "medium",
+        "-c:a", "aac", "-b:a", "192k",
+        output,
+    ]
+    return cmd
+
+
+def _fast_copy_stitch(
+    intro: str, main_clip: str, outro: str, output: str,
+    is_image_flags: list[bool], clips: list[dict],
+    width: int, height: int, fps: float,
+    transition: str, transition_duration: float, crf: int,
+) -> str | None:
+    """stitch()'s fast path: rather than crossfading the whole intro+main+
+    outro timeline in one pass (which decodes and re-encodes all of it,
+    including however long the main body is), build only the two short
+    crossfade windows — intro blending into the start of main, and the end
+    of main blending into outro — as their own small encodes, and stream-
+    copy the untouched middle of main between them. The three pieces are
+    joined with the concat demuxer, so the vast majority of a long main
+    clip is never decoded or re-encoded at all. The re-encoded windows
+    target the main clip's own bitrate (see _quality_match_args()) rather
+    than an arbitrary configured CRF, so they don't look like a quality
+    jump where they meet the untouched footage.
+
+    Only applicable when main_clip is h264 (so the copied middle can sit
+    in the same stream as the freshly-encoded h264 pieces either side of
+    it) and long enough to actually have an untouched middle. Returns
+    output on success; returns None (after cleaning up) if the fast path
+    isn't usable here, so the caller can fall back to the old single-pass
+    crossfade — this always logs why."""
+    intro_clip, main_info, outro_clip = clips
+
+    if main_info.get("video_codec") != "h264":
+        print(
+            f"[stitch] fast copy: main clip is {main_info.get('video_codec')!r}, not h264 — the "
+            "re-encoded transition windows (always h264) couldn't be joined with a copied middle "
+            "of a different codec, skipping",
+            file=sys.stderr,
+        )
+        return None
+
+    main_duration = main_info["duration"]
+    mid_start = find_next_keyframe(main_clip, transition_duration)
+    if mid_start is None:
+        print(
+            f"[stitch] fast copy: couldn't find a keyframe at/after {transition_duration:.3f}s "
+            "into the main clip, skipping",
+            file=sys.stderr,
+        )
+        return None
+    mid_end = main_duration - transition_duration
+    if mid_start >= mid_end:
+        print(
+            f"[stitch] fast copy: main clip isn't long enough to have an untouched middle once "
+            f"both {transition_duration:.3f}s crossfade windows are set aside (next keyframe at "
+            f"{mid_start:.3f}s, need it before {mid_end:.3f}s) — skipping",
+            file=sys.stderr,
+        )
+        return None
+
+    video_encode_args = _quality_match_args(main_clip, crf)
+    margin = FAST_COPY_END_TRIM_FRAMES / fps if fps > 0 else 0.0
+
+    front_path = Path(output).with_name(f".{Path(output).stem}.front{Path(output).suffix}")
+    middle_path = Path(output).with_name(f".{Path(output).stem}.middle{Path(output).suffix}")
+    tail_path = Path(output).with_name(f".{Path(output).stem}.tail{Path(output).suffix}")
+    try:
+        front_cmd = _build_pair_xfade_cmd(
+            _clip_input_args(intro, is_image_flags[0], intro_clip["duration"]), intro_clip["has_audio"], intro_clip["duration"],
+            ["-t", f"{mid_start:.3f}", "-i", main_clip], main_info["has_audio"], mid_start,
+            width, height, fps, transition, transition_duration, video_encode_args, str(front_path),
+        )
+        print(f"[stitch] fast copy: encoding the intro crossfade (intro + main's first {mid_start:.3f}s)")
+        print("Running:", " ".join(front_cmd))
+        subprocess.run(front_cmd, check=True, stdin=subprocess.DEVNULL)
+
+        middle_duration = max(0.0, mid_end - mid_start - margin)
+        middle_cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-ss", f"{mid_start:.3f}", "-i", main_clip, "-t", f"{middle_duration:.3f}",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            str(middle_path),
+        ]
+        print(
+            f"[stitch] fast copy: stream-copying the untouched middle of main "
+            f"({mid_start:.3f}s -> {mid_end:.3f}s, no re-encoding)"
+        )
+        print("Running:", " ".join(middle_cmd))
+        subprocess.run(middle_cmd, check=True, stdin=subprocess.DEVNULL)
+
+        tail_duration = main_duration - mid_end
+        tail_cmd = _build_pair_xfade_cmd(
+            ["-ss", f"{mid_end:.3f}", "-i", main_clip], main_info["has_audio"], tail_duration,
+            _clip_input_args(outro, is_image_flags[2], outro_clip["duration"]), outro_clip["has_audio"], outro_clip["duration"],
+            width, height, fps, transition, transition_duration, video_encode_args, str(tail_path),
+        )
+        print(f"[stitch] fast copy: encoding the outro crossfade (main's last {tail_duration:.3f}s + outro)")
+        print("Running:", " ".join(tail_cmd))
+        subprocess.run(tail_cmd, check=True, stdin=subprocess.DEVNULL)
+
+        print("[stitch] fast copy: joining the intro crossfade, copied middle, and outro crossfade")
+        _run_concat([front_path, middle_path, tail_path], output, faststart=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[stitch] fast copy step failed ({e}) — falling back to a full re-encode", file=sys.stderr)
+        return None
+    finally:
+        front_path.unlink(missing_ok=True)
+        middle_path.unlink(missing_ok=True)
+        tail_path.unlink(missing_ok=True)
+
+    front_duration = intro_clip["duration"] + mid_start - transition_duration
+    tail_out_duration = tail_duration + outro_clip["duration"] - transition_duration
+    print(
+        f"\nDone (fast copy: ~{front_duration + tail_out_duration:.1f}s re-encoded across both "
+        f"crossfades, {middle_duration:.1f}s of the main clip copied) -> {output}"
+    )
+    return output
+
+
 def expand_output_path(path: str) -> str:
     """Expand strftime placeholders (%Y, %m, %d, %H, %M, %S, etc.) in an
     output path's filename with the current date/time, so a filename can
@@ -207,13 +502,22 @@ def stitch(
     intro: str, main_clip: str, outro: str, output: str = "output.mp4",
     transition_duration: float = 1.0, transition: str = "fade", crf: int = 18,
     intro_duration: float | None = None, outro_duration: float | None = None,
+    fast_copy: bool = True,
 ) -> str:
     """Crossfade an intro, main body, and outro clip into one video. intro/
     outro can each be either a video or a still image (jpg/png/etc.) — a
     still image is looped into a fixed-length clip using intro_duration/
     outro_duration (falling back to DEFAULT_IMAGE_DURATION if not given).
     main_clip must be a real video (it's the trimmed recording).
-    Returns the resolved output path (after strftime expansion)."""
+    Returns the resolved output path (after strftime expansion).
+
+    fast_copy (default on): try _fast_copy_stitch() first — only the two
+    short crossfade windows get re-encoded, and the untouched middle of
+    main_clip (very likely almost all of it) is stream-copied instead of
+    being decoded and re-encoded along with everything else. Falls
+    straight through to the full single-pass crossfade below (logging
+    why) if that's not applicable or safe for this main_clip — an
+    h264-only technique, and not worth it for a short main clip."""
     output = expand_output_path(output)
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         sys.exit("ffmpeg and ffprobe must be installed and on PATH.")
@@ -253,6 +557,16 @@ def stitch(
     # xfade requires even dimensions for yuv420p.
     width -= width % 2
     height -= height % 2
+
+    if fast_copy:
+        result = _fast_copy_stitch(
+            intro, main_clip, outro, output,
+            is_image_flags, clips, width, height, fps,
+            transition, transition_duration, crf,
+        )
+        if result is not None:
+            return result
+        print("[stitch] continuing with a full re-encode")
 
     cmd = ["ffmpeg", "-y", "-nostdin"]
     for p, is_image, clip in zip(paths, is_image_flags, clips):
@@ -388,7 +702,7 @@ async def propresenter_loop(pp_cfg: dict, out_queue: "queue.Queue", stop_event: 
     a widening gap where a slide-change event could be missed."""
     import websockets
 
-    uri = f"ws://{pp_cfg['host']}:{pp_cfg['port']}/stagedisplay"
+    uri = f"ws://{pp_cfg['host']}:{pp_cfg.get('port', 1025)}/stagedisplay"
     reconnect_interval = pp_cfg.get("reconnect_interval_seconds", 4)
     while not stop_event.is_set():
         try:
@@ -449,13 +763,152 @@ def start_stdin_thread(out_queue: "queue.Queue"):
 # Trim + render (trim the OBS recording, then hand off to stitch())
 # --------------------------------------------------------------------------
 
-def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18) -> str:
-    """Frame-accurate trim: -ss/-to placed after -i forces ffmpeg to decode
-    from the start rather than snapping to the nearest keyframe. Returns
-    the resolved destination path (dst after strftime expansion) — use
-    this, not the original dst, for anything downstream that needs to find
-    the file that actually got written."""
+# -nostdin plus stdin=DEVNULL everywhere a subprocess is run in this file,
+# belt and suspenders: since watch() added a background thread reading
+# this script's own stdin (for the manual mark_begin/mark_end/prerender
+# commands) and the GUI now keeps that stdin open as a pipe rather than
+# leaving it unset/closed, ffmpeg would otherwise inherit that same pipe
+# and — on at least some platforms — treat it as something to read
+# interactive keyboard commands from ("Press [q] to stop, [?] for help"),
+# which can make it hang waiting on stdin instead of just encoding and
+# exiting. ffmpeg has no legitimate reason to ever want that here.
+
+# How much the fast-copy path's stream-copied end trim is allowed to run
+# past the requested end offset before it's nudged back: -c copy can only
+# cut at a packet boundary, and empirically tends to round up to include
+# whatever packet contains the requested end timestamp rather than
+# stopping just short of it (confirmed by direct measurement while
+# building this) — subtracting a small, fixed margin based on the clip's
+# own frame rate brings that back in line with what a full re-encode would
+# have produced, at the cost of a small, deliberate under-run instead of
+# an over-run if the true rounding behavior ever differs (e.g. a different
+# ffmpeg build). Either way this is a matter of at most a couple of frames
+# — inaudible/invisible for this pipeline's purposes.
+FAST_COPY_END_TRIM_FRAMES = 1.5
+
+
+def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> str | None:
+    """trim_clip()'s fast path: re-encode only the sliver from `start` to
+    the nearest keyframe at/after it (needed because a decode has to begin
+    on a keyframe), then stream-copy the video from that keyframe through
+    to `end` — a stream copy's end doesn't need to land on a keyframe the
+    way its start does, only its start, so the entire rest of the clip
+    (very likely almost all of it) never gets decoded or re-encoded at
+    all. The two pieces are joined with the concat demuxer.
+
+    Returns dst on success. Returns None (after cleaning up any partial
+    output) if the fast path isn't usable or safe here, so the caller can
+    fall back to trim_clip()'s old, always-correct full re-encode; this
+    always logs why."""
+    info = probe(src)
+    if info.get("video_codec") != "h264":
+        print(
+            f"[trim] fast copy: source is {info.get('video_codec')!r}, not h264 — the re-encoded "
+            "sliver (always h264) couldn't be joined with a copied tail of a different codec, skipping",
+            file=sys.stderr,
+        )
+        return None
+
+    keyframe_time = find_next_keyframe(src, start)
+    if keyframe_time is None:
+        print(f"[trim] fast copy: couldn't find a keyframe at/after {start:.3f}s, skipping", file=sys.stderr)
+        return None
+    if keyframe_time >= end:
+        print(
+            f"[trim] fast copy: the next keyframe ({keyframe_time:.3f}s) is at/after the trim's "
+            f"end ({end:.3f}s) — this cut is shorter than one GOP, skipping",
+            file=sys.stderr,
+        )
+        return None
+
+    fps = info["fps"]
+    tail_margin = FAST_COPY_END_TRIM_FRAMES / fps if fps > 0 else 0.0
+
+    # Close enough to already be a keyframe: skip the sliver re-encode
+    # entirely and just copy the whole range, no re-encoding at all.
+    if keyframe_time - start <= 0.02:
+        tail_duration = max(0.0, end - keyframe_time - tail_margin)
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-ss", f"{keyframe_time:.3f}", "-i", src, "-t", f"{tail_duration:.3f}",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            dst,
+        ]
+        print(f"[trim] fast copy: start ({start:.3f}s) is already on a keyframe — copying the whole clip, no re-encoding")
+        print("Running:", " ".join(cmd))
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+        if result.returncode != 0:
+            print("[trim] fast copy failed, falling back to a full re-encode", file=sys.stderr)
+            return None
+        print(f"\nDone (fast copy, fully copied, no re-encoding) -> {dst}")
+        return dst
+
+    sliver_path = Path(dst).with_name(f".{Path(dst).stem}.sliver{Path(dst).suffix}")
+    tail_path = Path(dst).with_name(f".{Path(dst).stem}.tail{Path(dst).suffix}")
+    try:
+        sliver_cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-ss", f"{start:.3f}", "-i", src, "-t", f"{keyframe_time - start:.3f}",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+            "-c:a", "aac", "-b:a", "192k",
+            str(sliver_path),
+        ]
+        print(
+            f"[trim] fast copy: re-encoding {start:.3f}s -> {keyframe_time:.3f}s "
+            f"({keyframe_time - start:.3f}s, up to the nearest keyframe)"
+        )
+        print("Running:", " ".join(sliver_cmd))
+        subprocess.run(sliver_cmd, check=True, stdin=subprocess.DEVNULL)
+
+        tail_duration = max(0.0, end - keyframe_time - tail_margin)
+        tail_cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-ss", f"{keyframe_time:.3f}", "-i", src, "-t", f"{tail_duration:.3f}",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            str(tail_path),
+        ]
+        print(
+            f"[trim] fast copy: stream-copying video {keyframe_time:.3f}s -> {end:.3f}s "
+            f"({tail_duration:.3f}s, no re-encoding)"
+        )
+        print("Running:", " ".join(tail_cmd))
+        subprocess.run(tail_cmd, check=True, stdin=subprocess.DEVNULL)
+
+        print("[trim] fast copy: joining the re-encoded sliver and copied tail")
+        _run_concat([sliver_path, tail_path], dst)
+    except subprocess.CalledProcessError as e:
+        print(f"[trim] fast copy step failed ({e}) — falling back to a full re-encode", file=sys.stderr)
+        return None
+    finally:
+        sliver_path.unlink(missing_ok=True)
+        tail_path.unlink(missing_ok=True)
+
+    print(f"\nDone (fast copy: {keyframe_time - start:.3f}s re-encoded, {tail_duration:.3f}s copied) -> {dst}")
+    return dst
+
+
+def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18, fast_copy: bool = True) -> str:
+    """Trim src down to [start, end] and write it to dst. Returns the
+    resolved destination path (dst after strftime expansion) — use this,
+    not the original dst, for anything downstream that needs to find the
+    file that actually got written.
+
+    fast_copy (default on): try _fast_copy_trim() first — re-encode just a
+    short sliver up to the nearest keyframe, then stream-copy the rest, so
+    a long clip doesn't get fully decoded and re-encoded just to cut its
+    ends off. Falls straight through to the full re-encode below (logging
+    why) if that's not applicable or safe for this source — an h264-only
+    technique, and not worth it for a very short trim range."""
     dst = expand_output_path(dst)
+
+    if fast_copy:
+        result = _fast_copy_trim(src, dst, start, end, crf)
+        if result is not None:
+            return result
+        print("[trim] continuing with a full re-encode")
+
+    # Frame-accurate trim: -ss/-to placed after -i forces ffmpeg to decode
+    # from the start rather than snapping to the nearest keyframe.
     cmd = [
         "ffmpeg", "-y", "-nostdin",
         "-i", src,
@@ -465,15 +918,6 @@ def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18) -> st
         dst,
     ]
     print("Running:", " ".join(cmd))
-    # -nostdin plus stdin=DEVNULL, belt and suspenders: since watch() added
-    # a background thread reading this script's own stdin (for the manual
-    # mark_begin/mark_end/prerender commands) and the GUI now keeps that
-    # stdin open as a pipe rather than leaving it unset/closed, ffmpeg
-    # would otherwise inherit that same pipe and — on at least some
-    # platforms — treat it as something to read interactive keyboard
-    # commands from ("Press [q] to stop, [?] for help"), which can make it
-    # hang waiting on stdin instead of just encoding and exiting. ffmpeg
-    # has no legitimate reason to ever want that here.
     subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
     return dst
 
@@ -543,6 +987,7 @@ def render(state: dict):
     trimmed_path = trim_clip(
         state["recording_path"], trim_cfg.get("output", "body_trimmed.mp4"),
         start_offset, end_offset, crf=trim_cfg.get("crf", 18),
+        fast_copy=trim_cfg.get("fast_copy", True),
     )
     print(f"\nTrimmed body clip -> {trimmed_path}")
 
@@ -555,6 +1000,7 @@ def render(state: dict):
             crf=stitch_cfg.get("crf", 18),
             intro_duration=stitch_cfg.get("intro_duration"),
             outro_duration=stitch_cfg.get("outro_duration"),
+            fast_copy=stitch_cfg.get("fast_copy", True),
         )
 
 
@@ -642,7 +1088,7 @@ def prerender_worker(events_q: "queue.Queue", recording_path: str, raw_begin_off
         _write_render_state(recording_path, raw_begin_offset, raw_end_offset, trim_cfg, stitch_cfg)
         trimmed_path = trim_clip(
             recording_path, trim_cfg.get("output", "body_trimmed.mp4"), start_offset, end_offset,
-            crf=trim_cfg.get("crf", 18),
+            crf=trim_cfg.get("crf", 18), fast_copy=trim_cfg.get("fast_copy", True),
         )
         print(f"[watcher] prerender: trimmed -> {trimmed_path}")
         if stitch_cfg.get("auto"):
@@ -654,6 +1100,7 @@ def prerender_worker(events_q: "queue.Queue", recording_path: str, raw_begin_off
                 crf=stitch_cfg.get("crf", 18),
                 intro_duration=stitch_cfg.get("intro_duration"),
                 outro_duration=stitch_cfg.get("outro_duration"),
+                fast_copy=stitch_cfg.get("fast_copy", True),
             )
             print(f"[watcher] prerender complete -> {final_path}")
         else:
@@ -718,11 +1165,21 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     status = obs_req_client.get_record_status()
     already_recording = status.output_active
 
-    start_propresenter_thread(pp_cfg, events_q)
+    # ProPresenter is optional: Mark Start/Mark End (the 'manual' events
+    # below) can drive the whole state machine by hand, so a service can be
+    # run with no ProPresenter connection at all, or with a slide config
+    # that never matches — only OBS is actually required. Only start the
+    # connection thread if a host was actually configured; otherwise there's
+    # nothing to connect to, and trying would just reconnect-loop forever
+    # against an empty host for no benefit.
+    if pp_cfg.get("host"):
+        start_propresenter_thread(pp_cfg, events_q)
+    else:
+        print("[watcher] no ProPresenter host configured — skipping that connection; use manual Mark Start/Mark End instead")
     start_stdin_thread(events_q)
 
-    begin_slide_cfg = pp_cfg["begin_slide"]
-    end_slide_cfg = pp_cfg["end_slide"]
+    begin_slide_cfg = pp_cfg.get("begin_slide") or {}
+    end_slide_cfg = pp_cfg.get("end_slide") or {}
 
     t0 = None
     t_begin = None
@@ -957,6 +1414,12 @@ def main():
     p_stitch.add_argument("--crf", type=int, default=18, help="x264 CRF quality, lower is better (default: 18)")
     p_stitch.add_argument("--intro-duration", type=float, default=None, help=f"Seconds to show the intro for, if it's a still image (default: {DEFAULT_IMAGE_DURATION})")
     p_stitch.add_argument("--outro-duration", type=float, default=None, help=f"Seconds to show the outro for, if it's a still image (default: {DEFAULT_IMAGE_DURATION})")
+    p_stitch.add_argument(
+        "--fast-copy", action=argparse.BooleanOptionalAction, default=True,
+        help="Re-encode only the two crossfade windows and stream-copy the untouched middle of "
+             "the main clip, instead of fully re-encoding everything (default: on; needs an h264 "
+             "main clip, falls back to a full re-encode automatically otherwise)",
+    )
 
     args = parser.parse_args()
 
@@ -965,6 +1428,7 @@ def main():
             args.intro, args.main_clip, args.outro, output=args.output,
             transition_duration=args.transition_duration, transition=args.transition, crf=args.crf,
             intro_duration=args.intro_duration, outro_duration=args.outro_duration,
+            fast_copy=args.fast_copy,
         )
         return
 
@@ -977,9 +1441,14 @@ def main():
     if not cfg_path.is_file():
         sys.exit(f"Config file not found: {cfg_path}. Copy config.example.json and edit it.")
     cfg = json.loads(cfg_path.read_text())
-    pp_cfg = cfg["propresenter"]
+    # ProPresenter is optional for 'watch' (see watch()'s docstring-level
+    # comment on start_propresenter_thread) — but 'learn' exists solely to
+    # observe ProPresenter's own slide feed, so it still needs a host.
+    pp_cfg = cfg.get("propresenter", {})
 
     if args.command == "learn":
+        if not pp_cfg.get("host"):
+            sys.exit("Learn mode needs a ProPresenter host configured (Config > ProPresenter > Host) — there's nothing to connect to otherwise.")
         try:
             learn_mode(pp_cfg)
         except KeyboardInterrupt:

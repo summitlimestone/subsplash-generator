@@ -1,9 +1,13 @@
 # sclc-subsplash-generator
 
-Produces a service recording: watches ProPresenter for a "begin" and "end"
-slide, correlates those moments against an OBS recording, trims the
-recording down to the body clip, and stitches it together with a provided
-intro and outro using a crossfade at each join.
+Produces a service recording: watches for a "begin" and "end" moment,
+correlates those moments against an OBS recording, trims the recording
+down to the body clip, and stitches it together with a provided intro and
+outro using a crossfade at each join. The begin/end moments can come from
+ProPresenter slide detection, or be marked by hand (the GUI's Mark Sermon
+Start/Mark Sermon End buttons, or `mark_begin`/`mark_end` typed into a
+terminal `watch` run) — ProPresenter is entirely optional; OBS is the only
+connection actually required.
 
 Everything lives in one script, `service_video.py`, with four subcommands.
 `gui.py` is an optional desktop GUI over the same four subcommands, for
@@ -31,8 +35,10 @@ nothing about the underlying logic differs from using the terminal. On
 first run, if there's no `config.json` next to the script yet, it creates
 a starter one — real defaults where one genuinely exists (ports, CRF,
 transition, reconnect interval), honest empty fields where it can't be
-guessed (host, password, slide UIDs, clip paths). Open Config and fill
-those in before running Watch or Learn. Two windows:
+guessed (host, password, slide UIDs, clip paths). Open Config and fill in
+at least the OBS host before running Watch — ProPresenter is optional (see
+below) and only needed if you want the begin/end slides detected
+automatically instead of marking them by hand. Two windows:
 
 **Main window** — the day-to-day view, for whoever's running the service
 each week. A Live/Offline notebook plus the console:
@@ -46,8 +52,10 @@ each week. A Live/Offline notebook plus the console:
   for recording, waiting for begin/end slide, rendering, done — plus
   Prerendering/Done (Prerendered)/Done (Skipped Render), each in their own
   color, once Prerender or Skip Render is used — see below), Mark Sermon
-  Start/Mark Sermon End buttons for manually overriding ProPresenter slide
-  detection live if something goes wrong, Prerender/Skip Render buttons
+  Start/Mark Sermon End buttons for marking those moments by hand — either
+  as the primary way to run a service with no ProPresenter connection at
+  all, or to override ProPresenter slide detection live if something goes
+  wrong — Prerender/Skip Render buttons
   (see below) for once an end is marked, each enabled only when it's
   actually meaningful for the current state, and the render-state
   file path captured once Watch finishes, with a button to jump straight
@@ -75,18 +83,19 @@ via the main window's "Config" button. Hidden rather than closed when
 you dismiss it, so reopening is instant. The config file path (Load/Save)
 lives at the top, then three tabs:
 
-- **ProPresenter** — host/port/password/reconnect interval, begin/end
-  slide matching (by UID or by text), and Learn mode: connect and watch
-  discovered slide UIDs appear in a table as you step through them in
-  ProPresenter; select a row and click "Use as Begin/End Slide" to fill
-  them in.
+- **ProPresenter** — entirely optional (leave it blank to run on Mark
+  Sermon Start/Mark Sermon End alone): host/port/password/reconnect
+  interval, begin/end slide matching (by UID or by text), and Learn mode:
+  connect and watch discovered slide UIDs appear in a table as you step
+  through them in ProPresenter; select a row and click "Use as Begin/End
+  Slide" to fill them in.
 - **OBS** — host/port/password.
 - **Render** — the trim + auto-stitch settings a live Watch run uses once
   it finishes (trimmed output path, pad start/end, transition type,
-  transition duration, CRF, auto-stitch toggle) — same fields, layout, and
-  order as the Offline tab, since these are exactly what it defaults to
-  before you override them per run. The Offline tab's manual crossfade
-  tool doesn't read these values, though.
+  transition duration, CRF, fast copy trim/stitch toggles, auto-stitch
+  toggle) — same fields, layout, and order as the Offline tab, since these
+  are exactly what it defaults to before you override them per run. The
+  Offline tab's manual crossfade tool doesn't read these values, though.
 
 Starting Watch or Learn auto-saves whatever's currently in both windows to
 the config file path shown in Config, so there's no separate "save before
@@ -114,11 +123,41 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 | `--crf` | `18` | x264 quality (lower = better) |
 | `--intro-duration` | `5.0` | Seconds to show `intro` for, **if it's a still image** |
 | `--outro-duration` | `5.0` | Seconds to show `outro` for, **if it's a still image** |
+| `--fast-copy`/`--no-fast-copy` | on | Skip re-encoding the untouched middle of `main` (see below) |
 
 It normalizes all three clips to the main clip's resolution/framerate
 before crossfading (so mismatched intro/outro resolutions are fine), and
 backfills a silent audio track for any clip that doesn't have one so the
 audio crossfade never breaks.
+
+**Fast copy** (on by default): crossfading normally means decoding and
+re-encoding the *entire* intro+main+outro timeline, even though the actual
+blending only happens in two short windows (intro into the start of main,
+the end of main into outro) — for a long main clip (a whole service),
+that's most of the cost of a render for no real benefit, since the middle
+of it never actually changes. With fast copy, only those two crossfade
+windows get re-encoded; the untouched middle of `main` is stream-copied
+straight through instead, so most of a long main clip is never decoded or
+re-encoded at all. The two re-encoded windows target `main`'s own bitrate
+(read via ffprobe) rather than `--crf`, so they don't look like a quality
+jump where they meet the untouched footage — `--crf` is only actually used
+there as a fallback if that bitrate can't be determined.
+
+This needs `main` to be h264 (so the copied middle and the freshly
+re-encoded windows can sit in the same output stream) and long enough to
+actually have an untouched middle once both crossfade windows are set
+aside; if either isn't true, it automatically falls back to the normal
+full re-encode and says why. `trim`'s own fast-copy trim (below) produces
+h264 output, so a live Watch run's default pipeline (trim, then
+auto-stitch) qualifies end to end.
+
+Splitting the render into separately-produced pieces and joining them
+(via ffmpeg's concat demuxer) means the join points aren't quite as exact
+as a single continuous re-encode would be — in practice, at most a couple
+of frames either way, which isn't something you'd notice watching the
+video. `--no-fast-copy` (or `stitch.fast_copy: false` in config/render-
+state files) turns it off if you'd rather always take the slower, exactly-
+single-pass route.
 
 `intro` and `outro` can each be either a video or a still image (jpg, png,
 bmp, tif/tiff, webp) — `main` (the body clip) must always be a video. An
@@ -148,14 +187,18 @@ extra folder.
 python service_video.py watch -c config.json [--debug]
 ```
 
-Runs on the OBS machine for the whole service. Two connections stay open
-the entire time:
+Runs on the OBS machine for the whole service. **obs-websocket v5** (built
+into OBS 28+, via `obsws-python`) stays connected the entire time — this
+one's required, since `watch` needs it to know when the recording starts
+and stops.
 
-- **ProPresenter's legacy "stage display" WebSocket**
-  (`ws://host:port/stagedisplay`). ProPresenter also has a newer,
-  officially documented API, but this targets the older, better-documented
-  one.
-- **obs-websocket v5** (built into OBS 28+), via `obsws-python`.
+**ProPresenter's legacy "stage display" WebSocket**
+(`ws://host:port/stagedisplay`) is optional: leave `propresenter.host`
+blank in the config and `watch` skips that connection entirely, relying
+solely on the manual marking described below to know when the begin/end
+moments happen. Configure it if you'd rather have the begin/end slides
+detected automatically instead. ProPresenter also has a newer, officially
+documented API, but this targets the older, better-documented one.
 
 Slides are matched by **UID**, not by displayed text — most slides
 (title graphics, bumpers, video backgrounds) have no text layer, so
@@ -164,20 +207,24 @@ UID is always present and stable.
 
 State machine: wait for OBS recording to start → wait for the begin slide
 → wait for the end slide → wait for OBS recording to stop (to get the
-final file path) → trim → stitch.
+final file path) → trim → stitch. The begin/end transitions happen either
+from a ProPresenter slide match (if configured) or a manual mark (below);
+nothing else in the state machine cares which one drove it.
 
-The ProPresenter connection drops periodically as a matter of course —
-that's normal behavior of the legacy protocol, not a sign of a broken
-setup — so it reconnects on a fast, fixed interval (default 4s,
-configurable) rather than growing backoff, so a live service never has a
-widening gap where a slide-change event could be missed.
+When ProPresenter is configured, its connection drops periodically as a
+matter of course — that's normal behavior of the legacy protocol, not a
+sign of a broken setup — so it reconnects on a fast, fixed interval
+(default 4s, configurable) rather than growing backoff, so a live service
+never has a widening gap where a slide-change event could be missed.
 
-**Manual override**, for when something's gone wrong live and there's no
-time to fix ProPresenter itself — typing `mark_begin` or `mark_end` (each
-on its own line) into `watch`'s stdin does exactly what the matching slide
-being shown would do. The GUI's Live tab exposes this as "Mark Sermon
+**Manual marking** — typing `mark_begin` or `mark_end` (each on its own
+line) into `watch`'s stdin does exactly what the matching slide being
+shown would do. The GUI's Live tab exposes this as "Mark Sermon
 Start"/"Mark Sermon End" buttons, but it works the same typed directly
-into a terminal running `watch` interactively. Each is only accepted when
+into a terminal running `watch` interactively. This is the only way the
+begin/end moments get marked when ProPresenter isn't configured at all,
+and doubles as an override for when something's gone wrong live and
+there's no time to fix ProPresenter itself. Each is only accepted when
 it's actually meaningful for the current state — Mark Start needs the
 recording already running; Mark End needs a start already marked (by
 either means) — and sending the same one again while it's still valid
@@ -261,15 +308,19 @@ ProPresenter or OBS is made.
 ## Setup
 
 1. `pip install -r requirements.txt`
-2. In ProPresenter: **Preferences → Network**, enable the network API,
+2. In OBS: **Tools → WebSocket Server Settings**, enable it, note the port
+   (default `4455`) and password. This one's required — `watch` always
+   needs OBS to know when the recording starts and stops.
+3. *(Optional — skip to step 6 if you'd rather just mark the begin/end
+   moments by hand every service via Mark Sermon Start/Mark Sermon End.)*
+   In ProPresenter: **Preferences → Network**, enable the network API,
    note the port (and password, if set).
-3. In OBS: **Tools → WebSocket Server Settings**, enable it, note the port
-   (default `4455`) and password.
 4. Copy `config.example.json` → `config.json` and fill in your
-   `propresenter`/`obs` host, port, and password. (Skip this if you're
-   using `gui.py` — it creates a starter `config.json` with sensible
-   defaults the first time it runs and finds none.)
-5. Find your begin/end slide UIDs:
+   `propresenter`/`obs` host, port, and password (leave `propresenter.host`
+   blank to skip ProPresenter entirely). (Skip this if you're using
+   `gui.py` — it creates a starter `config.json` with sensible defaults the
+   first time it runs and finds none.)
+5. *(Optional, requires step 3)* Find your begin/end slide UIDs:
    ```
    python service_video.py learn -c config.json
    ```
@@ -279,13 +330,17 @@ ProPresenter or OBS is made.
    paths — each can be a video or a still image; if it's an image, also
    set `stitch.intro_duration` / `stitch.outro_duration` (in seconds).
 7. Before a real service, do a dry run with `watch -c config.json --debug`
-   and confirm the begin/end slides are detected correctly.
+   and confirm the begin/end slides are detected correctly (or, with no
+   ProPresenter configured, confirm `mark_begin`/`mark_end` — or the GUI's
+   Mark Sermon Start/Mark Sermon End buttons — move the state machine
+   along as expected).
 
 ## Config reference (`config.json`)
 
 ```jsonc
 {
-  "propresenter": {
+  "propresenter": {                       // entirely optional — leave "host" "" (or omit
+                                           // this whole section) to run on manual marking alone
     "host": "192.168.1.50",
     "port": 1025,
     "password": "",
@@ -303,7 +358,8 @@ ProPresenter or OBS is made.
     "state_output": "render_state.json",  // optional, base name for the timestamped state file
     "pad_start_seconds": 0,               // + = later/tighter start, - = earlier/more buffer
     "pad_end_seconds": 0,                 // + = later/more buffer, - = earlier/tighter end
-    "crf": 18
+    "crf": 18,
+    "fast_copy": true                     // optional, default true — see "Fast copy" below
   },
   "stitch": {
     "auto": true,
@@ -314,7 +370,8 @@ ProPresenter or OBS is made.
     "output": "final.mp4",
     "transition_duration": 1.0,
     "transition": "fade",                 // optional, default "fade" — any ffmpeg xfade transition name
-    "crf": 18                             // optional, default 18 — quality of the final stitched output
+    "crf": 18,                            // optional, default 18 — quality of the final stitched output
+    "fast_copy": true                     // optional, default true — see "Fast copy" below
   }
 }
 ```
@@ -332,3 +389,18 @@ output produced by `render`'s auto-stitch step, separately from
 `trim.crf` (which only affects the trimmed intermediate clip). Both are
 optional and default to what they've always defaulted to, so existing
 config/render-state files don't need updating.
+
+**Fast copy** (`trim.fast_copy`/`stitch.fast_copy`, both on by default):
+skips re-encoding footage that doesn't actually need it, so a live Watch
+run's trim+stitch of a long service finishes in a fraction of the time a
+full re-encode would take. `trim` re-encodes only a short sliver at the
+very start of the cut, up to the nearest keyframe (a cut can only start
+decoding there) and stream-copies everything after it; `stitch` (see the
+`stitch` subcommand section above for the full explanation) re-encodes
+only the two short crossfade windows and stream-copies the untouched
+middle of the main clip between them. Both need an h264 source and fall
+back automatically (logging why) to the old always-re-encode behavior
+whenever that's not the case, so turning this off entirely is rarely
+necessary — it exists mainly as an escape hatch (or for comparing output
+quality/timing against the pre-fast-copy behavior) rather than something
+you're expected to reach for day to day.

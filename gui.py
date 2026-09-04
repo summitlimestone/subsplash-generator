@@ -75,6 +75,7 @@ def default_config() -> dict:
             "pad_start_seconds": 0.0,
             "pad_end_seconds": 0.0,
             "crf": 18,
+            "fast_copy": True,
         },
         "stitch": {
             "auto": True,
@@ -85,6 +86,7 @@ def default_config() -> dict:
             "output": "final.mp4",
             "transition_duration": 1.0,
             "transition": "fade",
+            "fast_copy": True,
         },
     }
 
@@ -264,6 +266,22 @@ IMAGE_DURATION_HELP = (
     f"Defaults to {DEFAULT_IMAGE_DURATION}s if left blank."
 )
 
+FAST_COPY_TRIM_HELP = (
+    "Re-encodes only a short sliver at the very start (up to the nearest "
+    "keyframe — a cut can only start there) and stream-copies the rest, "
+    "instead of re-encoding the whole trimmed clip. Much faster; needs an "
+    "h264 recording, and falls back to a full re-encode automatically if "
+    "that or anything else about the fast path doesn't pan out."
+)
+FAST_COPY_STITCH_HELP = (
+    "Re-encodes only the two short crossfade windows (intro into the start "
+    "of the main clip, and the end of the main clip into outro) and "
+    "stream-copies the untouched middle, instead of re-encoding the whole "
+    "thing. Much faster for a long main clip; needs an h264 main clip, and "
+    "falls back to a full re-encode automatically if that or anything else "
+    "about the fast path doesn't pan out."
+)
+
 
 class Tooltip:
     """A small hover tooltip for a single widget, shown after a short delay
@@ -425,8 +443,10 @@ class App(tk.Tk):
             self._log(
                 f"[gui] no config.json found next to this script — created a "
                 f"starter one at {DEFAULT_CONFIG_PATH} with sensible defaults. "
-                "Open Config and fill in ProPresenter/OBS host + slide UIDs "
-                "before running Watch or Learn."
+                "Open Config and fill in the OBS host before running Watch — "
+                "ProPresenter is optional (Config > ProPresenter) and only "
+                "needed if you want slides to auto-mark start/end instead of "
+                "the Mark Start/Mark End buttons."
             )
         self.load_config(str(DEFAULT_CONFIG_PATH))
 
@@ -1047,8 +1067,24 @@ class App(tk.Tk):
 
         self._crf_slider(frame, 8, "CRF (quality)", "st_crf", col=0, colspan=3)
 
+        self.vars["st_trim_fast_copy"] = tk.BooleanVar(value=True)
+        trim_fast_cb = ttk.Checkbutton(
+            frame, text="Fast copy trim (recommended)", variable=self.vars["st_trim_fast_copy"],
+        )
+        trim_fast_cb.grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(trim_fast_cb, FAST_COPY_TRIM_HELP + " Only applies when re-trimming from a raw "
+                "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
+                "is then assumed to already be trimmed.", font=self.ui_font)
+
+        self.vars["st_stitch_fast_copy"] = tk.BooleanVar(value=True)
+        stitch_fast_cb = ttk.Checkbutton(
+            frame, text="Fast copy stitch (recommended)", variable=self.vars["st_stitch_fast_copy"],
+        )
+        stitch_fast_cb.grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(stitch_fast_cb, FAST_COPY_STITCH_HELP, font=self.ui_font)
+
         start_btn = ttk.Button(frame, text="Run Render", style="Accent.TButton", command=self._run_render)
-        start_btn.grid(row=9, column=0, sticky="w", pady=(10, 0))
+        start_btn.grid(row=11, column=0, sticky="w", pady=(10, 0))
         self._start_buttons.append(start_btn)
 
     def _browse_render_state(self):
@@ -1087,6 +1123,10 @@ class App(tk.Tk):
         crf_val = stitch_cfg.get("crf", trim_cfg.get("crf"))
         if crf_val is not None:
             self.vars["st_crf"].set(max(0, min(51, round(crf_val))))
+        if "fast_copy" in trim_cfg:
+            self.vars["st_trim_fast_copy"].set(bool(trim_cfg["fast_copy"]))
+        if "fast_copy" in stitch_cfg:
+            self.vars["st_stitch_fast_copy"].set(bool(stitch_cfg["fast_copy"]))
 
         has_raw = "recording_path" in state and "raw_begin_offset" in state and "raw_end_offset" in state
         if has_raw:
@@ -1225,6 +1265,7 @@ class App(tk.Tk):
         self.vars["trim_pad_start"].set(str(trim.get("pad_start_seconds", 0)))
         self.vars["trim_pad_end"].set(str(trim.get("pad_end_seconds", 0)))
         self.vars["trim_crf"].set(max(0, min(51, round(trim.get("crf", 18)))))
+        self.vars["trim_fast_copy"].set(bool(trim.get("fast_copy", True)))
 
         self.vars["stitch_auto"].set(bool(stitch.get("auto", True)))
         self.vars["stitch_intro"].set(stitch.get("intro", ""))
@@ -1234,6 +1275,7 @@ class App(tk.Tk):
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
         self.vars["stitch_transition_duration"].set(str(stitch.get("transition_duration", 1.0)))
         self.vars["stitch_transition"].set(stitch.get("transition", "fade"))
+        self.vars["stitch_fast_copy"].set(bool(stitch.get("fast_copy", True)))
 
         self.config_path_var.set(str(path))
         self._log(f"[gui] loaded config from {path}")
@@ -1255,15 +1297,18 @@ class App(tk.Tk):
             self.vars[f"{prefix}_case_sensitive"].set(bool(slide_cfg.get("case_sensitive", False)))
 
     def _collect_slide(self, prefix: str) -> dict:
+        """A blank UID/text is allowed — ProPresenter is optional (Mark
+        Start/Mark End can drive the whole run by hand), so leaving a slide
+        unset just means that end never auto-matches rather than blocking
+        Save/Start Watch; service_video.py's slide_matches() already treats
+        an empty slide config as "never matches"."""
         mode = self.vars[f"{prefix}_mode"].get()
         if mode == "uid":
             uid = self.vars[f"{prefix}_uid"].get().strip()
-            if not uid:
-                raise ValueError(f"{prefix.capitalize()} slide UID is empty (or switch to text matching)")
-            return {"uid": uid}
+            return {"uid": uid} if uid else {}
         text = self.vars[f"{prefix}_text"].get().strip()
         if not text:
-            raise ValueError(f"{prefix.capitalize()} slide text is empty")
+            return {}
         match_mode = self.vars[f"{prefix}_match_mode"].get()
         if match_mode == "regex":
             try:
@@ -1280,10 +1325,14 @@ class App(tk.Tk):
         v = self.vars
         return {
             "propresenter": {
+                # Host (and everything else here) is optional — see
+                # _collect_slide's docstring; a blank port/reconnect
+                # interval falls back rather than blocking Save/Start Watch
+                # just because ProPresenter isn't being used this run.
                 "host": v["pp_host"].get().strip(),
-                "port": to_int(v["pp_port"].get().strip(), "ProPresenter port"),
+                "port": to_int(v["pp_port"].get().strip() or "1025", "ProPresenter port"),
                 "password": v["pp_password"].get(),
-                "reconnect_interval_seconds": to_int(v["pp_reconnect"].get().strip(), "Reconnect interval"),
+                "reconnect_interval_seconds": to_int(v["pp_reconnect"].get().strip() or "4", "Reconnect interval"),
                 "begin_slide": self._collect_slide("begin"),
                 "end_slide": self._collect_slide("end"),
             },
@@ -1298,6 +1347,7 @@ class App(tk.Tk):
                 "pad_start_seconds": to_float(v["trim_pad_start"].get().strip() or "0", "Pad start seconds"),
                 "pad_end_seconds": to_float(v["trim_pad_end"].get().strip() or "0", "Pad end seconds"),
                 "crf": v["trim_crf"].get(),
+                "fast_copy": bool(v["trim_fast_copy"].get()),
             },
             "stitch": {
                 "auto": bool(v["stitch_auto"].get()),
@@ -1314,6 +1364,7 @@ class App(tk.Tk):
                     v["stitch_transition_duration"].get().strip() or "1.0", "Transition duration"
                 ),
                 "transition": v["stitch_transition"].get().strip() or "fade",
+                "fast_copy": bool(v["stitch_fast_copy"].get()),
             },
         }
 
@@ -1554,6 +1605,8 @@ class App(tk.Tk):
                 self.vars["st_outro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
             )
             crf = self.vars["st_crf"].get()
+            trim_fast_copy = bool(self.vars["st_trim_fast_copy"].get())
+            stitch_fast_copy = bool(self.vars["st_stitch_fast_copy"].get())
             start_ts = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
             end_ts = to_timestamp(self.vars["st_end"].get().strip() or "00:00:00.000", "Sermon end")
         except ValueError as e:
@@ -1590,6 +1643,7 @@ class App(tk.Tk):
                     "pad_start_seconds": 0,
                     "pad_end_seconds": 0,
                     "crf": crf,
+                    "fast_copy": trim_fast_copy,
                 },
                 "stitch": {
                     "auto": True,
@@ -1601,6 +1655,7 @@ class App(tk.Tk):
                     "transition_duration": duration,
                     "transition": transition,
                     "crf": crf,
+                    "fast_copy": stitch_fast_copy,
                 },
             }
             state_path = raw["state_path"]
@@ -1612,6 +1667,7 @@ class App(tk.Tk):
                 "stitch", intro, main_clip, outro,
                 "-o", output, "-d", str(duration), "-t", transition, "--crf", str(crf),
                 "--intro-duration", str(intro_duration), "--outro-duration", str(outro_duration),
+                "--fast-copy" if stitch_fast_copy else "--no-fast-copy",
             ]
             self._start("stitch", args)
 
@@ -1680,24 +1736,33 @@ class ConfigWindow(tk.Toplevel):
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(3, weight=1)
 
-        app._labeled_entry(frame, 0, "Host", "pp_host")
-        app._labeled_entry(frame, 0, "Port", "pp_port", width=10, col=2)
+        ttk.Label(
+            frame,
+            text="Entirely optional — since Mark Start/Mark End on the Live tab can "
+            "drive a whole run by hand, Watch works fine with no ProPresenter "
+            "connection at all. Fill this in only if you want the begin/end slides "
+            "detected automatically instead.",
+            style="Muted.TLabel", wraplength=540, justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        app._labeled_entry(frame, 1, "Host", "pp_host")
+        app._labeled_entry(frame, 1, "Port", "pp_port", width=10, col=2)
         app.show_pw_var = tk.BooleanVar(value=False)
-        pw_entry = app._labeled_entry(frame, 1, "Password", "pp_password", show="•")
-        app._labeled_entry(frame, 1, "Reconnect (s)", "pp_reconnect", width=10, col=2)
+        pw_entry = app._labeled_entry(frame, 2, "Password", "pp_password", show="•")
+        app._labeled_entry(frame, 2, "Reconnect (s)", "pp_reconnect", width=10, col=2)
         ttk.Checkbutton(
             frame, text="Show passwords", variable=app.show_pw_var, command=app._toggle_show_passwords
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         app._pw_entries = [pw_entry]
 
-        app._build_slide_picker(frame, row=3, prefix="begin", label="Begin slide")
-        app._build_slide_picker(frame, row=8, prefix="end", label="End slide")
+        app._build_slide_picker(frame, row=4, prefix="begin", label="Begin slide")
+        app._build_slide_picker(frame, row=9, prefix="end", label="End slide")
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=12, column=0, columnspan=4, sticky="ew", pady=(12, 8)
+            row=13, column=0, columnspan=4, sticky="ew", pady=(12, 8)
         )
         ttk.Label(frame, text="Learn slide UIDs", style="Header.TLabel").grid(
-            row=13, column=0, columnspan=4, sticky="w"
+            row=14, column=0, columnspan=4, sticky="w"
         )
         ttk.Label(
             frame,
@@ -1705,17 +1770,17 @@ class ConfigWindow(tk.Toplevel):
             "slides in ProPresenter — each distinct slide shown appears below with "
             "its UID.",
             style="Muted.TLabel", wraplength=540, justify="left",
-        ).grid(row=14, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        ).grid(row=15, column=0, columnspan=4, sticky="w", pady=(2, 6))
 
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=15, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        btn_row.grid(row=16, column=0, columnspan=4, sticky="w", pady=(0, 6))
         start_btn = ttk.Button(btn_row, text="Start Learn", style="Accent.TButton", command=app._run_learn)
         start_btn.pack(side="left")
         app._start_buttons.append(start_btn)
 
-        frame.rowconfigure(16, weight=1)
+        frame.rowconfigure(17, weight=1)
         tree_frame = ttk.Frame(frame)
-        tree_frame.grid(row=16, column=0, columnspan=4, sticky="nsew", pady=(0, 6))
+        tree_frame.grid(row=17, column=0, columnspan=4, sticky="nsew", pady=(0, 6))
         self.learn_tree = ttk.Treeview(tree_frame, columns=("uid", "text"), show="headings", height=8)
         self.learn_tree.heading("uid", text="UID")
         self.learn_tree.heading("text", text="Text")
@@ -1727,7 +1792,7 @@ class ConfigWindow(tk.Toplevel):
         tree_scroll.pack(side="left", fill="y")
 
         assign_row = ttk.Frame(frame)
-        assign_row.grid(row=17, column=0, columnspan=4, sticky="w")
+        assign_row.grid(row=18, column=0, columnspan=4, sticky="w")
         ttk.Button(
             assign_row, text="Use selected as Begin Slide", command=lambda: self._assign_slide("begin")
         ).pack(side="left")
@@ -1811,13 +1876,27 @@ class ConfigWindow(tk.Toplevel):
 
         app._crf_slider(frame, 6, "CRF (quality)", "trim_crf", col=0, colspan=3)
 
+        app.vars["trim_fast_copy"] = tk.BooleanVar(value=True)
+        fast_trim_cb = ttk.Checkbutton(
+            frame, text="Fast copy trim (recommended)", variable=app.vars["trim_fast_copy"],
+        )
+        fast_trim_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(fast_trim_cb, FAST_COPY_TRIM_HELP, font=app.ui_font)
+
+        app.vars["stitch_fast_copy"] = tk.BooleanVar(value=True)
+        fast_stitch_cb = ttk.Checkbutton(
+            frame, text="Fast copy stitch (recommended)", variable=app.vars["stitch_fast_copy"],
+        )
+        fast_stitch_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(fast_stitch_cb, FAST_COPY_STITCH_HELP, font=app.ui_font)
+
         ttk.Separator(frame, orient="horizontal").grid(
-            row=7, column=0, columnspan=5, sticky="ew", pady=(12, 8)
+            row=9, column=0, columnspan=5, sticky="ew", pady=(12, 8)
         )
         app.vars["stitch_auto"] = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame, text="Auto-stitch after trim", variable=app.vars["stitch_auto"],
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
+        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
 
 
 if __name__ == "__main__":

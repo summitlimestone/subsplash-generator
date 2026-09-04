@@ -20,7 +20,8 @@
     "output": "body_trimmed.mp4",
     "pad_start_seconds": 0,
     "pad_end_seconds": 0,
-    "crf": 18
+    "crf": 18,
+    "fast_copy": true
   },
   "stitch": {
     "auto": true,
@@ -30,6 +31,7 @@
     "outro_duration": 5.0,
     "output": "final.mp4",
     "transition_duration": 1.0,
-    "transition": "fade"
+    "transition": "fade",
+    "fast_copy": true
   }
 }
