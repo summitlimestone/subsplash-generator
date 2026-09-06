@@ -39,7 +39,9 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +59,9 @@ def default_config() -> dict:
     clip paths) — not example.json's fake example values, which could be
     mistaken for already being configured."""
     return {
+        "general": {
+            "log_path": DEFAULT_LOG_PATH,
+        },
         "propresenter": {
             "host": "",
             "port": 1025,
@@ -72,11 +77,13 @@ def default_config() -> dict:
         },
         "trim": {
             "output": "body_trimmed.mp4",
-            "state_output": "render_state.json",
+            "state_output": DEFAULT_STATE_OUTPUT,
             "pad_start_seconds": 0.0,
             "pad_end_seconds": 0.0,
-            "crf": 18,
+            "crf": 23,
             "fast_copy": True,
+            "encoder": "nvenc",
+            "encoder_preset": None,
         },
         "stitch": {
             "auto": True,
@@ -87,7 +94,14 @@ def default_config() -> dict:
             "output": "final.mp4",
             "transition_duration": 1.0,
             "transition": "fade",
-            "fast_copy": True,
+            # Off by default and not exposed in the GUI — see stitch()'s
+            # own docstring in service_video.py: it's always safe to turn
+            # on (verifies its own result before trusting it), just not
+            # actually useful in practice. Still settable by hand (or via
+            # the CLI's --fast-copy) if that ever changes.
+            "fast_copy": False,
+            "encoder": "nvenc",
+            "encoder_preset": None,
         },
     }
 
@@ -95,6 +109,16 @@ STATE_RE = re.compile(r"state = (\w+)")
 RENDER_STATE_PATH_RE = re.compile(r"wrote render state -> (.+)$")
 SLIDE_RE = re.compile(r'^uid: "(.*)"\s+text: (.*)$')
 PRERENDER_STATUS_RE = re.compile(r"prerender status = (\w+)")
+# Mirrors service_video.py's _print_step() output exactly (see
+# _MACHINE_PROGRESS/--machine-progress there) — "[progress] step N/M
+# duration=D.DDD: <description>".
+PROGRESS_STEP_RE = re.compile(r"^\[progress\] step (\d+)/(\d+) duration=([\d.]+):")
+# A bare ffmpeg -progress field line, e.g. "out_time_us=1234567" — matched
+# generically (not by an exhaustive list of known keys) so a future
+# ffmpeg version adding new fields still gets swallowed into the progress
+# readout instead of leaking into the log; only consulted while
+# App._in_progress_step is true, i.e. right after a PROGRESS_STEP_RE line.
+PROGRESS_FIELD_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$")
 
 # service_video.py's internal state machine names, relabeled for display —
 # names not listed here (WAIT_RECORD_START etc.) show as-is.
@@ -103,6 +127,7 @@ WATCH_STATE_LABELS = {
 }
 
 JSON_FILETYPES = [("JSON files", "*.json"), ("All files", "*.*")]
+LOG_FILETYPES = [("Log files", "*.log *.txt"), ("All files", "*.*")]
 VIDEO_FILETYPES = [("Video files", "*.mp4 *.mov *.mkv *.m4v *.avi"), ("All files", "*.*")]
 # Intro/outro can be either a video or a still image (see IMAGE_DURATION_HELP) —
 # their Browse buttons use this instead of VIDEO_FILETYPES.
@@ -111,6 +136,13 @@ INTRO_OUTRO_FILETYPES = [
     ("All files", "*.*"),
 ]
 DEFAULT_IMAGE_DURATION = 5.0
+# Mirrors service_video.py's DEFAULT_STATE_OUTPUT exactly — duplicated
+# rather than imported, same as format_timestamp()/parse_timestamp().
+DEFAULT_STATE_OUTPUT = "render_state_%Y%m%d_%H%M%S.json"
+# GUI-only (service_video.py has no console of its own to log) — see
+# App._sync_log_file(). Same %Y%m%d_%H%M%S timestamp convention as
+# DEFAULT_STATE_OUTPUT, expanded via expand_output_path() below.
+DEFAULT_LOG_PATH = "console_%Y%m%d_%H%M%S.log"
 
 # Matches the Summit Limestone brand palette used by the companion
 # subsplash-form site (summitlimestone.github.io/subsplash-form) — its
@@ -197,6 +229,34 @@ def to_timestamp(text: str, field: str) -> float:
         raise ValueError(f"{field} must be HH:MM:SS.mmm (got {text!r})")
 
 
+def expand_output_path(path: str) -> str:
+    """Duplicated from service_video.py's function of the same name
+    (rather than imported — this script only ever runs service_video.py
+    as a subprocess, never imports it) so App._sync_log_file() can expand
+    general.log_path itself, the same way every other output-path field
+    in this GUI is expanded by service_video.py once it's handed the raw
+    string. Only the filename is expanded, not any directory part of the
+    path — see service_video.py's own copy for the full reasoning."""
+    p = Path(path)
+    name = datetime.now().strftime(p.name).replace("/", "-").replace("\\", "-")
+    return str(p.with_name(name)) if p.name else path
+
+
+def format_elapsed(seconds: float) -> str:
+    """Formats a wall-clock duration for the "took ..." summary shown in
+    the console header's speed slot once a run finishes (see
+    App._on_process_exit()) — h/m/s, omitting leading zero units (e.g.
+    "45s", "2m 15s", "1h 03m 22s")."""
+    total = round(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
 # ffmpeg's xfade filter transition names (video-filters.html#xfade-1), for
 # the Transition type dropdown. Editable, not readonly — these cover the
 # built-in set, but xfade also accepts a custom expression, so free typing
@@ -217,6 +277,49 @@ XFADE_TRANSITIONS = [
     "coverleft", "coverright", "coverup", "coverdown",
     "revealleft", "revealright", "revealup", "revealdown",
 ]
+
+# Mirrors service_video.py's ENCODER_PROFILES keys exactly — duplicated
+# rather than imported, same as format_timestamp()/parse_timestamp(),
+# since this GUI only ever talks to that script as a subprocess.
+ENCODER_CHOICES = ["software", "nvenc", "qsv", "amf", "videotoolbox"]
+ENCODER_HELP = (
+    "Which encoder the full re-encode (not fast copy's own small "
+    "re-encoded windows) uses. \"software\" is libx264, the same as "
+    "always. A hardware choice (nvenc: NVIDIA, qsv: Intel Quick Sync, "
+    "amf: AMD, videotoolbox: Apple/macOS) can be dramatically faster if "
+    "the machine actually has one — if it fails to run at all (no such "
+    "hardware, wrong driver, etc.) it automatically falls back to "
+    "software and logs why, so it's safe to leave set either way. Quality/"
+    "size at a given CRF isn't quite comparable across encoders, though —  "
+    "expect to eyeball it against your own footage rather than assume "
+    "parity with software."
+)
+
+# Mirrors service_video.py's ENCODER_PROFILES "presets"/"default_preset"
+# per encoder exactly — duplicated rather than imported, same as
+# ENCODER_CHOICES. Keyed the same as ENCODER_CHOICES; the Encoder preset
+# dropdown's values/default are swapped to match whichever's selected
+# (see _wire_encoder_preset_choices()) since preset names aren't shared
+# across encoders.
+ENCODER_PRESET_CHOICES = {
+    "software": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+    "nvenc": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+    "qsv": ["veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+    "amf": ["speed", "balanced", "quality", "high_quality"],
+    "videotoolbox": [],
+}
+ENCODER_DEFAULT_PRESETS = {
+    "software": "veryfast", "nvenc": "p4", "qsv": "veryfast", "amf": "speed", "videotoolbox": "",
+}
+ENCODER_PRESET_HELP = (
+    "That encoder's own speed/quality preset — names and effect differ per "
+    "encoder, so this follows whichever's picked above. A hardware "
+    "encoder's fastest preset tends to give up noticeably more compression "
+    "efficiency for its extra speed than a CPU preset does (confirmed with "
+    "NVENC: its fastest, p1, produced files around 4x the size of software "
+    "at the same CRF — p4, used here by default, is a much closer match "
+    "without losing much of the speed advantage)."
+)
 
 
 CRF_HELP = (
@@ -246,6 +349,14 @@ TIMESTAMP_HELP = (
     "is expanded, not any folder in the path."
 )
 
+LOG_PATH_HELP = (
+    TIMESTAMP_HELP + " The timestamp (if any) is filled in once, the "
+    "first time this app opens the file — not re-expanded on every line "
+    "written — so a whole session's console output lands in one file. "
+    "Leave blank to turn off file logging entirely; the console pane "
+    "itself is unaffected either way."
+)
+
 PRERENDER_HELP = (
     "Starts trim+stitch now, reading the recording while OBS is still "
     "writing it, instead of waiting for the recording to stop. Counts as "
@@ -267,20 +378,18 @@ IMAGE_DURATION_HELP = (
     f"Defaults to {DEFAULT_IMAGE_DURATION}s if left blank."
 )
 
-FAST_COPY_TRIM_HELP = (
+FAST_COPY_HELP = (
     "Re-encodes only a short sliver at the very start (up to the nearest "
     "keyframe — a cut can only start there) and stream-copies the rest, "
     "instead of re-encoding the whole trimmed clip. Much faster; needs an "
-    "h264 recording, and falls back to a full re-encode automatically if "
-    "that or anything else about the fast path doesn't pan out."
-)
-FAST_COPY_STITCH_HELP = (
-    "Re-encodes only the two short crossfade windows (intro into the start "
-    "of the main clip, and the end of the main clip into outro) and "
-    "stream-copies the untouched middle, instead of re-encoding the whole "
-    "thing. Much faster for a long main clip; needs an h264 main clip, and "
-    "falls back to a full re-encode automatically if that or anything else "
-    "about the fast path doesn't pan out."
+    "h264 or hevc recording, and always verifies its own result actually "
+    "decodes cleanly before trusting it, falling back to a full re-encode "
+    "automatically otherwise. (Stitching the intro/outro on afterward "
+    "always fully re-encodes regardless — crossfading forces a real "
+    "decode+re-encode of those clips, which in testing never came out "
+    "compatible enough with the trimmed clip's own encoding to stream-copy "
+    "the rest, so there's no equivalent toggle for it. It uses a fast x264 "
+    "preset instead.)"
 )
 
 
@@ -358,6 +467,15 @@ class ProcessRunner:
         # broken even though it's working fine underneath. bufsize=1
         # below only affects how *this* process reads the pipe; it can't
         # do anything about how the child buffers its own writes.
+        #
+        # --machine-progress on every subcommand that can run ffmpeg
+        # (learn never does, so it's left off there) — switches
+        # service_video.py's ffmpeg calls to machine-readable progress
+        # output instead of the normal human stats line, which App parses
+        # into the progress bar/step/speed readout next to the console
+        # status instead of logging it (see App._handle_progress_line()).
+        if args and args[0] in ("watch", "render", "stitch"):
+            args = [*args, "--machine-progress"]
         cmd = [sys.executable, "-u", str(SERVICE_SCRIPT), *args]
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -413,6 +531,33 @@ class App(tk.Tk):
         # _handle_watch_line()/_on_process_exit(). Reset at the start of
         # each watch run.
         self._prerender_locked = False
+        # See _handle_progress_line(): whether the most recently parsed
+        # line was a "[progress] step N/M" marker (or a progress field
+        # following one) — while true, key=value lines get swallowed
+        # into the progress bar/step/speed readout instead of logged.
+        # Reset at the start of every run and when one exits, same as
+        # _prerender_locked above.
+        self._in_progress_step = False
+        self._progress_step_duration: float | None = None
+        # When the current run started (time.monotonic(), so a system
+        # clock change mid-run can't skew it) — set in _start(), read in
+        # _on_process_exit() to show "took ..." in place of the last
+        # speed reading once the run finishes; see _format_duration().
+        self._run_started_at: float | None = None
+        # Set by _run_render()'s raw-trim path when it hands 'render' a
+        # throwaway temp render-state file instead of overwriting the
+        # loaded one — cleaned up in _on_process_exit() once that run
+        # finishes, whichever way.
+        self._temp_render_state_path: str | None = None
+        # The open console-log file handle (see _sync_log_file()/_log()),
+        # None while file logging is off (general.log_path blank, or it
+        # failed to open). _log_path_raw is the unexpanded general.log_path
+        # value the currently-open handle was last opened for, so
+        # _sync_log_file() only actually reopens (and re-expands any
+        # timestamp) when that setting has genuinely changed, rather than
+        # on every config save/autosave.
+        self._log_file = None
+        self._log_path_raw: str | None = None
         self._queue: "queue.Queue" = queue.Queue()
         self.runner = ProcessRunner(
             on_line=lambda line: self._queue.put(("line", line)),
@@ -438,6 +583,11 @@ class App(tk.Tk):
         # need the full field set regardless of whether the user has ever
         # opened the Config window.
         self.config_window = ConfigWindow(self)
+        # Same reasoning — built eagerly (but hidden) so st_crf/
+        # st_trim_fast_copy/st_encoder/st_encoder_preset exist regardless
+        # of whether the user has ever opened it via the Offline tab's
+        # "Advanced…" button.
+        self.offline_advanced_window = OfflineAdvancedWindow(self)
 
         if not DEFAULT_CONFIG_PATH.is_file():
             DEFAULT_CONFIG_PATH.write_text(json.dumps(default_config(), indent=2))
@@ -791,6 +941,22 @@ class App(tk.Tk):
         self.vars[key] = var
         return combo
 
+    def _wire_encoder_preset_choices(self, encoder_key: str, preset_combo, preset_key: str):
+        """Keep an Encoder preset combobox's values (and current value, if
+        it's not one of them) in sync with whichever Encoder is currently
+        selected — preset names aren't shared across encoders (see
+        ENCODER_PRESET_CHOICES), so the dropdown has to swap its whole
+        option list rather than just filtering, and reset to the newly-
+        selected encoder's own default if the old value doesn't carry over."""
+        def refresh(*_):
+            encoder = self.vars[encoder_key].get()
+            choices = ENCODER_PRESET_CHOICES.get(encoder, [])
+            preset_combo.configure(values=choices)
+            if self.vars[preset_key].get() not in choices:
+                self.vars[preset_key].set(ENCODER_DEFAULT_PRESETS.get(encoder, ""))
+        self.vars[encoder_key].trace_add("write", refresh)
+        refresh()
+
     def _labeled_spinbox(
         self, parent, row, label, key, from_=-30.0, to=30.0, increment=0.1,
         default="0.0", width=10, col=0, pad_left=0, colspan=1, help_text=None,
@@ -827,7 +993,7 @@ class App(tk.Tk):
             row=row, column=col + 1, sticky="w", padx=(4, 0), pady=3
         )
 
-    def _crf_slider(self, parent, row, label, key, col=0, colspan=1, default=18):
+    def _crf_slider(self, parent, row, label, key, col=0, colspan=1, default=23):
         """A 0-51 CRF slider with a live numeric readout, replacing a plain
         text entry for this one field everywhere it appears — stored as an
         IntVar (not the StringVar _labeled_entry uses) so the slider can
@@ -1069,27 +1235,22 @@ class App(tk.Tk):
         self._labeled_entry(frame, 7, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
         self.vars["st_duration"].set("1.0")
 
-        self._crf_slider(frame, 8, "CRF (quality)", "st_crf", col=0, colspan=3)
-
-        self.vars["st_trim_fast_copy"] = tk.BooleanVar(value=True)
-        trim_fast_cb = ttk.Checkbutton(
-            frame, text="Fast copy trim (recommended)", variable=self.vars["st_trim_fast_copy"],
+        # CRF/Fast copy/Encoder/Encoder preset live in their own "Advanced"
+        # window (see OfflineAdvancedWindow) rather than inline here —
+        # tuning knobs set once and rarely touched, unlike everything
+        # above, which changes per run.
+        ttk.Button(frame, text="Advanced…", command=self._open_offline_advanced_window).grid(
+            row=8, column=0, sticky="w", pady=(6, 0)
         )
-        trim_fast_cb.grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
-        Tooltip(trim_fast_cb, FAST_COPY_TRIM_HELP + " Only applies when re-trimming from a raw "
-                "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
-                "is then assumed to already be trimmed.", font=self.ui_font)
-
-        self.vars["st_stitch_fast_copy"] = tk.BooleanVar(value=True)
-        stitch_fast_cb = ttk.Checkbutton(
-            frame, text="Fast copy stitch (recommended)", variable=self.vars["st_stitch_fast_copy"],
-        )
-        stitch_fast_cb.grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
-        Tooltip(stitch_fast_cb, FAST_COPY_STITCH_HELP, font=self.ui_font)
 
         start_btn = ttk.Button(frame, text="Run Render", style="Accent.TButton", command=self._run_render)
-        start_btn.grid(row=11, column=0, sticky="w", pady=(10, 0))
+        start_btn.grid(row=9, column=0, sticky="w", pady=(10, 0))
         self._start_buttons.append(start_btn)
+
+    def _open_offline_advanced_window(self):
+        self.offline_advanced_window.deiconify()
+        self.offline_advanced_window.lift()
+        self.offline_advanced_window.focus_set()
 
     def _browse_render_state(self):
         path = filedialog.askopenfilename(
@@ -1129,8 +1290,13 @@ class App(tk.Tk):
             self.vars["st_crf"].set(max(0, min(51, round(crf_val))))
         if "fast_copy" in trim_cfg:
             self.vars["st_trim_fast_copy"].set(bool(trim_cfg["fast_copy"]))
-        if "fast_copy" in stitch_cfg:
-            self.vars["st_stitch_fast_copy"].set(bool(stitch_cfg["fast_copy"]))
+        if "encoder" in stitch_cfg or "encoder" in trim_cfg:
+            # Set encoder_preset *after* encoder — see load_config()'s
+            # identical comment on why the order matters here.
+            self.vars["st_encoder"].set(stitch_cfg.get("encoder", trim_cfg.get("encoder", "nvenc")))
+            saved_preset = stitch_cfg.get("encoder_preset") or trim_cfg.get("encoder_preset")
+            if saved_preset:
+                self.vars["st_encoder_preset"].set(saved_preset)
 
         has_raw = "recording_path" in state and "raw_begin_offset" in state and "raw_end_offset" in state
         if has_raw:
@@ -1157,7 +1323,7 @@ class App(tk.Tk):
             self._offline_raw_state = {
                 "recording_path": state["recording_path"],
                 "trim_output": trim_cfg.get("output", "body_trimmed.mp4"),
-                "state_output": trim_cfg.get("state_output", "render_state.json"),
+                "state_output": trim_cfg.get("state_output", DEFAULT_STATE_OUTPUT),
                 "state_path": path,
             }
             self._log(f"[gui] loaded render fields from {path} (timestamps active — Run will re-trim the raw recording)")
@@ -1192,6 +1358,25 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="idle")
         self.status_label = ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel")
         self.status_label.pack(side="left", padx=(10, 0))
+
+        # ffmpeg's own progress (see _handle_progress_line()) — step
+        # count on the left, a determinate bar, render speed on the
+        # right, replacing the wall of frame=.../time=.../speed=... lines
+        # ffmpeg would otherwise print once per step. All start blank/at
+        # 0 and stay that way outside of a step actually reporting
+        # progress (most non-ffmpeg output, and 'learn', never touch
+        # these at all).
+        self.progress_step_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.progress_step_var, style="Muted.TLabel").pack(
+            side="left", padx=(10, 4)
+        )
+        self.progress_bar = ttk.Progressbar(header, mode="determinate", maximum=100, length=140)
+        self.progress_bar.pack(side="left")
+        self.progress_speed_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.progress_speed_var, style="Muted.TLabel").pack(
+            side="left", padx=(4, 0)
+        )
+
         ttk.Button(header, text="Clear", command=self._clear_console).pack(side="right")
         self.stop_button = ttk.Button(
             header, text="Stop", style="Danger.TButton", command=self._stop, state="disabled"
@@ -1223,6 +1408,48 @@ class App(tk.Tk):
         self.console.insert("end", line + "\n")
         self.console.see("end")
         self.console.configure(state="disabled")
+        if self._log_file:
+            try:
+                self._log_file.write(line + "\n")
+                self._log_file.flush()
+            except OSError:
+                # Don't let a mid-session write failure (e.g. the disk
+                # filling up, or the file's been deleted/unmounted out from
+                # under this) take the console pane down with it — just
+                # stop trying to write to a file that's stopped working.
+                self._log_file = None
+
+    def _sync_log_file(self):
+        """(Re)opens the console log file at general.log_path if that
+        setting has actually changed since the last time this ran —
+        called wherever a changed log_path takes effect: after loading a
+        config, after Save Config, and after the autosave a run does
+        before starting. A blank path turns file logging off. The path is
+        expanded (any timestamp placeholder filled in) once, right here,
+        rather than on every line _log() writes — so a whole session's
+        console output lands in one file instead of a new one per line —
+        which is also why this only reopens on an actual change rather
+        than every time one of those callers runs, even with an unchanged
+        path: reopening on every autosave (before every single run) would
+        otherwise mean a session's output gets fragmented across a new
+        timestamped file per run instead of staying in one place."""
+        raw = self.vars["log_path"].get().strip()
+        if raw == self._log_path_raw and (self._log_file or not raw):
+            return
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
+        self._log_path_raw = raw
+        if not raw:
+            return
+        expanded = expand_output_path(raw)
+        try:
+            self._log_file = open(expanded, "a", encoding="utf-8")
+        except OSError as e:
+            self._log(f"[gui] couldn't open log file {expanded}: {e}")
 
     # ------------------------------------------------------------------
     # Config load/save (widgets live in the main window's Live tab and in
@@ -1248,10 +1475,13 @@ class App(tk.Tk):
             messagebox.showerror("Load config", f"Invalid JSON: {e}")
             return
 
+        general = cfg.get("general", {})
         pp = cfg.get("propresenter", {})
         obs = cfg.get("obs", {})
         trim = cfg.get("trim", {})
         stitch = cfg.get("stitch", {})
+
+        self.vars["log_path"].set(general.get("log_path", DEFAULT_LOG_PATH))
 
         self.vars["pp_host"].set(pp.get("host", ""))
         self.vars["pp_port"].set(str(pp.get("port", "")))
@@ -1265,11 +1495,23 @@ class App(tk.Tk):
         self.vars["obs_password"].set(obs.get("password", ""))
 
         self.vars["trim_output"].set(trim.get("output", "body_trimmed.mp4"))
-        self.vars["trim_state_output"].set(trim.get("state_output", "render_state.json"))
+        self.vars["trim_state_output"].set(trim.get("state_output", DEFAULT_STATE_OUTPUT))
         self.vars["trim_pad_start"].set(str(trim.get("pad_start_seconds", 0)))
         self.vars["trim_pad_end"].set(str(trim.get("pad_end_seconds", 0)))
-        self.vars["trim_crf"].set(max(0, min(51, round(trim.get("crf", 18)))))
+        self.vars["trim_crf"].set(max(0, min(51, round(trim.get("crf", 23)))))
         self.vars["trim_fast_copy"].set(bool(trim.get("fast_copy", True)))
+        # One shared control for both trim.encoder and stitch.encoder (see
+        # collect_config()) — on load, prefer stitch's (what determines
+        # the final video's encoder, same as the Offline tab's CRF field
+        # prefers stitch.crf for the same reason) and fall back to trim's.
+        # Set encoder_preset *after* encoder — setting encoder resets it
+        # to that encoder's own default (see _wire_encoder_preset_choices()),
+        # which a saved preset value should override, not the other way
+        # around.
+        self.vars["encoder"].set(stitch.get("encoder", trim.get("encoder", "nvenc")))
+        saved_preset = stitch.get("encoder_preset") or trim.get("encoder_preset")
+        if saved_preset:
+            self.vars["encoder_preset"].set(saved_preset)
 
         self.vars["stitch_auto"].set(bool(stitch.get("auto", True)))
         self.vars["stitch_intro"].set(stitch.get("intro", ""))
@@ -1279,9 +1521,9 @@ class App(tk.Tk):
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
         self.vars["stitch_transition_duration"].set(str(stitch.get("transition_duration", 1.0)))
         self.vars["stitch_transition"].set(stitch.get("transition", "fade"))
-        self.vars["stitch_fast_copy"].set(bool(stitch.get("fast_copy", True)))
 
         self.config_path_var.set(str(path))
+        self._sync_log_file()
         self._log(f"[gui] loaded config from {path}")
 
     def _load_slide(self, slide_cfg: dict, prefix: str):
@@ -1328,6 +1570,14 @@ class App(tk.Tk):
     def collect_config(self) -> dict:
         v = self.vars
         return {
+            "general": {
+                # Unlike the output-path fields below, blank here is a
+                # real, meaningful value (file logging off — see
+                # LOG_PATH_HELP) rather than "unset, use the default", so
+                # this doesn't fall back to DEFAULT_LOG_PATH the way those
+                # do.
+                "log_path": v["log_path"].get().strip(),
+            },
             "propresenter": {
                 # Host (and everything else here) is optional — see
                 # _collect_slide's docstring; a blank port/reconnect
@@ -1347,11 +1597,13 @@ class App(tk.Tk):
             },
             "trim": {
                 "output": v["trim_output"].get().strip() or "body_trimmed.mp4",
-                "state_output": v["trim_state_output"].get().strip() or "render_state.json",
+                "state_output": v["trim_state_output"].get().strip() or DEFAULT_STATE_OUTPUT,
                 "pad_start_seconds": to_float(v["trim_pad_start"].get().strip() or "0", "Pad start seconds"),
                 "pad_end_seconds": to_float(v["trim_pad_end"].get().strip() or "0", "Pad end seconds"),
                 "crf": v["trim_crf"].get(),
                 "fast_copy": bool(v["trim_fast_copy"].get()),
+                "encoder": v["encoder"].get(),
+                "encoder_preset": v["encoder_preset"].get() or None,
             },
             "stitch": {
                 "auto": bool(v["stitch_auto"].get()),
@@ -1368,7 +1620,11 @@ class App(tk.Tk):
                     v["stitch_transition_duration"].get().strip() or "1.0", "Transition duration"
                 ),
                 "transition": v["stitch_transition"].get().strip() or "fade",
-                "fast_copy": bool(v["stitch_fast_copy"].get()),
+                # Not GUI-exposed (see FAST_COPY_HELP / stitch()'s own
+                # docstring in service_video.py for why) — always off here;
+                # still settable by hand if that ever changes.
+                "fast_copy": False,
+                "encoder": v["encoder"].get(),
             },
         }
 
@@ -1380,6 +1636,7 @@ class App(tk.Tk):
             return
         path = Path(self.config_path_var.get().strip() or str(DEFAULT_CONFIG_PATH))
         path.write_text(json.dumps(cfg, indent=2))
+        self._sync_log_file()
         self._log(f"[gui] saved config -> {path}")
         messagebox.showinfo("Config saved", f"Saved to {path}")
 
@@ -1395,6 +1652,7 @@ class App(tk.Tk):
         path = Path(self.config_path_var.get().strip() or str(DEFAULT_CONFIG_PATH))
         path.write_text(json.dumps(cfg, indent=2))
         self.config_path_var.set(str(path))
+        self._sync_log_file()
         self._log(f"[gui] saved config -> {path}")
         return True
 
@@ -1415,24 +1673,88 @@ class App(tk.Tk):
             return
         self._current_command = command_name
         self._set_busy(True, command_name)
+        self._reset_progress()
+        self._run_started_at = time.monotonic()
         self._log(f"[gui] running: {' '.join([sys.executable, '-u', str(SERVICE_SCRIPT), *args])}")
         try:
             self.runner.start(args)
         except RuntimeError as e:
             self._log(f"[gui] {e}")
             self._set_busy(False)
+            # The process never actually started, so _on_process_exit()
+            # (which would otherwise clean this up) never fires either.
+            if self._temp_render_state_path:
+                Path(self._temp_render_state_path).unlink(missing_ok=True)
+                self._temp_render_state_path = None
 
     def _stop(self):
         if self.runner.running():
             self._log("[gui] stop requested — terminating process (no graceful trim/exit message)...")
             self.runner.stop()
 
+    def _reset_progress(self):
+        """Full reset, for the start of a new run — blanks everything,
+        including the speed/"took ..." slot. Contrast
+        _clear_progress_parsing_state(), used at the end of one instead,
+        which leaves the step/bar showing that run's final state."""
+        self._clear_progress_parsing_state()
+        self.progress_step_var.set("")
+        self.progress_bar["value"] = 0
+        self.progress_speed_var.set("")
+
+    def _clear_progress_parsing_state(self):
+        """Just the internal bookkeeping _handle_progress_line() uses,
+        not what's on screen — see _reset_progress()."""
+        self._in_progress_step = False
+        self._progress_step_duration = None
+
+    def _handle_progress_line(self, line: str) -> bool:
+        """Parses one line of ffmpeg's machine-readable progress output
+        (service_video.py's --machine-progress/_print_step(), started
+        automatically by ProcessRunner) into the "[N/M]"/progress bar/
+        speed readout next to the console status, and reports whether it
+        did (True) so _drain_queue() skips logging it — meant to replace
+        the wall of frame=.../time=.../speed=... lines ffmpeg would
+        otherwise print once per step, not add to it."""
+        m = PROGRESS_STEP_RE.match(line)
+        if m:
+            self.progress_step_var.set(f"[{m.group(1)}/{m.group(2)}]")
+            self._progress_step_duration = float(m.group(3))
+            self._in_progress_step = True
+            self.progress_bar["value"] = 0
+            self.progress_speed_var.set("")
+            return True
+
+        if not self._in_progress_step:
+            return False
+        fm = PROGRESS_FIELD_RE.match(line)
+        if not fm:
+            return False
+        key, value = fm.group(1), fm.group(2).strip()
+        if key == "out_time_us" and self._progress_step_duration:
+            # -progress's own out_time_ms field is a long-documented
+            # ffmpeg misnomer — it actually carries microseconds too
+            # (identical to out_time_us), so out_time_us is used here
+            # instead as the one whose name is actually accurate.
+            try:
+                seconds = int(value) / 1_000_000
+                pct = max(0.0, min(100.0, seconds / self._progress_step_duration * 100))
+                self.progress_bar["value"] = pct
+            except ValueError:
+                pass
+        elif key == "speed":
+            self.progress_speed_var.set(value)
+        elif key == "progress" and value == "end":
+            self.progress_bar["value"] = 100
+        return True
+
     def _drain_queue(self):
         try:
             while True:
                 kind, payload = self._queue.get_nowait()
                 if kind == "line":
-                    self._log(payload)
+                    if not self._handle_progress_line(payload):
+                        self._log(payload)
                     if self._current_command == "learn":
                         self._handle_learn_line(payload)
                     elif self._current_command == "watch":
@@ -1445,6 +1767,17 @@ class App(tk.Tk):
 
     def _on_process_exit(self, code: int):
         label = self._current_command or "process"
+        # Leaves the step/bar showing this run's final state (rather than
+        # blanking them, like _reset_progress() does for a new run) and
+        # replaces the live speed reading with how long the whole thing
+        # took — a still-useful summary, success or not.
+        self._clear_progress_parsing_state()
+        if self._run_started_at is not None:
+            self.progress_speed_var.set(f"took {format_elapsed(time.monotonic() - self._run_started_at)}")
+            self._run_started_at = None
+        if self._temp_render_state_path:
+            Path(self._temp_render_state_path).unlink(missing_ok=True)
+            self._temp_render_state_path = None
         if code == 0:
             self._log(f"[gui] {label} finished successfully.\n")
         else:
@@ -1615,7 +1948,8 @@ class App(tk.Tk):
             )
             crf = self.vars["st_crf"].get()
             trim_fast_copy = bool(self.vars["st_trim_fast_copy"].get())
-            stitch_fast_copy = bool(self.vars["st_stitch_fast_copy"].get())
+            encoder = self.vars["st_encoder"].get()
+            encoder_preset = self.vars["st_encoder_preset"].get() or None
             start_ts = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
             end_ts = to_timestamp(self.vars["st_end"].get().strip() or "00:00:00.000", "Sermon end")
         except ValueError as e:
@@ -1625,7 +1959,7 @@ class App(tk.Tk):
         return {
             "intro": intro, "main_clip": main_clip, "outro": outro, "output": output,
             "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
-            "crf": crf, "trim_fast_copy": trim_fast_copy, "stitch_fast_copy": stitch_fast_copy,
+            "crf": crf, "trim_fast_copy": trim_fast_copy, "encoder": encoder, "encoder_preset": encoder_preset,
             "start_ts": start_ts, "end_ts": end_ts, "transition": transition,
         }
 
@@ -1649,6 +1983,8 @@ class App(tk.Tk):
                 "pad_end_seconds": 0,
                 "crf": f["crf"],
                 "fast_copy": f["trim_fast_copy"],
+                "encoder": f["encoder"],
+                "encoder_preset": f["encoder_preset"],
             },
             "stitch": {
                 "auto": True,
@@ -1660,7 +1996,10 @@ class App(tk.Tk):
                 "transition_duration": f["duration"],
                 "transition": f["transition"],
                 "crf": f["crf"],
-                "fast_copy": f["stitch_fast_copy"],
+                # Not GUI-exposed (see FAST_COPY_HELP) — always off here.
+                "fast_copy": False,
+                "encoder": f["encoder"],
+                "encoder_preset": f["encoder_preset"],
             },
         }
 
@@ -1682,24 +2021,37 @@ class App(tk.Tk):
 
         if use_raw_trim:
             # Re-trim the raw recording to these exact timestamps, then
-            # stitch — i.e. everything 'watch' does after a live run,
-            # reusing the same render_state file so it stays the documented,
-            # editable/rerunnable record of this redo. They're absolute
-            # timestamps a person picked by eye, not a raw/pad split (there's
-            # no slide detection here), so pass them straight through as the
-            # offsets with zero padding.
+            # stitch — i.e. everything 'watch' does after a live run.
+            # They're absolute timestamps a person picked by eye, not a
+            # raw/pad split (there's no slide detection here), so pass
+            # them straight through as the offsets with zero padding.
+            #
+            # 'render' needs a render-state *file* to read (not stdin),
+            # but that doesn't have to be the loaded one — an offline
+            # render is exploratory (tweak timestamps/settings, see what
+            # comes out), not something that should silently overwrite
+            # your saved record of what actually happened live just
+            # because you clicked Run Render. So this writes to a
+            # throwaway temp file instead (cleaned up once the process
+            # exits, see _on_process_exit()); use "Export to JSON" if you
+            # actually want to keep these settings.
             render_state = self._build_render_state(f, raw["trim_output"], raw["state_output"])
-            state_path = raw["state_path"]
-            Path(state_path).write_text(json.dumps(render_state, indent=2))
-            self._log(f"[gui] updated {state_path} with the current timestamps/settings")
-            self._start("render", ["render", state_path])
+            temp_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", prefix="render_state_", delete=False
+            )
+            with temp_file:
+                json.dump(render_state, temp_file, indent=2)
+            self._temp_render_state_path = temp_file.name
+            self._start("render", ["render", temp_file.name])
         else:
             args = [
                 "stitch", f["intro"], f["main_clip"], f["outro"],
                 "-o", f["output"], "-d", str(f["duration"]), "-t", f["transition"], "--crf", str(f["crf"]),
                 "--intro-duration", str(f["intro_duration"]), "--outro-duration", str(f["outro_duration"]),
-                "--fast-copy" if f["stitch_fast_copy"] else "--no-fast-copy",
+                "--encoder", f["encoder"],
             ]
+            if f["encoder_preset"]:
+                args += ["--encoder-preset", f["encoder_preset"]]
             self._start("stitch", args)
 
     def _export_render_state(self):
@@ -1719,7 +2071,7 @@ class App(tk.Tk):
             messagebox.showerror("Export to JSON", "Sermon end must be after Sermon start.")
             return
 
-        render_state = self._build_render_state(f, "body_trimmed.mp4", "render_state.json")
+        render_state = self._build_render_state(f, "body_trimmed.mp4", DEFAULT_STATE_OUTPUT)
         default_name = f"render_state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path = filedialog.asksaveasfilename(
             title="Export render-state JSON", defaultextension=".json",
@@ -1737,13 +2089,76 @@ class App(tk.Tk):
             ):
                 return
             self.runner.stop()
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
         self.destroy()
+
+
+class OfflineAdvancedWindow(tk.Toplevel):
+    """The Offline tab's CRF/Fast copy/Encoder/Encoder preset settings —
+    split out into their own window (opened via the Offline tab's
+    "Advanced…" button) since they're tuning knobs set once and rarely
+    touched, unlike Intro/Main/Outro/Output/Sermon start-end, which change
+    every run. Built once at App startup and hidden with withdraw()/
+    deiconify() rather than destroyed on close, so reopening is instant —
+    same pattern as ConfigWindow. All actual state lives in app.vars; this
+    window just hosts widgets bound to it (the same st_crf/
+    st_trim_fast_copy/st_encoder/st_encoder_preset vars _run_render()/
+    _export_render_state() already read)."""
+
+    def __init__(self, app: App):
+        super().__init__(app)
+        self.app = app
+        self.title("Service Video — Advanced Render Settings")
+        self.geometry("420x300")
+        self.configure(bg=PALETTE["bg"])
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Applies to \"Run Render\" on the Offline tab — the re-trim step "
+            "(only when re-trimming a raw recording, right after \"Load from "
+            "JSON\") and the crossfade itself.",
+            style="Muted.TLabel", wraplength=380, justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+
+        app._crf_slider(frame, 1, "CRF (quality)", "st_crf", col=0, colspan=3)
+
+        app.vars["st_trim_fast_copy"] = tk.BooleanVar(value=True)
+        trim_fast_cb = ttk.Checkbutton(
+            frame, text="Fast copy (recommended)", variable=app.vars["st_trim_fast_copy"],
+        )
+        trim_fast_cb.grid(row=2, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(trim_fast_cb, FAST_COPY_HELP + " Only applies when re-trimming from a raw "
+                "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
+                "is then assumed to already be trimmed.", font=app.ui_font)
+
+        encoder_combo = app._labeled_combobox(frame, 3, "Encoder", "st_encoder", ENCODER_CHOICES, width=14, col=0)
+        encoder_combo.configure(state="readonly")
+        app.vars["st_encoder"].set("nvenc")
+        Tooltip(encoder_combo, ENCODER_HELP, font=app.ui_font)
+
+        preset_combo = app._labeled_combobox(frame, 4, "Encoder preset", "st_encoder_preset", [], width=14, col=0)
+        preset_combo.configure(state="readonly")
+        app._wire_encoder_preset_choices("st_encoder", preset_combo, "st_encoder_preset")
+        Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
+
+        self.withdraw()
 
 
 class ConfigWindow(tk.Toplevel):
     """Everything that's set once and rarely touched again: the config file
-    path, ProPresenter connection + slide matching (with Learn mode folded
-    in, since discovering slide UIDs is a ProPresenter-configuration task),
+    path, general app-wide settings (currently just the console log path),
+    ProPresenter connection + slide matching (with Learn mode folded in,
+    since discovering slide UIDs is a ProPresenter-configuration task),
     OBS connection, and the trim/auto-stitch settings a live Watch run uses
     afterward. Built once at App startup and hidden with withdraw()/
     deiconify() rather than destroyed on close, so state and widgets persist
@@ -1768,6 +2183,7 @@ class ConfigWindow(tk.Toplevel):
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._build_general_tab(notebook)
         self._build_propresenter_tab(notebook)
         self._build_obs_tab(notebook)
         self._build_render_settings_tab(notebook)
@@ -1786,6 +2202,24 @@ class ConfigWindow(tk.Toplevel):
         ttk.Button(
             top, text="Save", style="Accent.TButton", command=self.app._save_config_clicked
         ).pack(side="left", padx=(6, 0))
+
+    # -- General tab: app-wide settings not specific to any one action ----
+
+    def _build_general_tab(self, notebook):
+        app = self.app
+        _outer, frame = app._make_scrollable_tab(notebook, "General")
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Settings that apply across the whole app, not tied to any one "
+            "of Watch/Render/Stitch/Learn.",
+            style="Muted.TLabel", wraplength=540, justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        app._labeled_entry(frame, 1, "Console log path", "log_path", colspan=3, help_text=LOG_PATH_HELP)
+        app._add_browse(frame, 1, "log_path", save=True, filetypes=LOG_FILETYPES, col=3)
 
     # -- ProPresenter tab: connection + slide matching + Learn -------------
 
@@ -1914,7 +2348,8 @@ class ConfigWindow(tk.Toplevel):
         # don't collide with that span.
         app._labeled_entry(frame, 1, "Trimmed output path", "trim_output", colspan=3, help_text=TIMESTAMP_HELP)
         app._add_browse(frame, 1, "trim_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
-        app._labeled_entry(frame, 2, "Render-state base name", "trim_state_output", colspan=3)
+        app._labeled_entry(frame, 2, "Render state output path", "trim_state_output", colspan=3, help_text=TIMESTAMP_HELP)
+        app._add_browse(frame, 2, "trim_state_output", save=True, filetypes=JSON_FILETYPES, col=3)
         app._labeled_spinbox(
             frame, 3, "Start offset (s)", "trim_pad_start", colspan=3, help_text=OFFSET_HELP,
         )
@@ -1937,25 +2372,28 @@ class ConfigWindow(tk.Toplevel):
 
         app.vars["trim_fast_copy"] = tk.BooleanVar(value=True)
         fast_trim_cb = ttk.Checkbutton(
-            frame, text="Fast copy trim (recommended)", variable=app.vars["trim_fast_copy"],
+            frame, text="Fast copy (recommended)", variable=app.vars["trim_fast_copy"],
         )
         fast_trim_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
-        Tooltip(fast_trim_cb, FAST_COPY_TRIM_HELP, font=app.ui_font)
+        Tooltip(fast_trim_cb, FAST_COPY_HELP, font=app.ui_font)
 
-        app.vars["stitch_fast_copy"] = tk.BooleanVar(value=True)
-        fast_stitch_cb = ttk.Checkbutton(
-            frame, text="Fast copy stitch (recommended)", variable=app.vars["stitch_fast_copy"],
-        )
-        fast_stitch_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
-        Tooltip(fast_stitch_cb, FAST_COPY_STITCH_HELP, font=app.ui_font)
+        encoder_combo = app._labeled_combobox(frame, 8, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
+        encoder_combo.configure(state="readonly")
+        app.vars["encoder"].set("nvenc")
+        Tooltip(encoder_combo, ENCODER_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
+
+        preset_combo = app._labeled_combobox(frame, 9, "Encoder preset", "encoder_preset", [], width=14, col=0)
+        preset_combo.configure(state="readonly")
+        app._wire_encoder_preset_choices("encoder", preset_combo, "encoder_preset")
+        Tooltip(preset_combo, ENCODER_PRESET_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=9, column=0, columnspan=5, sticky="ew", pady=(12, 8)
+            row=10, column=0, columnspan=5, sticky="ew", pady=(12, 8)
         )
         app.vars["stitch_auto"] = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame, text="Auto-stitch after trim", variable=app.vars["stitch_auto"],
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
 {
+  "general": {
+    "log_path": "console_%Y%m%d_%H%M%S.log"
+  },
   "propresenter": {
     "host": "192.168.1.50",
     "port": 1025,
@@ -20,8 +23,10 @@
     "output": "body_trimmed.mp4",
     "pad_start_seconds": 0,
     "pad_end_seconds": 0,
-    "crf": 18,
-    "fast_copy": true
+    "crf": 23,
+    "fast_copy": true,
+    "encoder": "nvenc",
+    "encoder_preset": null
   },
   "stitch": {
     "auto": true,
@@ -32,6 +37,8 @@
     "output": "final.mp4",
     "transition_duration": 1.0,
     "transition": "fade",
-    "fast_copy": true
+    "fast_copy": false,
+    "encoder": "nvenc",
+    "encoder_preset": null
   }
 }

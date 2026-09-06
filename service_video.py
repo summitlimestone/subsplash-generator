@@ -61,6 +61,119 @@ from pathlib import Path
 # to OBS and ProPresenter); imported lazily inside those code paths so
 # 'stitch' and 'render' keep working with nothing but ffmpeg installed.
 
+# Set once at startup from --machine-progress (see main()) — whether every
+# ffmpeg invocation in this file reports progress via -progress
+# (machine-readable key=value lines on stdout, meant for the GUI to parse
+# into an actual progress bar) instead of ffmpeg's normal, periodically-
+# rewritten human-readable stats line. A module-level flag rather than a
+# parameter threaded through trim_clip()/stitch() and everything
+# fast_copy's paths call, because it's genuinely a single, process-wide
+# "what output mode is ffmpeg in" setting that never changes mid-run —
+# the GUI turns it on for every subprocess it starts (see gui.py's
+# ProcessRunner); a terminal user running this directly never sees it and
+# gets ffmpeg's normal stats output, unchanged.
+_MACHINE_PROGRESS = False
+
+
+def _ffmpeg_output_args() -> list[str]:
+    """Extra ffmpeg args controlling how it reports progress — see
+    _MACHINE_PROGRESS. -progress pipe:1 writes clean, easy-to-parse
+    key=value progress lines to stdout (frame=.../out_time_ms=.../
+    speed=.../progress=continue|end, repeated every ~0.5s) instead of the
+    usual single line rewritten in place, paired with -nostats to suppress
+    that line entirely — together, what lets the GUI show a real progress
+    bar instead of a wall of frame=.../time=... lines in its console log,
+    without touching anything else ffmpeg prints (banners, warnings,
+    errors, the final summary)."""
+    return ["-nostats", "-progress", "pipe:1"] if _MACHINE_PROGRESS else []
+
+
+# How many real ffmpeg steps each fast_copy path takes when it gets far
+# enough to attempt any of them at all — _fast_copy_trim's sliver+tail+
+# join, _fast_copy_stitch's front+middle+tail+join. Used, together with
+# FALLBACK_STEPS, to reserve an accurate step total up front (see
+# _reset_steps()/_phase_worst_case_steps()) rather than discovering it
+# piece by piece as the render actually happens — keep these in sync with
+# _fast_copy_trim()/_fast_copy_stitch() if the number of steps either one
+# takes ever changes.
+TRIM_FAST_COPY_STEPS = 3
+STITCH_FAST_COPY_STEPS = 4
+FALLBACK_STEPS = 1
+
+# Tracks a running step N/M count across a whole top-level operation —
+# render() (trim_clip() then, if auto-stitch, stitch() too), a single
+# prerender_worker() pass, or one standalone 'stitch' CLI call — for the
+# GUI's progress bar (see _MACHINE_PROGRESS/_print_step()). `total` is
+# fixed once, up front, by the caller (see _reset_steps()) rather than
+# grown as fast_copy's actual path through each phase becomes known: even
+# a fast_copy attempt that completes every one of its own steps can still
+# fail its own final decode-verify and need a fallback afterward, so the
+# only way to never have to revise the total mid-render is to reserve for
+# that worst case from the start. A phase that turns out not to need its
+# reserved fallback step (or an already-on-a-keyframe trim that skips
+# fast_copy's own multi-step path entirely) just finishes short of the
+# total rather than exactly hitting it — a fixed, honest total that's
+# sometimes not fully used beats one that grows mid-render and contradicts
+# what was already shown.
+_step_state = {"current": 0, "total": 0}
+
+
+def _phase_worst_case_steps(fast_copy_enabled: bool, fast_copy_step_count: int) -> int:
+    """Upper bound on how many real ffmpeg steps one phase (trim_clip()'s
+    or stitch()'s) could take: `fast_copy_step_count` (its own fast_copy
+    path's step count — TRIM_FAST_COPY_STEPS/STITCH_FAST_COPY_STEPS) plus
+    one more for a fallback, since even a fast_copy attempt that completes
+    every one of its own steps can still need one afterward — or, if
+    fast_copy isn't even enabled, just the one fallback step it goes
+    straight to."""
+    return fast_copy_step_count + FALLBACK_STEPS if fast_copy_enabled else FALLBACK_STEPS
+
+
+def _reset_steps(total: int = 0):
+    """Start (or restart) the step count for a new top-level operation,
+    reserving `total` steps up front — see _step_state's docstring for
+    why that has to be decided now rather than discovered incrementally.
+    Called once at the start of render(), prerender_worker(), and a
+    standalone 'stitch' CLI call (in main()), each of which can compute
+    their own accurate total from _phase_worst_case_steps() before doing
+    any real work; trim_clip()/stitch() never call this themselves, so a
+    render() that runs both keeps counting continuously across the two
+    instead of each restarting from 1."""
+    _step_state["current"] = 0
+    _step_state["total"] = total
+
+
+def _print_step(duration: float, what: str):
+    """Marks the start of one ffmpeg step, advancing _step_state's
+    running current by one (capping total up to match on the rare chance
+    a phase ever needs more steps than _reset_steps() reserved for it,
+    rather than printing a nonsensical current > total). Meaningless to a
+    terminal user (just another log line); the GUI parses it into the
+    "[N/M]" label next to its progress bar and resets the bar itself,
+    since each step has its own separate duration — `duration` (seconds)
+    is that step's own expected output length, printed here rather than
+    left for the GUI to work out from the ffmpeg command line (not always
+    possible — a multi-input crossfade's output duration isn't simply any
+    one -t/-ss/-to value on it) since this already knows it exactly, one
+    way or another, in every case. Printed right before the ffmpeg call
+    it describes — every step counted this way corresponds to exactly one
+    _ffmpeg_output_args()-bearing call, so the two stay honest with each
+    other."""
+    _step_state["current"] += 1
+    _step_state["total"] = max(_step_state["total"], _step_state["current"])
+    print(f"[progress] step {_step_state['current']}/{_step_state['total']} duration={duration:.3f}: {what}")
+
+
+def _render_step_total(trim_cfg: dict, stitch_cfg: dict) -> int:
+    """The upfront step total for a whole render (trim_clip() then, if
+    auto-stitch, stitch() too) — see _reset_steps()/
+    _phase_worst_case_steps(). Shared by render() and prerender_worker(),
+    the two places that run both phases from one config pair."""
+    total = _phase_worst_case_steps(trim_cfg.get("fast_copy", True), TRIM_FAST_COPY_STEPS)
+    if stitch_cfg.get("auto"):
+        total += _phase_worst_case_steps(stitch_cfg.get("fast_copy", False), STITCH_FAST_COPY_STEPS)
+    return total
+
 
 # --------------------------------------------------------------------------
 # Crossfade stitching (intro + body + outro -> one video)
@@ -68,11 +181,26 @@ from pathlib import Path
 
 def probe(path: str) -> dict:
     """Return duration, width, height, fps, video codec, and whether an
-    audio stream exists for a media file, via ffprobe."""
+    audio stream exists for a media file, via ffprobe.
+
+    fps comes from r_frame_rate, not avg_frame_rate. avg_frame_rate is
+    computed from each frame's own timestamp (nb_frames / measured
+    duration), so it silently inherits any timestamp imprecision already
+    present in the file — confirmed by direct testing to be a real risk
+    here specifically, not just a style preference: probing a fast-copy
+    trim's output before CONCAT_TIMESCALE was forced consistently (see its
+    own comment for the actual bug this was hiding) could measure a
+    noticeably-off avg_frame_rate — e.g. ~28.8 on a genuinely-30fps source
+    — purely from that timestamp corruption, with no real frames ever
+    dropped. r_frame_rate is the stream's own declared/nominal rate (a
+    clean rational like "30/1"), read from the container's stream info
+    rather than computed from potentially-imprecise per-frame timestamps,
+    so it isn't vulnerable to this class of problem even if some other,
+    not-yet-found timestamp issue crops up here again later."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-show_entries", "stream=width,height,avg_frame_rate,codec_type,codec_name",
+        "-show_entries", "stream=width,height,r_frame_rate,codec_type,codec_name",
         "-of", "json",
         path,
     ]
@@ -93,7 +221,7 @@ def probe(path: str) -> dict:
         sys.exit(f"{path!r} has no video stream.")
 
     has_audio = any(s.get("codec_type") == "audio" for s in data["streams"])
-    fps = float(Fraction(video_stream["avg_frame_rate"]))
+    fps = float(Fraction(video_stream["r_frame_rate"]))
 
     return {
         "duration": duration,
@@ -101,10 +229,11 @@ def probe(path: str) -> dict:
         "height": video_stream["height"],
         "fps": fps,
         "has_audio": has_audio,
-        # Used by the fast-copy trim/stitch paths to decide whether a
-        # stream copy can safely sit next to a fresh libx264 re-encode in
-        # the same concatenated output — see find_next_keyframe()/
-        # _fast_copy_trim()/_fast_copy_stitch().
+        # Used by the fast-copy trim/stitch paths to decide whether (and
+        # in what codec) a stream copy can safely sit next to a freshly
+        # re-encoded segment in the same concatenated output — see
+        # FAST_COPY_CODECS/find_next_keyframe()/_fast_copy_trim()/
+        # _fast_copy_stitch().
         "video_codec": video_stream.get("codec_name"),
     }
 
@@ -114,6 +243,15 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 # Used for a still-image intro/outro when no intro_duration/outro_duration is
 # configured, so forgetting to set one doesn't hard-fail a stitch.
 DEFAULT_IMAGE_DURATION = 5.0
+
+# trim.state_output's default when not configured — a render-state file's
+# own path, same strftime-placeholder support as trim.output/
+# stitch.output (see expand_output_path()); the timestamp placeholder
+# here reproduces what used to be automatic (a fixed "_YYYYMMDD_HHMMSS"
+# always appended to whatever base name was configured, whether wanted or
+# not) as just the default rather than special-cased behavior — leave it
+# out of a custom state_output entirely if you don't want it.
+DEFAULT_STATE_OUTPUT = "render_state_%Y%m%d_%H%M%S.json"
 
 
 def is_image_file(path: str) -> bool:
@@ -155,18 +293,98 @@ def probe_image_dimensions(path: str) -> dict:
 # machinery both use.
 # --------------------------------------------------------------------------
 
-def find_next_keyframe(path: str, start: float, windows: tuple[float, ...] = (30.0, 300.0)) -> float | None:
-    """Return the timestamp (seconds) of the first video keyframe at or
-    after `start` in path's video stream, or None if none turns up within
-    the largest window tried. Scans via ffprobe's -read_intervals (which
-    seeks straight there rather than reading from the start of the file)
-    combined with -skip_frame nokey (which only decodes keyframes, not
-    everything in between), so this stays fast and cheap no matter how
-    long `path` is or how far into it `start` falls — critical, since the
-    whole point of the fast-copy path is to avoid touching the rest of the
-    file. Tries progressively wider windows in case a single one lands
-    entirely between two keyframes (an unusually long GOP, or a search
-    window that happens to start right after one)."""
+# A fast-copy re-encoded segment (the trim sliver, or a stitch crossfade
+# window) has to be encoded in the SAME codec as the footage it's stream-
+# copied next to, or concatenating the two would produce a broken/
+# unplayable file — unlike the old always-re-encode fallback path (which
+# always outputs h264 regardless of the source), fast copy's output codec
+# follows whatever the source already is. Keyed by the codec name ffprobe
+# reports; a source whose codec isn't listed here just isn't eligible for
+# the fast path at all (logged, falls back to the old behavior).
+#
+#   encoder/extra: the ffmpeg encoder to re-encode with, and any extra
+#     output args it needs for container compatibility beyond -c:v/-crf —
+#     HEVC-in-MP4 in particular needs the hvc1 tag rather than ffmpeg's
+#     default hev1 for broad player/QuickTime compatibility.
+#   vcl_nal_types/safe_nal_types: see _is_true_random_access_point()'s
+#     docstring — identifies which NAL unit types in this codec's
+#     bitstream carry an actual coded picture, and which of those are
+#     genuine random-access points safe to start a stream copy at.
+FAST_COPY_CODECS = {
+    "h264": {
+        "encoder": "libx264", "extra": [],
+        "vcl_nal_types": range(1, 6), "safe_nal_types": {5},  # 5 = IDR slice
+    },
+    "hevc": {
+        "encoder": "libx265", "extra": ["-tag:v", "hvc1"],
+        "vcl_nal_types": range(0, 32), "safe_nal_types": {19, 20},  # IDR_W_RADL, IDR_N_LP
+    },
+}
+
+_TRACE_HEADERS_NAL_TYPE_RE = re.compile(r"nal_unit_type\s+\S+\s*=\s*(\d+)\s*$")
+
+
+def _is_true_random_access_point(path: str, timestamp: float, codec_info: dict) -> bool:
+    """Whether the keyframe at exactly `timestamp` in path's video stream
+    is a genuine random-access point — h264 IDR, or hevc IDR specifically
+    (IDR_W_RADL/IDR_N_LP) — rather than merely something a plain per-frame
+    keyframe scan reports as one.
+
+    This distinction matters because open-GOP encoding — the default for
+    many encoders, confirmed common for HEVC while building this — uses
+    CRA pictures: intra frames that look exactly like a keyframe to a
+    plain scan (find_next_keyframe()'s first pass), but have leading
+    pictures immediately after them, in decode order, that reference
+    frames from *before* the cut point. Those only decode correctly when
+    a decoder recognizes the CRA as the true start of a coded sequence
+    (opening a fresh file, or a proper broadcast splice that rewrites the
+    NAL header) — neither of which describes a plain concatenated stream
+    copy, which is mid-stream from the decoder's perspective. Confirmed by
+    direct testing while building this: concatenating a fresh encode with
+    a stream copy starting at an open-GOP CRA plays the seam fine, but the
+    rest of that GOP fails to decode ("Could not find ref with POC ...").
+    An IDR frame has no such leading pictures at all — by definition, so
+    always safe.
+
+    Checked with ffmpeg's trace_headers bitstream filter (not decoding,
+    just parsing NAL headers) on a tiny extraction starting exactly at
+    `timestamp` — `timestamp` must already be an exact keyframe time (e.g.
+    from find_next_keyframe()'s own scan), since -ss before -i with -c
+    copy only seeks cleanly to a real keyframe boundary; this doesn't
+    itself search for one. Cheap and fast regardless of the file's overall
+    length, same as find_next_keyframe() itself."""
+    cmd = [
+        "ffmpeg", "-loglevel", "info", "-nostdin",
+        "-ss", f"{timestamp:.3f}", "-i", path, "-t", "0.2",
+        "-c:v", "copy", "-an", "-bsf:v", "trace_headers", "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    for line in result.stderr.splitlines():
+        m = _TRACE_HEADERS_NAL_TYPE_RE.search(line)
+        if not m:
+            continue
+        nal_type = int(m.group(1))
+        if nal_type not in codec_info["vcl_nal_types"]:
+            continue  # a parameter-set/SEI/etc. NAL, not the actual slice
+        return nal_type in codec_info["safe_nal_types"]
+    return False
+
+
+def find_next_keyframe(path: str, start: float, codec_info: dict, windows: tuple[float, ...] = (30.0, 300.0)) -> float | None:
+    """Return the timestamp (seconds) of the first *safe* video keyframe
+    (see _is_true_random_access_point()) at or after `start` in path's
+    video stream, or None if none turns up within the largest window
+    tried. Scans via ffprobe's -read_intervals (which seeks straight there
+    rather than reading from the start of the file) combined with
+    -skip_frame nokey (which only decodes keyframes, not everything in
+    between) to list keyframe candidates cheaply regardless of how long
+    `path` is or how far into it `start` falls, then checks each one in
+    turn (skipping any that aren't actually safe to cut at) — critical,
+    since the whole point of the fast-copy path is to avoid touching the
+    rest of the file, and it can't safely stream-copy from an unsafe one.
+    Tries progressively wider windows if a single one turns up nothing
+    (an unusually long GOP, a run of unsafe candidates, or a window that
+    happens to start right after the last usable keyframe)."""
     for window in windows:
         cmd = [
             "ffprobe", "-v", "error",
@@ -188,7 +406,7 @@ def find_next_keyframe(path: str, start: float, windows: tuple[float, ...] = (30
         tokens = [t.strip().rstrip(",") for t in result.stdout.split()]
         times = sorted(float(t) for t in tokens if t)
         for t in times:
-            if t >= start - 0.001:
+            if t >= start - 0.001 and _is_true_random_access_point(path, t, codec_info):
                 return t
     return None
 
@@ -246,20 +464,112 @@ def _concat_list_entry(path: Path) -> str:
     return "'" + str(path).replace("'", "'\\''") + "'"
 
 
-def _run_concat(parts: list[Path], output: str, faststart: bool = False):
+# Forced onto every segment _run_concat() ever joins (via -video_track_timescale)
+# — confirmed by direct testing to be necessary, not just tidiness. ffmpeg's mp4
+# muxer doesn't use the same video track timescale for every output: a freshly
+# re-encoded stream gets one derived from the encoder's own frame rate (e.g.
+# 15360 for 30fps), while a plain -c:v copy gets a different one (e.g. 16000)
+# picked some other way. The concat demuxer's -c copy join does NOT rescale
+# timestamps between segments with different timebases — it was confirmed, by
+# reproducing this exact failure end to end, to just carry each segment's raw
+# tick counts through as if they shared one timebase, which silently stretches
+# or compresses whichever segment's timebase differs from the first one's. A
+# 16000-vs-15360 mismatch is a 16000/15360 = 1.041666... ratio — confirmed to
+# match, almost exactly, a real-world video-runs-~4% -slower-than-audio report
+# (video and audio start in sync, both end at their correct real content, but
+# video visibly drifts behind audio over a long clip) that traced back to
+# exactly this: a fast-copy trim's stream-copied tail segment silently
+# stretched relative to its freshly re-encoded sliver once concatenated,
+# despite both segments' own audio tracks staying perfectly in sync throughout
+# (audio doesn't have this problem — aac's timebase is sample-rate-derived and
+# consistent regardless of which ffmpeg code path wrote a given segment).
+# Forcing every segment (both fast-copy trim's sliver/tail and fast-copy
+# stitch's front/middle/tail) onto this one fixed timescale up front — rather
+# than trying to detect and reconcile a mismatch after the fact — sidesteps
+# the whole problem. 90000 (a 90kHz clock) is the standard industry choice for
+# this (used throughout MPEG-TS/broadcast) specifically because it divides
+# evenly into every common frame rate, including fractional ones like
+# 30000/1001 (29.97), so it never introduces new rounding of its own.
+CONCAT_TIMESCALE = 90000
+
+# How much to decode on each side of a join point when verifying one —
+# see _verify_join_points_decode_cleanly()'s docstring for why a small
+# fixed window is just as reliable a check as decoding the whole file.
+JOIN_VERIFY_WINDOW_SECONDS = 2.0
+
+
+def _verify_join_points_decode_cleanly(path: str, join_offsets: list[float]) -> bool:
+    """Sanity-check a fast-copy result by decoding a short window
+    straddling each point where two independently-produced segments were
+    joined, and checking whether the decoder reported any problem there —
+    rather than just trusting that matching codecs and a safe keyframe
+    (see _is_true_random_access_point()) were enough to guarantee a
+    correct result.
+
+    This exists because concatenating independently-encoded segments can
+    go wrong in ways neither of those checks predicts: confirmed by direct
+    testing while building this, MP4 can only hold one set of codec
+    parameters (SPS/PPS/etc.) per track, so a segment whose parameters
+    genuinely differ from the one before it — normal between two separate
+    encoder runs, even at identical settings, since real content drives
+    some of those decisions — can decode wrong from that point on, with
+    no error raised at mux time, despite each segment individually being
+    perfectly valid.
+
+    Checking only near each join, instead of decoding the whole result, is
+    just as reliable for this specific failure mode and far cheaper: a
+    parameter mismatch is a property of the *encoded segment*, applied
+    identically to every frame in it, so if it's going to cause a decode
+    error it does so at the very first frame that uses it — right at the
+    join — not gradually partway through. A problem starting anywhere
+    later than that would mean something new-and-different went wrong,
+    not this. Costs roughly the same regardless of how long the untouched,
+    copied middle between joins is, which is the whole point of fast copy
+    in the first place."""
+    for offset in join_offsets:
+        start = max(0.0, offset - JOIN_VERIFY_WINDOW_SECONDS / 2)
+        cmd = [
+            "ffmpeg", "-v", "error", "-nostdin",
+            "-ss", f"{start:.3f}", "-i", path, "-t", f"{JOIN_VERIFY_WINDOW_SECONDS:.3f}",
+            "-map", "0:v:0", "-f", "null", "-",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode != 0 or result.stderr.strip():
+            return False
+    return True
+
+
+def _run_concat(parts: list[Path], output: str, faststart: bool = False, verify_join_offsets: list[float] | None = None):
     """Join `parts` (already-produced media files, in order) into `output`
     via the concat demuxer with -c copy — a fast, no-re-encode join, used
     to reassemble a fast-copy trim/stitch's separately-produced segments.
     The list file is written next to `output` and always cleaned up.
 
+    Every part MUST have been written with -video_track_timescale
+    CONCAT_TIMESCALE (every caller here does) — this join doesn't rescale
+    timestamps between segments with differing timebases, so a mismatch
+    silently stretches or compresses whichever part's timebase differs
+    from the first one's, without any error at join time. See
+    CONCAT_TIMESCALE's own comment for the real desync this caused before
+    it was forced consistently.
+
     faststart: pass True when `output` is a final deliverable meant for
     web/streaming playback (mirrors stitch()'s old path, which always sets
     this) rather than an intermediate file like trim_clip()'s output —
-    just rewrites where the moov atom sits, no re-encoding involved."""
+    just rewrites where the moov atom sits, no re-encoding involved.
+
+    verify_join_offsets: the timestamp(s) in `output`, in seconds, where
+    two independently-produced segments meet — pass one per join whenever
+    `parts` includes more than one independently re-encoded segment
+    (front+middle+tail, or sliver+tail); see
+    _verify_join_points_decode_cleanly() for why. Raises RuntimeError
+    (after removing the bad output) if any join doesn't decode cleanly,
+    the same way a failed ffmpeg call raises CalledProcessError, so
+    callers can catch both the same way and fall back."""
     list_path = Path(output).with_name(f".{Path(output).stem}.concat.txt")
     list_path.write_text("".join(f"file {_concat_list_entry(p)}\n" for p in parts))
     try:
-        cmd = ["ffmpeg", "-y", "-nostdin", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy"]
+        cmd = ["ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(), "-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy"]
         if faststart:
             cmd += ["-movflags", "+faststart"]
         cmd.append(output)
@@ -267,6 +577,16 @@ def _run_concat(parts: list[Path], output: str, faststart: bool = False):
         subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
     finally:
         list_path.unlink(missing_ok=True)
+
+    if verify_join_offsets:
+        print(f"[fast copy] verifying {output} decodes cleanly at its {len(verify_join_offsets)} join point(s)...")
+        if not _verify_join_points_decode_cleanly(output, verify_join_offsets):
+            Path(output).unlink(missing_ok=True)
+            raise RuntimeError(
+                f"{output} didn't decode cleanly at a join point — the segments' codec parameters "
+                "likely drifted enough between separate encoder runs to not actually be "
+                "interchangeable, even though they matched on codec name"
+            )
 
 
 def build_filter_complex(
@@ -323,14 +643,17 @@ def _build_pair_xfade_cmd(
     input_args_a: list[str], has_audio_a: bool, duration_a: float,
     input_args_b: list[str], has_audio_b: bool, duration_b: float,
     width: int, height: int, fps: float, transition: str, transition_duration: float,
-    video_encode_args: list[str], output: str,
+    encoder: str, video_encode_args: list[str], encoder_extra_args: list[str], output: str,
 ) -> list[str]:
     """Build an ffmpeg command crossfading exactly two inputs (each
     described by its own input-side ffmpeg args) into `output` — the
     two-clip version of build_filter_complex()'s chained three-clip
     crossfade, used by _fast_copy_stitch() for the short intro/main-start
-    and main-end/outro transition windows."""
-    cmd = ["ffmpeg", "-y", "-nostdin", *input_args_a, *input_args_b]
+    and main-end/outro transition windows. `encoder` matches whatever
+    codec the untouched, copied footage this gets concatenated next to is
+    already in (see FAST_COPY_CODECS) — this can't default to h264 the way
+    the old always-re-encode fallback does."""
+    cmd = ["ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(), *input_args_a, *input_args_b]
 
     audio_inputs = []
     next_input_index = 2
@@ -357,8 +680,9 @@ def _build_pair_xfade_cmd(
     cmd += [
         "-filter_complex", filter_complex,
         "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", *video_encode_args, "-preset", "medium",
+        "-c:v", encoder, *video_encode_args, "-preset", "veryfast", *encoder_extra_args,
         "-c:a", "aac", "-b:a", "192k",
+        "-video_track_timescale", str(CONCAT_TIMESCALE),
         output,
     ]
     return cmd
@@ -382,29 +706,32 @@ def _fast_copy_stitch(
     than an arbitrary configured CRF, so they don't look like a quality
     jump where they meet the untouched footage.
 
-    Only applicable when main_clip is h264 (so the copied middle can sit
-    in the same stream as the freshly-encoded h264 pieces either side of
-    it) and long enough to actually have an untouched middle. Returns
-    output on success; returns None (after cleaning up) if the fast path
-    isn't usable here, so the caller can fall back to the old single-pass
-    crossfade — this always logs why."""
+    Only applicable when main_clip's codec is one fast copy knows how to
+    match (see FAST_COPY_CODECS — currently h264 and hevc; the re-encoded
+    transition windows have to be the same codec as the copied middle they
+    sit next to) and main_clip is long enough to actually have an
+    untouched middle. Returns output on success; returns None (after
+    cleaning up) if the fast path isn't usable here, so the caller can
+    fall back to the old single-pass crossfade — this always logs why."""
     intro_clip, main_info, outro_clip = clips
 
-    if main_info.get("video_codec") != "h264":
+    codec_info = FAST_COPY_CODECS.get(main_info.get("video_codec"))
+    if codec_info is None:
         print(
-            f"[stitch] fast copy: main clip is {main_info.get('video_codec')!r}, not h264 — the "
-            "re-encoded transition windows (always h264) couldn't be joined with a copied middle "
-            "of a different codec, skipping",
+            f"[stitch] fast copy: main clip's codec is {main_info.get('video_codec')!r}, which fast "
+            f"copy doesn't know how to match (supported: {', '.join(FAST_COPY_CODECS)}) — the "
+            "re-encoded transition windows couldn't be joined with a copied middle of a different "
+            "codec, skipping",
             file=sys.stderr,
         )
         return None
 
     main_duration = main_info["duration"]
-    mid_start = find_next_keyframe(main_clip, transition_duration)
+    mid_start = find_next_keyframe(main_clip, transition_duration, codec_info)
     if mid_start is None:
         print(
-            f"[stitch] fast copy: couldn't find a keyframe at/after {transition_duration:.3f}s "
-            "into the main clip, skipping",
+            f"[stitch] fast copy: couldn't find a safe keyframe (a true random-access point — see "
+            f"find_next_keyframe()) at/after {transition_duration:.3f}s into the main clip, skipping",
             file=sys.stderr,
         )
         return None
@@ -424,43 +751,53 @@ def _fast_copy_stitch(
     front_path = Path(output).with_name(f".{Path(output).stem}.front{Path(output).suffix}")
     middle_path = Path(output).with_name(f".{Path(output).stem}.middle{Path(output).suffix}")
     tail_path = Path(output).with_name(f".{Path(output).stem}.tail{Path(output).suffix}")
+    front_duration = intro_clip["duration"] + mid_start - transition_duration
     try:
         front_cmd = _build_pair_xfade_cmd(
             _clip_input_args(intro, is_image_flags[0], intro_clip["duration"]), intro_clip["has_audio"], intro_clip["duration"],
             ["-t", f"{mid_start:.3f}", "-i", main_clip], main_info["has_audio"], mid_start,
-            width, height, fps, transition, transition_duration, video_encode_args, str(front_path),
+            width, height, fps, transition, transition_duration,
+            codec_info["encoder"], video_encode_args, codec_info["extra"], str(front_path),
         )
         print(f"[stitch] fast copy: encoding the intro crossfade (intro + main's first {mid_start:.3f}s)")
+        _print_step(front_duration, "encoding intro crossfade")
         print("Running:", " ".join(front_cmd))
         subprocess.run(front_cmd, check=True, stdin=subprocess.DEVNULL)
 
         middle_duration = max(0.0, mid_end - mid_start - margin)
         middle_cmd = [
-            "ffmpeg", "-y", "-nostdin",
+            "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{mid_start:.3f}", "-i", main_clip, "-t", f"{middle_duration:.3f}",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-video_track_timescale", str(CONCAT_TIMESCALE),
             str(middle_path),
         ]
         print(
             f"[stitch] fast copy: stream-copying the untouched middle of main "
             f"({mid_start:.3f}s -> {mid_end:.3f}s, no re-encoding)"
         )
+        _print_step(middle_duration, "copying middle")
         print("Running:", " ".join(middle_cmd))
         subprocess.run(middle_cmd, check=True, stdin=subprocess.DEVNULL)
 
         tail_duration = main_duration - mid_end
+        tail_out_duration = tail_duration + outro_clip["duration"] - transition_duration
         tail_cmd = _build_pair_xfade_cmd(
             ["-ss", f"{mid_end:.3f}", "-i", main_clip], main_info["has_audio"], tail_duration,
             _clip_input_args(outro, is_image_flags[2], outro_clip["duration"]), outro_clip["has_audio"], outro_clip["duration"],
-            width, height, fps, transition, transition_duration, video_encode_args, str(tail_path),
+            width, height, fps, transition, transition_duration,
+            codec_info["encoder"], video_encode_args, codec_info["extra"], str(tail_path),
         )
         print(f"[stitch] fast copy: encoding the outro crossfade (main's last {tail_duration:.3f}s + outro)")
+        _print_step(tail_out_duration, "encoding outro crossfade")
         print("Running:", " ".join(tail_cmd))
         subprocess.run(tail_cmd, check=True, stdin=subprocess.DEVNULL)
 
         print("[stitch] fast copy: joining the intro crossfade, copied middle, and outro crossfade")
-        _run_concat([front_path, middle_path, tail_path], output, faststart=True)
-    except subprocess.CalledProcessError as e:
+        _print_step(front_duration + middle_duration + tail_out_duration, "joining")
+        join_offsets = [front_duration, front_duration + middle_duration]
+        _run_concat([front_path, middle_path, tail_path], output, faststart=True, verify_join_offsets=join_offsets)
+    except (subprocess.CalledProcessError, RuntimeError) as e:
         print(f"[stitch] fast copy step failed ({e}) — falling back to a full re-encode", file=sys.stderr)
         return None
     finally:
@@ -468,8 +805,6 @@ def _fast_copy_stitch(
         middle_path.unlink(missing_ok=True)
         tail_path.unlink(missing_ok=True)
 
-    front_duration = intro_clip["duration"] + mid_start - transition_duration
-    tail_out_duration = tail_duration + outro_clip["duration"] - transition_duration
     print(
         f"\nDone (fast copy: ~{front_duration + tail_out_duration:.1f}s re-encoded across both "
         f"crossfades, {middle_duration:.1f}s of the main clip copied) -> {output}"
@@ -498,11 +833,148 @@ def expand_output_path(path: str) -> str:
     return str(p.with_name(name)) if p.name else path
 
 
+# --------------------------------------------------------------------------
+# Optional hardware-accelerated encoding for trim_clip()'s/stitch()'s full
+# re-encode paths (fast_copy off, or fast_copy tried and fell back) — the
+# only ffmpeg encode steps expensive enough for this to matter; see
+# _encode_with_fallback()'s docstring for the rest.
+# --------------------------------------------------------------------------
+
+# Selectable via trim.encoder/stitch.encoder (config/render-state) or
+# --encoder (the stitch subcommand's CLI). "software" (libx264) is what
+# this project originally used and needs no translation; "nvenc" is now
+# the default (at cq 23/preset p4 — a good speed/quality balance per real
+# hardware testing) and, like every other hardware encoder here, needs its
+# own quality and speed-preset flags
+# translated from the same 0-51 CRF-like scale and "fastest available
+# preset" choice used everywhere else in this project, since none of them
+# actually implement x264's own -crf/-preset. These map to each vendor's
+# documented ffmpeg options, and were confirmed to at least be valid,
+# recognized options against this project's own ffmpeg build (they get
+# past argument parsing to an actual attempt to open the hardware) — but
+# none could be verified end-to-end against real encoded output, since no
+# GPU encoder was available to test against while building this. Worth a
+# real side-by-side quality/timing check against "software" once
+# configured, and please report back if any of these need adjusting for
+# your actual hardware/driver combination.
+ENCODER_PROFILES = {
+    "software": {
+        "codec": "libx264",
+        "presets": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+        "default_preset": "veryfast",
+        "args": lambda crf, preset: ["-crf", str(crf), "-preset", preset],
+    },
+    "nvenc": {
+        # NVIDIA. -cq is NVENC's closest equivalent to x264's -crf (same
+        # 0-51 scale, lower = better quality) — only honored under a
+        # rate-control mode that supports it, hence the explicit -rc vbr.
+        # Confirmed by direct testing: the SAME crf number does not mean
+        # the same thing on NVENC as on x264 — NVENC needs a meaningfully
+        # lower (better/bigger) number to land at comparable quality/size,
+        # so don't assume parity with whatever crf is set for software.
+        # p4 ("medium" per NVENC's own docs) is its default preset — a
+        # much better size/quality tradeoff than p1 (fastest) for not
+        # much speed given up, since NVENC stays fast across its whole
+        # preset range unlike x264.
+        "codec": "h264_nvenc",
+        "presets": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        "default_preset": "p4",
+        "args": lambda crf, preset: ["-rc", "vbr", "-cq", str(crf), "-preset", preset],
+    },
+    "qsv": {
+        # Intel Quick Sync. -global_quality under QSV's default ICQ
+        # (Intelligent Constant Quality) mode is its closest equivalent to
+        # -crf, same 0-51 scale. Unlike the others, QSV's own preset names
+        # happen to match x264's, "veryfast" included.
+        "codec": "h264_qsv",
+        "presets": ["veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+        "default_preset": "veryfast",
+        "args": lambda crf, preset: ["-global_quality", str(crf), "-preset", preset],
+    },
+    "amf": {
+        # AMD. No direct CRF equivalent; constant-QP mode (-rc cqp) with
+        # one QP value applied to all frame types is the closest
+        # fixed-quality analog, same 0-51 scale. -quality doubles as AMF's
+        # named preset (an alias of -preset, per its own ffmpeg -h output —
+        # only one of the two needs setting).
+        "codec": "h264_amf",
+        "presets": ["speed", "balanced", "quality", "high_quality"],
+        "default_preset": "speed",
+        "args": lambda crf, preset: [
+            "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf), "-quality", preset,
+        ],
+    },
+    "videotoolbox": {
+        # Apple (macOS only — this encoder doesn't exist on other
+        # platforms' ffmpeg builds at all, so it's untested even at the
+        # argument-parsing level covered above). No CRF-equivalent or
+        # named presets at all; -q:v is its only fixed-quality knob, 0-100
+        # where *higher* is better — the inverse of x264's scale — so this
+        # rescales/inverts crf onto it.
+        "codec": "h264_videotoolbox",
+        "presets": [],
+        "default_preset": None,
+        "args": lambda crf, preset: ["-q:v", str(max(1, min(100, round(100 - (crf / 51) * 100))))],
+    },
+}
+
+
+def _encode_with_fallback(build_cmd, encoder: str, crf: int, preset: str | None, label: str):
+    """Run an ffmpeg encode command for one of trim_clip()'s/stitch()'s
+    full re-encode paths, using the requested encoder profile (see
+    ENCODER_PROFILES) — `build_cmd(codec, codec_args)` returns the full
+    ffmpeg argv given that profile's -c:v value and quality/preset args.
+    `preset` is one of that profile's own "presets" list; None (or
+    anything not actually in that list) falls back to the profile's own
+    "default_preset", logging why for anything that was actually a typo
+    rather than simply left unset. Falls back to "software" (libx264)
+    automatically, logging why, if the requested encoder fails to run at
+    all (wrong/missing hardware, driver mismatch, unsupported card, etc.
+    — the way a hardware encoder typically fails, distinct from a normal
+    encode failure) — since this is meant to be a speed option, not a new
+    way for a render to fail outright. Exits (like the rest of this
+    file's ffmpeg calls) if software itself fails too."""
+    profile = ENCODER_PROFILES.get(encoder)
+    if profile is None:
+        print(
+            f"[{label}] unknown encoder {encoder!r} (known: {', '.join(ENCODER_PROFILES)}) — using software",
+            file=sys.stderr,
+        )
+        encoder, profile = "software", ENCODER_PROFILES["software"]
+
+    if preset is not None and preset not in profile["presets"]:
+        if profile["presets"]:
+            print(
+                f"[{label}] {encoder!r} has no preset {preset!r} (known: {', '.join(profile['presets'])}) — "
+                f"using its default, {profile['default_preset']!r}",
+                file=sys.stderr,
+            )
+        preset = None
+    if preset is None:
+        preset = profile["default_preset"]
+
+    cmd = build_cmd(profile["codec"], profile["args"](crf, preset))
+    print("Running:", " ".join(cmd))
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+    if result.returncode == 0:
+        return
+    if encoder == "software":
+        sys.exit("ffmpeg failed.")
+
+    print(f"[{label}] {encoder} failed to encode — falling back to software (libx264)", file=sys.stderr)
+    sw = ENCODER_PROFILES["software"]
+    sw_cmd = build_cmd(sw["codec"], sw["args"](crf, sw["default_preset"]))
+    print("Running:", " ".join(sw_cmd))
+    result = subprocess.run(sw_cmd, stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        sys.exit("ffmpeg failed (both the requested encoder and the software fallback).")
+
+
 def stitch(
     intro: str, main_clip: str, outro: str, output: str = "output.mp4",
-    transition_duration: float = 1.0, transition: str = "fade", crf: int = 18,
+    transition_duration: float = 1.0, transition: str = "fade", crf: int = 23,
     intro_duration: float | None = None, outro_duration: float | None = None,
-    fast_copy: bool = True,
+    fast_copy: bool = False, encoder: str = "nvenc", encoder_preset: str | None = None,
 ) -> str:
     """Crossfade an intro, main body, and outro clip into one video. intro/
     outro can each be either a video or a still image (jpg/png/etc.) — a
@@ -511,13 +983,44 @@ def stitch(
     main_clip must be a real video (it's the trimmed recording).
     Returns the resolved output path (after strftime expansion).
 
-    fast_copy (default on): try _fast_copy_stitch() first — only the two
-    short crossfade windows get re-encoded, and the untouched middle of
-    main_clip (very likely almost all of it) is stream-copied instead of
-    being decoded and re-encoded along with everything else. Falls
-    straight through to the full single-pass crossfade below (logging
-    why) if that's not applicable or safe for this main_clip — an
-    h264-only technique, and not worth it for a short main clip."""
+    fast_copy (default OFF, unlike trim_clip()'s — see below): try
+    _fast_copy_stitch() first — only the two short crossfade windows get
+    re-encoded, and the untouched middle of main_clip is stream-copied
+    instead of being decoded and re-encoded along with everything else.
+    _fast_copy_stitch() always verifies its own result actually decodes
+    cleanly before trusting it (see _verify_join_points_decode_cleanly()),
+    and falls straight through to the full single-pass crossfade below
+    (logging why) if that check — or an earlier one (codec, a safe
+    keyframe, main_clip being long enough) — didn't pass. So this is never
+    unsafe to leave on.
+
+    It's just not USEFUL in practice: every re-encode this produces (the
+    two crossfade windows) goes through a scale/pad/format/xfade filter
+    chain, and empirically — confirmed by direct, repeated testing while
+    building this, including with h264 and with intro/outro cut from
+    main_clip itself so the content genuinely matches — that consistently
+    produces different-enough codec parameters (SPS/PPS/etc.) from
+    main_clip's own that the decode-clean check fails every time, not just
+    sometimes. MP4 (and concat generally) can only carry one set of those
+    per track, so this isn't a narrow bug to chase further; it's a real
+    limit of the format for this technique specifically. Left here,
+    default off, in case a future encoder/container combination
+    (or trim_clip()'s plain re-encode, which has no such filter chain and
+    reliably passes the same check) changes that.
+
+    encoder (default "nvenc", at cq 23/preset p4 — a good speed/quality
+    balance per real hardware testing): which encoder the full
+    single-pass crossfade below uses — see ENCODER_PROFILES/
+    _encode_with_fallback() for the available names and the automatic
+    fallback-to-software behavior if a hardware one fails to run. Only
+    applies to that full re-encode, not fast_copy's own (much smaller,
+    rarely-taken) re-encode windows.
+
+    encoder_preset (default None): that encoder's own speed/quality
+    preset — None (or anything not one of that encoder's own presets, per
+    ENCODER_PROFILES) uses its default. Presets aren't comparable across
+    encoders (each has its own names and its own speed/efficiency curve),
+    so this only makes sense together with a specific `encoder` choice."""
     output = expand_output_path(output)
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         sys.exit("ffmpeg and ffprobe must be installed and on PATH.")
@@ -568,7 +1071,7 @@ def stitch(
             return result
         print("[stitch] continuing with a full re-encode")
 
-    cmd = ["ffmpeg", "-y", "-nostdin"]
+    cmd = ["ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args()]
     for p, is_image, clip in zip(paths, is_image_flags, clips):
         if is_image:
             # -loop 1: repeat the single frame indefinitely; -t: cut that
@@ -597,19 +1100,25 @@ def stitch(
         clips, audio_inputs, width, height, fps, transition, transition_duration,
     )
 
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", v_out, "-map", a_out,
-        "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        output,
-    ]
+    # This is the path that actually runs for virtually every stitch
+    # (fast_copy defaults off for stitch specifically — see stitch()'s
+    # docstring for why it's not worth attempting), so its speed is what
+    # matters day to day — hence the encoder choice (see
+    # ENCODER_PROFILES/_encode_with_fallback()). Always h264 regardless of
+    # main_clip's own codec, same as this fallback has always done.
+    base_cmd = cmd + ["-filter_complex", filter_complex, "-map", v_out, "-map", a_out]
 
-    print("Running:", " ".join(cmd))
-    result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
-    if result.returncode != 0:
-        sys.exit("ffmpeg failed.")
+    def build_cmd(codec, codec_args):
+        return base_cmd + [
+            "-c:v", codec, *codec_args,
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            output,
+        ]
+
+    total_duration = clips[0]["duration"] + clips[1]["duration"] + clips[2]["duration"] - 2 * transition_duration
+    _print_step(total_duration, "encoding")
+    _encode_with_fallback(build_cmd, encoder, crf, encoder_preset, "stitch")
 
     print(f"\nDone -> {output}")
     return output
@@ -801,17 +1310,23 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
     fall back to trim_clip()'s old, always-correct full re-encode; this
     always logs why."""
     info = probe(src)
-    if info.get("video_codec") != "h264":
+    codec_info = FAST_COPY_CODECS.get(info.get("video_codec"))
+    if codec_info is None:
         print(
-            f"[trim] fast copy: source is {info.get('video_codec')!r}, not h264 — the re-encoded "
-            "sliver (always h264) couldn't be joined with a copied tail of a different codec, skipping",
+            f"[trim] fast copy: source's codec is {info.get('video_codec')!r}, which fast copy "
+            f"doesn't know how to match (supported: {', '.join(FAST_COPY_CODECS)}) — the re-encoded "
+            "sliver couldn't be joined with a copied tail of a different codec, skipping",
             file=sys.stderr,
         )
         return None
 
-    keyframe_time = find_next_keyframe(src, start)
+    keyframe_time = find_next_keyframe(src, start, codec_info)
     if keyframe_time is None:
-        print(f"[trim] fast copy: couldn't find a keyframe at/after {start:.3f}s, skipping", file=sys.stderr)
+        print(
+            f"[trim] fast copy: couldn't find a safe keyframe (a true random-access point — see "
+            f"find_next_keyframe()) at/after {start:.3f}s, skipping",
+            file=sys.stderr,
+        )
         return None
     if keyframe_time >= end:
         print(
@@ -829,12 +1344,14 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
     if keyframe_time - start <= 0.02:
         tail_duration = max(0.0, end - keyframe_time - tail_margin)
         cmd = [
-            "ffmpeg", "-y", "-nostdin",
+            "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{keyframe_time:.3f}", "-i", src, "-t", f"{tail_duration:.3f}",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-video_track_timescale", str(CONCAT_TIMESCALE),
             dst,
         ]
         print(f"[trim] fast copy: start ({start:.3f}s) is already on a keyframe — copying the whole clip, no re-encoding")
+        _print_step(tail_duration, "copying")
         print("Running:", " ".join(cmd))
         result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
         if result.returncode != 0:
@@ -847,36 +1364,41 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
     tail_path = Path(dst).with_name(f".{Path(dst).stem}.tail{Path(dst).suffix}")
     try:
         sliver_cmd = [
-            "ffmpeg", "-y", "-nostdin",
+            "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{start:.3f}", "-i", src, "-t", f"{keyframe_time - start:.3f}",
-            "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+            "-c:v", codec_info["encoder"], "-crf", str(crf), "-preset", "veryfast", *codec_info["extra"],
             "-c:a", "aac", "-b:a", "192k",
+            "-video_track_timescale", str(CONCAT_TIMESCALE),
             str(sliver_path),
         ]
         print(
             f"[trim] fast copy: re-encoding {start:.3f}s -> {keyframe_time:.3f}s "
             f"({keyframe_time - start:.3f}s, up to the nearest keyframe)"
         )
+        _print_step(keyframe_time - start, "re-encoding sliver")
         print("Running:", " ".join(sliver_cmd))
         subprocess.run(sliver_cmd, check=True, stdin=subprocess.DEVNULL)
 
         tail_duration = max(0.0, end - keyframe_time - tail_margin)
         tail_cmd = [
-            "ffmpeg", "-y", "-nostdin",
+            "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{keyframe_time:.3f}", "-i", src, "-t", f"{tail_duration:.3f}",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-video_track_timescale", str(CONCAT_TIMESCALE),
             str(tail_path),
         ]
         print(
             f"[trim] fast copy: stream-copying video {keyframe_time:.3f}s -> {end:.3f}s "
             f"({tail_duration:.3f}s, no re-encoding)"
         )
+        _print_step(tail_duration, "copying tail")
         print("Running:", " ".join(tail_cmd))
         subprocess.run(tail_cmd, check=True, stdin=subprocess.DEVNULL)
 
         print("[trim] fast copy: joining the re-encoded sliver and copied tail")
-        _run_concat([sliver_path, tail_path], dst)
-    except subprocess.CalledProcessError as e:
+        _print_step((keyframe_time - start) + tail_duration, "joining")
+        _run_concat([sliver_path, tail_path], dst, verify_join_offsets=[keyframe_time - start])
+    except (subprocess.CalledProcessError, RuntimeError) as e:
         print(f"[trim] fast copy step failed ({e}) — falling back to a full re-encode", file=sys.stderr)
         return None
     finally:
@@ -887,7 +1409,10 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
     return dst
 
 
-def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18, fast_copy: bool = True) -> str:
+def trim_clip(
+    src: str, dst: str, start: float, end: float, crf: int = 23,
+    fast_copy: bool = True, encoder: str = "nvenc", encoder_preset: str | None = None,
+) -> str:
     """Trim src down to [start, end] and write it to dst. Returns the
     resolved destination path (dst after strftime expansion) — use this,
     not the original dst, for anything downstream that needs to find the
@@ -897,8 +1422,21 @@ def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18, fast_
     short sliver up to the nearest keyframe, then stream-copy the rest, so
     a long clip doesn't get fully decoded and re-encoded just to cut its
     ends off. Falls straight through to the full re-encode below (logging
-    why) if that's not applicable or safe for this source — an h264-only
-    technique, and not worth it for a very short trim range."""
+    why) if that's not applicable or safe for this source — only works
+    for the codecs in FAST_COPY_CODECS (h264, hevc), and not worth it for
+    a very short trim range. Note this means fast_copy's output ends up
+    in src's own codec (hevc stays hevc, etc.) rather than always being
+    h264 the way the full-re-encode fallback below always is.
+
+    encoder/encoder_preset (default "nvenc"/None, i.e. cq 23 at nvenc's
+    own default preset p4 — a good speed/quality balance per real
+    hardware testing): which encoder (and that encoder's own speed/quality
+    preset) the full re-encode below uses if fast_copy is off or falls
+    back — see ENCODER_PROFILES/
+    _encode_with_fallback() for the available names, per-encoder presets,
+    and the automatic fallback-to-software behavior if a hardware one
+    fails to run. Doesn't apply to fast_copy's own (much smaller) sliver
+    re-encode."""
     dst = expand_output_path(dst)
 
     if fast_copy:
@@ -909,16 +1447,18 @@ def trim_clip(src: str, dst: str, start: float, end: float, crf: int = 18, fast_
 
     # Frame-accurate trim: -ss/-to placed after -i forces ffmpeg to decode
     # from the start rather than snapping to the nearest keyframe.
-    cmd = [
-        "ffmpeg", "-y", "-nostdin",
-        "-i", src,
-        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
-        "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
-        "-c:a", "aac", "-b:a", "192k",
-        dst,
-    ]
-    print("Running:", " ".join(cmd))
-    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
+    def build_cmd(codec, codec_args):
+        return [
+            "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
+            "-i", src,
+            "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+            "-c:v", codec, *codec_args,
+            "-c:a", "aac", "-b:a", "192k",
+            dst,
+        ]
+
+    _print_step(end - start, "re-encoding")
+    _encode_with_fallback(build_cmd, encoder, crf, encoder_preset, "trim")
     return dst
 
 
@@ -978,6 +1518,7 @@ def render(state: dict):
     so a live run's trim+stitch step is always reproducible offline."""
     trim_cfg = state.get("trim", {})
     stitch_cfg = state.get("stitch", {})
+    _reset_steps(_render_step_total(trim_cfg, stitch_cfg))
 
     start_offset, end_offset = compute_trim_offsets(
         parse_timestamp(state["raw_begin_offset"]), parse_timestamp(state["raw_end_offset"]),
@@ -986,8 +1527,9 @@ def render(state: dict):
 
     trimmed_path = trim_clip(
         state["recording_path"], trim_cfg.get("output", "body_trimmed.mp4"),
-        start_offset, end_offset, crf=trim_cfg.get("crf", 18),
-        fast_copy=trim_cfg.get("fast_copy", True),
+        start_offset, end_offset, crf=trim_cfg.get("crf", 23),
+        fast_copy=trim_cfg.get("fast_copy", True), encoder=trim_cfg.get("encoder", "nvenc"),
+        encoder_preset=trim_cfg.get("encoder_preset"),
     )
     print(f"\nTrimmed body clip -> {trimmed_path}")
 
@@ -997,19 +1539,21 @@ def render(state: dict):
             output=stitch_cfg.get("output", "final.mp4"),
             transition_duration=stitch_cfg.get("transition_duration", 1.0),
             transition=stitch_cfg.get("transition", "fade"),
-            crf=stitch_cfg.get("crf", 18),
+            crf=stitch_cfg.get("crf", 23),
             intro_duration=stitch_cfg.get("intro_duration"),
             outro_duration=stitch_cfg.get("outro_duration"),
-            fast_copy=stitch_cfg.get("fast_copy", True),
+            fast_copy=stitch_cfg.get("fast_copy", False),
+            encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
         )
 
 
 def _write_render_state(recording_path: str, raw_begin_offset: float, raw_end_offset: float, trim_cfg: dict, stitch_cfg: dict) -> tuple[dict, Path]:
-    """Builds the render-state dict and writes it to a timestamped file
-    (base name from trim.state_output) — the same self-contained record
-    documented in the README, used both by the normal end-of-recording
-    path and by prerender, so a render-state file looks identical
-    regardless of which one produced it."""
+    """Builds the render-state dict and writes it to trim.state_output
+    (strftime placeholders expanded the same way as trim.output/
+    stitch.output — see expand_output_path()) — the same self-contained
+    record documented in the README, used both by the normal
+    end-of-recording path and by prerender, so a render-state file looks
+    identical regardless of which one produced it."""
     render_state = {
         "recording_path": recording_path,
         "raw_begin_offset": format_timestamp(raw_begin_offset),
@@ -1017,9 +1561,7 @@ def _write_render_state(recording_path: str, raw_begin_offset: float, raw_end_of
         "trim": trim_cfg,
         "stitch": stitch_cfg,
     }
-    state_base = Path(trim_cfg.get("state_output", "render_state.json"))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    state_path = state_base.with_name(f"{state_base.stem}_{timestamp}{state_base.suffix}")
+    state_path = Path(expand_output_path(trim_cfg.get("state_output") or DEFAULT_STATE_OUTPUT))
     state_path.write_text(json.dumps(render_state, indent=2))
     print(f"[watcher] wrote render state -> {state_path}")
     print(f"[watcher] to redo just the trim/stitch later (no OBS/ProPresenter needed): python {Path(__file__).name} render {state_path}")
@@ -1080,6 +1622,7 @@ def prerender_worker(events_q: "queue.Queue", recording_path: str, raw_begin_off
     Reports back over events_q rather than returning anything, since this
     runs in its own background thread — the main watch() loop is what
     updates its own bookkeeping and prints the final status line."""
+    _reset_steps(_render_step_total(trim_cfg, stitch_cfg))
     try:
         start_offset, end_offset = compute_trim_offsets(
             raw_begin_offset, raw_end_offset,
@@ -1088,7 +1631,8 @@ def prerender_worker(events_q: "queue.Queue", recording_path: str, raw_begin_off
         _write_render_state(recording_path, raw_begin_offset, raw_end_offset, trim_cfg, stitch_cfg)
         trimmed_path = trim_clip(
             recording_path, trim_cfg.get("output", "body_trimmed.mp4"), start_offset, end_offset,
-            crf=trim_cfg.get("crf", 18), fast_copy=trim_cfg.get("fast_copy", True),
+            crf=trim_cfg.get("crf", 23), fast_copy=trim_cfg.get("fast_copy", True),
+            encoder=trim_cfg.get("encoder", "nvenc"), encoder_preset=trim_cfg.get("encoder_preset"),
         )
         print(f"[watcher] prerender: trimmed -> {trimmed_path}")
         if stitch_cfg.get("auto"):
@@ -1097,10 +1641,11 @@ def prerender_worker(events_q: "queue.Queue", recording_path: str, raw_begin_off
                 output=stitch_cfg.get("output", "final.mp4"),
                 transition_duration=stitch_cfg.get("transition_duration", 1.0),
                 transition=stitch_cfg.get("transition", "fade"),
-                crf=stitch_cfg.get("crf", 18),
+                crf=stitch_cfg.get("crf", 23),
                 intro_duration=stitch_cfg.get("intro_duration"),
                 outro_duration=stitch_cfg.get("outro_duration"),
-                fast_copy=stitch_cfg.get("fast_copy", True),
+                fast_copy=stitch_cfg.get("fast_copy", False),
+                encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
             )
             print(f"[watcher] prerender complete -> {final_path}")
         else:
@@ -1394,15 +1939,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Not documented in --help on any of these (add_argument's help=
+    # omitted) — an internal switch the GUI passes to every subprocess it
+    # starts (see gui.py's ProcessRunner), not something a terminal user
+    # would want: it replaces ffmpeg's normal human-readable progress
+    # stats with machine-readable ones meant for the GUI's progress bar to
+    # parse (see _MACHINE_PROGRESS/_ffmpeg_output_args()), which would
+    # just look like log spam in a terminal.
+    machine_progress_kwargs = dict(action="store_true")
+
     p_watch = sub.add_parser("watch", help="Watch ProPresenter+OBS live, then trim and stitch once the service ends")
     p_watch.add_argument("-c", "--config", default="config.json", help="Path to config JSON file")
     p_watch.add_argument("--debug", action="store_true", help="Print every raw message received from ProPresenter and OBS")
+    p_watch.add_argument("--machine-progress", **machine_progress_kwargs)
 
     p_learn = sub.add_parser("learn", help="Print slide uid/text as you step through ProPresenter (no OBS needed)")
     p_learn.add_argument("-c", "--config", default="config.json", help="Path to config JSON file")
 
     p_render = sub.add_parser("render", help="Re-run just the trim+stitch step from a saved render-state file (no OBS/ProPresenter needed)")
     p_render.add_argument("state_json", help="Path to a render_state_*.json file written by a previous 'watch' run")
+    p_render.add_argument("--machine-progress", **machine_progress_kwargs)
 
     p_stitch = sub.add_parser("stitch", help="Crossfade an intro, main body, and outro clip into one video")
     p_stitch.add_argument("intro", help="Path to the intro clip")
@@ -1411,24 +1967,44 @@ def main():
     p_stitch.add_argument("-o", "--output", default="output.mp4", help="Output file path")
     p_stitch.add_argument("-d", "--transition-duration", type=float, default=1.0, help="Crossfade duration in seconds (default: 1.0)")
     p_stitch.add_argument("-t", "--transition", default="fade", help="ffmpeg xfade transition name (default: fade, i.e. a simple crossfade)")
-    p_stitch.add_argument("--crf", type=int, default=18, help="x264 CRF quality, lower is better (default: 18)")
+    p_stitch.add_argument("--crf", type=int, default=23, help="CRF/CQ quality, lower is better (default: 23)")
     p_stitch.add_argument("--intro-duration", type=float, default=None, help=f"Seconds to show the intro for, if it's a still image (default: {DEFAULT_IMAGE_DURATION})")
     p_stitch.add_argument("--outro-duration", type=float, default=None, help=f"Seconds to show the outro for, if it's a still image (default: {DEFAULT_IMAGE_DURATION})")
     p_stitch.add_argument(
-        "--fast-copy", action=argparse.BooleanOptionalAction, default=True,
+        "--fast-copy", action=argparse.BooleanOptionalAction, default=False,
         help="Re-encode only the two crossfade windows and stream-copy the untouched middle of "
-             "the main clip, instead of fully re-encoding everything (default: on; needs an h264 "
-             "main clip, falls back to a full re-encode automatically otherwise)",
+             "the main clip, instead of fully re-encoding everything (default: off — always "
+             "verifies its own result before trusting it, and safely falls back to a full "
+             "re-encode otherwise, but in practice that check has never actually passed in "
+             "testing; see stitch()'s docstring)",
     )
+    p_stitch.add_argument(
+        "--encoder", default="nvenc", choices=list(ENCODER_PROFILES),
+        help="Encoder for the full re-encode (default: nvenc, at cq 23/preset p4 — a good "
+             "speed/quality balance per real hardware testing). Falls back to software "
+             "automatically, logging why, if it fails to run — see ENCODER_PROFILES for the full "
+             "list and important caveats about how well-tested each one actually is.",
+    )
+    p_stitch.add_argument(
+        "--encoder-preset", default=None,
+        help="That encoder's own speed/quality preset (names differ per encoder — see "
+             "ENCODER_PROFILES; e.g. libx264: veryfast/medium/slow/etc., nvenc: p1-p7). Default: "
+             "that encoder's own default preset.",
+    )
+    p_stitch.add_argument("--machine-progress", **machine_progress_kwargs)
 
     args = parser.parse_args()
 
+    global _MACHINE_PROGRESS
+    _MACHINE_PROGRESS = getattr(args, "machine_progress", False)
+
     if args.command == "stitch":
+        _reset_steps(_phase_worst_case_steps(args.fast_copy, STITCH_FAST_COPY_STEPS))
         stitch(
             args.intro, args.main_clip, args.outro, output=args.output,
             transition_duration=args.transition_duration, transition=args.transition, crf=args.crf,
             intro_duration=args.intro_duration, outro_duration=args.outro_duration,
-            fast_copy=args.fast_copy,
+            fast_copy=args.fast_copy, encoder=args.encoder, encoder_preset=args.encoder_preset,
         )
         return
 
