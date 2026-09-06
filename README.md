@@ -109,9 +109,10 @@ each week. A Live/Offline notebook plus the console:
   through Watch/ProPresenter at all) to hand off or run later with
   `render`, rather than only ever being able to redo one Watch already
   produced. "Advanced…" opens a small window (hidden rather than closed
-  when dismissed, like Config) holding CRF, Fast copy, Encoder, and
-  Encoder preset — tuning knobs set once and rarely touched, split out
-  from the fields above that actually change per run.
+  when dismissed, like Config) holding CRF, Fast copy, Normalize audio (and
+  its Target LUFS), Encoder, and Encoder preset — tuning knobs set once and
+  rarely touched, split out from the fields above that actually change per
+  run.
 
 **Config window** — everything set once and rarely touched again, opened
 via the main window's "Config" button. Hidden rather than closed when
@@ -138,10 +139,11 @@ lives at the top, then four tabs:
 - **OBS** — host/port/password.
 - **Render** — the trim + auto-stitch settings a live Watch run uses once
   it finishes (trimmed output path, pad start/end, transition type,
-  transition duration, CRF, the fast copy toggle, auto-stitch toggle) —
-  same fields, layout, and order as the Offline tab, since these
-  are exactly what it defaults to before you override them per run. The
-  Offline tab's manual crossfade tool doesn't read these values, though.
+  transition duration, CRF, the fast copy toggle, the normalize-audio
+  toggle and its target LUFS, auto-stitch toggle) — same fields, layout,
+  and order as the Offline tab, since these are exactly what it defaults
+  to before you override them per run. The Offline tab's manual crossfade
+  tool doesn't read these values, though.
 
 Starting Watch or Learn auto-saves whatever's currently in both windows to
 the config file path shown in Config, so there's no separate "save before
@@ -469,6 +471,8 @@ ProPresenter or OBS is made.
     "pad_end_seconds": 0,                 // + = later/more buffer, - = earlier/tighter end
     "crf": 23,
     "fast_copy": true,                    // optional, default true — see "Fast copy" below
+    "normalize_audio": true,              // optional, default true — see "Normalize audio" below
+    "normalize_target_lufs": -16.0,       // optional, default -16.0 — integrated loudness target
     "encoder": "nvenc",                   // optional, default "nvenc" — see "Encoder" below
     "encoder_preset": null                // optional, default null (that encoder's own default preset, p4 for nvenc)
   },
@@ -523,6 +527,36 @@ the always-correct full re-encode. The GUI only exposes a single "Fast
 copy" checkbox, for `trim.fast_copy` — `stitch.fast_copy` is config/
 render-state/CLI (`stitch --fast-copy`) only, given it's never actually
 had anything to offer in testing.
+
+**Normalize audio** (`trim.normalize_audio` — on by default, trim only;
+`trim.normalize_target_lufs`, default `-16.0`): loudness-normalizes the
+trimmed clip's audio to the target via ffmpeg's `loudnorm` filter, useful
+since a live recording's levels can vary service to service (mic gain,
+distance from the mic, etc.) in a way a fixed CRF/encoder choice has no
+bearing on. `-16` LUFS is a common streaming/YouTube target and a good
+match for spoken-word content; `-23` is the EBU R128 broadcast standard,
+quieter with more headroom. Video is untouched either way, and this is
+trim-only — intro/outro clips (typically already produced/mixed at their
+own intentional level) and the final stitched crossfade aren't touched by
+it, on the theory that a crossfade already blends gracefully across a
+level difference between two clips, the same way it blends everything
+else about them.
+
+Measures the whole trimmed range once, up front (an audio-only pass —
+cheap, since no video gets decoded for it — that adds one extra step to
+the GUI's step counter), rather than leaving each piece fast copy might
+encode separately (the sliver and the tail) to work out its own
+correction independently: `loudnorm`'s single-pass mode makes its gain
+decision from a limited look-ahead window, which isn't guaranteed to
+agree between two disjoint chunks of the same recording, and a
+mismatch between them would be an audible jump right at the join.
+Measuring once and feeding the identical measured stats into both
+pieces' second-pass filters keeps them consistent with each other, the
+way `ffmpeg`'s own documentation recommends normalizing a program that
+has to be encoded in more than one pass. A failed measurement (logged,
+either way) just skips normalization for that render rather than failing
+it outright, since this is meant to be a quality improvement, not a hard
+requirement.
 
 **Encoder** (`trim.encoder`/`stitch.encoder`, both `"nvenc"` by
 default; `trim.encoder_preset`/`stitch.encoder_preset`, both null/that
