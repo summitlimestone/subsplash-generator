@@ -108,7 +108,13 @@ def default_config() -> dict:
 STATE_RE = re.compile(r"state = (\w+)")
 RENDER_STATE_PATH_RE = re.compile(r"wrote render state -> (.+)$")
 SLIDE_RE = re.compile(r'^uid: "(.*)"\s+text: (.*)$')
-PRERENDER_STATUS_RE = re.compile(r"prerender status = (\w+)")
+# Matches service_video.py's "[watcher] trim status = ..."/"[watcher]
+# stitch status = ..." lines (see _trim_worker()/_stitch_worker()).
+TRIM_STITCH_STATUS_RE = re.compile(r"(trim|stitch) status = (\w+)")
+# Matches render()'s own "\nTrimmed body clip -> ..." print line — used by
+# the Offline tab's Trim button to auto-point Main clip at the result, so
+# a follow-up Stitch click picks it up without the user re-Browsing.
+TRIMMED_PATH_RE = re.compile(r"^Trimmed body clip -> (.+)$")
 # Mirrors service_video.py's _print_step() output exactly (see
 # _MACHINE_PROGRESS/--machine-progress there) — "[progress] step N/M
 # duration=D.DDD: <description>".
@@ -123,7 +129,7 @@ PROGRESS_FIELD_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$")
 # service_video.py's internal state machine names, relabeled for display —
 # names not listed here (WAIT_RECORD_START etc.) show as-is.
 WATCH_STATE_LABELS = {
-    "TRIM": "Rendering",
+    "RECORDING_STOPPED": "Recording stopped",
 }
 
 JSON_FILETYPES = [("JSON files", "*.json"), ("All files", "*.*")]
@@ -357,19 +363,18 @@ LOG_PATH_HELP = (
     "itself is unaffected either way."
 )
 
-PRERENDER_HELP = (
-    "Starts trim+stitch now, reading the recording while OBS is still "
-    "writing it, instead of waiting for the recording to stop. Counts as "
-    "the real render — nothing more runs automatically once recording "
-    "actually ends. Can fail if clicked too soon after marking the end "
-    "(the encoder hasn't flushed that far yet) — safe to just try again."
+LIVE_TRIM_HELP = (
+    "Trims the recording down to the marked start/end. Works before the "
+    "recording actually stops too — it reads the in-progress file, and if "
+    "that doesn't work yet (the encoder hasn't flushed that far), it "
+    "automatically waits for the recording to finish and tries again once "
+    "more, rather than failing outright. Nothing renders on its own — this "
+    "is the only thing that ever trims."
 )
 
-SKIP_RENDER_HELP = (
-    "Writes the render-state file as usual when recording stops, but "
-    "skips the automatic trim+stitch — for when you already know the "
-    "timing will need adjusting by hand afterward. Use the Offline tab or "
-    "'render' on that file whenever you're ready."
+LIVE_STITCH_HELP = (
+    "Crossfades the just-trimmed clip with the intro/outro above. Needs a "
+    "successful Trim first this run."
 )
 
 IMAGE_DURATION_HELP = (
@@ -521,22 +526,23 @@ class App(tk.Tk):
         self._current_command: str | None = None
         # Set by _load_render_state_json() when a loaded file has raw
         # recording/offset info; cleared (or left stale but unused) when
-        # Main clip no longer matches — see _run_render().
+        # Main clip no longer matches — see _offline_use_raw_trim().
         self._offline_raw_state: dict | None = None
-        # Set once Prerender succeeds or Skip Render is used, so that
-        # terminal status ("Done (Prerendered)"/"Done (Skipped Render)")
-        # sticks instead of being overwritten by the state-machine
-        # transitions (e.g. "-> state = TRIM" when recording stops) or the
-        # generic "done" the process exiting would otherwise set — see
-        # _handle_watch_line()/_on_process_exit(). Reset at the start of
-        # each watch run.
-        self._prerender_locked = False
+        # Live tab's Trim/Stitch button enablement — see
+        # _update_live_buttons()/_handle_trim_stitch_status(). Both track
+        # whether something has become true at any point *this run*
+        # (an end has been marked; a trim has succeeded), not just
+        # whether the most recent "state = ..." line implies it, since
+        # neither should ever become un-true again mid-run once set.
+        # Reset at the start of each watch run (_run_watch()).
+        self._live_end_marked = False
+        self._live_trimmed = False
         # See _handle_progress_line(): whether the most recently parsed
         # line was a "[progress] step N/M" marker (or a progress field
         # following one) — while true, key=value lines get swallowed
         # into the progress bar/step/speed readout instead of logged.
         # Reset at the start of every run and when one exits, same as
-        # _prerender_locked above.
+        # _live_end_marked/_live_trimmed above.
         self._in_progress_step = False
         self._progress_step_duration: float | None = None
         # When the current run started (time.monotonic(), so a system
@@ -544,7 +550,7 @@ class App(tk.Tk):
         # _on_process_exit() to show "took ..." in place of the last
         # speed reading once the run finishes; see _format_duration().
         self._run_started_at: float | None = None
-        # Set by _run_render()'s raw-trim path when it hands 'render' a
+        # Set by _run_trim() when it hands 'render' a
         # throwaway temp render-state file instead of overwriting the
         # loaded one — cleaned up in _on_process_exit() once that run
         # finishes, whichever way.
@@ -1101,10 +1107,11 @@ class App(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Runs the live pipeline for the whole service: waits for OBS to start "
-            "recording, then the begin slide, then the end slide, then OBS to stop — "
-            "then trims and stitches automatically. Connection, slide-matching, and "
-            "trim settings live in Config.",
+            text="Tracks the whole service live: waits for OBS to start recording, then "
+            "the begin slide, then the end slide — keeping a render-state file up to "
+            "date as it goes. Nothing renders automatically: click Trim (works even "
+            "before recording stops) and then Stitch whenever you're ready. Connection, "
+            "slide-matching, and trim settings live in Config.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
 
@@ -1136,16 +1143,16 @@ class App(tk.Tk):
             btn_row, text="Mark Sermon End", command=self._mark_sermon_end, state="disabled",
         )
         self.mark_end_btn.pack(side="left", padx=(8, 0))
-        self.prerender_btn = ttk.Button(
-            btn_row, text="Prerender", command=self._prerender, state="disabled",
+        self.live_trim_btn = ttk.Button(
+            btn_row, text="Trim", command=self._trim_live, state="disabled",
         )
-        self.prerender_btn.pack(side="left", padx=(8, 0))
-        Tooltip(self.prerender_btn, PRERENDER_HELP, font=self.ui_font)
-        self.skip_render_btn = ttk.Button(
-            btn_row, text="Skip Render", command=self._skip_render, state="disabled",
+        self.live_trim_btn.pack(side="left", padx=(8, 0))
+        Tooltip(self.live_trim_btn, LIVE_TRIM_HELP, font=self.ui_font)
+        self.live_stitch_btn = ttk.Button(
+            btn_row, text="Stitch", command=self._stitch_live, state="disabled",
         )
-        self.skip_render_btn.pack(side="left", padx=(8, 0))
-        Tooltip(self.skip_render_btn, SKIP_RENDER_HELP, font=self.ui_font)
+        self.live_stitch_btn.pack(side="left", padx=(8, 0))
+        Tooltip(self.live_stitch_btn, LIVE_STITCH_HELP, font=self.ui_font)
         self.watch_debug_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(btn_row, text="Debug", variable=self.watch_debug_var).pack(
             side="left", padx=(10, 0)
@@ -1190,11 +1197,12 @@ class App(tk.Tk):
             frame,
             text="Crossfade an intro, main body clip, and outro into the final video. "
             "Fill in the fields yourself, or click \"Load from JSON\" to pull them out "
-            "of a render_state_*.json file a previous Watch run wrote. Loading from "
-            "JSON also enables the sermon start/end timestamps below, which re-trim "
-            "the raw recording to those exact points before stitching — otherwise "
-            "Main clip is assumed to already be trimmed and the timestamps are "
-            "ignored. Doesn't need a config file or any live connection either way.",
+            "of a render_state_*.json file a Watch run wrote (even one still in "
+            "progress). Loading from JSON also enables the sermon start/end "
+            "timestamps below, which Trim uses to re-trim the raw recording to those "
+            "exact points, pointing Main clip at the result for a follow-up Stitch — "
+            "otherwise Main clip is assumed to already be trimmed and Stitch alone is "
+            "what you want. Doesn't need a config file or any live connection either way.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
@@ -1243,9 +1251,14 @@ class App(tk.Tk):
             row=8, column=0, sticky="w", pady=(6, 0)
         )
 
-        start_btn = ttk.Button(frame, text="Run Render", style="Accent.TButton", command=self._run_render)
-        start_btn.grid(row=9, column=0, sticky="w", pady=(10, 0))
-        self._start_buttons.append(start_btn)
+        offline_btn_row = ttk.Frame(frame)
+        offline_btn_row.grid(row=9, column=0, sticky="w", pady=(10, 0))
+        trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
+        trim_btn.pack(side="left")
+        self._start_buttons.append(trim_btn)
+        stitch_btn = ttk.Button(offline_btn_row, text="Stitch", style="Accent.TButton", command=self._run_stitch)
+        stitch_btn.pack(side="left", padx=(8, 0))
+        self._start_buttons.append(stitch_btn)
 
     def _open_offline_advanced_window(self):
         self.offline_advanced_window.deiconify()
@@ -1281,10 +1294,11 @@ class App(tk.Tk):
             self.vars["st_duration"].set(str(stitch_cfg["transition_duration"]))
         if "transition" in stitch_cfg:
             self.vars["st_transition"].set(stitch_cfg["transition"])
-        # This one field drives both trim.crf and stitch.crf when Run
-        # re-trims (see _run_render) — on load, prefer stitch.crf (what
-        # actually determines the final video's visible quality) and fall
-        # back to trim.crf so a file that only sets one still reflects it.
+        # This one field drives both trim.crf and stitch.crf when Trim/
+        # Stitch runs (see _run_trim()/_run_stitch()) — on load, prefer
+        # stitch.crf (what actually determines the final video's visible
+        # quality) and fall back to trim.crf so a file that only sets one
+        # still reflects it.
         crf_val = stitch_cfg.get("crf", trim_cfg.get("crf"))
         if crf_val is not None:
             self.vars["st_crf"].set(max(0, min(51, round(crf_val))))
@@ -1298,11 +1312,19 @@ class App(tk.Tk):
             if saved_preset:
                 self.vars["st_encoder_preset"].set(saved_preset)
 
-        has_raw = "recording_path" in state and "raw_begin_offset" in state and "raw_end_offset" in state
+        # Not just key presence: a render-state file watch() is still
+        # incrementally writing (see service_video.py's _write_render_state())
+        # can have these keys present but null before that information is
+        # actually known yet — treat that the same as missing entirely.
+        has_raw = (
+            state.get("recording_path") is not None
+            and state.get("raw_begin_offset") is not None
+            and state.get("raw_end_offset") is not None
+        )
         if has_raw:
             # Point Main clip at the raw recording (not the already-trimmed
             # clip) so the timestamp fields below have something meaningful
-            # to trim from — see _run_render(). Shown as the actual computed
+            # to trim from — see _run_trim(). Shown as the actual computed
             # trim points (raw slide-detected offset + any padding that was
             # applied live), not as a raw/pad split — there's no slide
             # detection here, just a person looking at footage and picking
@@ -1759,6 +1781,8 @@ class App(tk.Tk):
                         self._handle_learn_line(payload)
                     elif self._current_command == "watch":
                         self._handle_watch_line(payload)
+                    elif self._current_command == "trim":
+                        self._handle_offline_trim_line(payload)
                 elif kind == "exit":
                     self._on_process_exit(payload)
         except queue.Empty:
@@ -1783,19 +1807,13 @@ class App(tk.Tk):
         else:
             self._log(f"[gui] {label} exited with code {code}.\n")
         if label == "watch":
-            # render() doesn't print another "state = ..." line, so the
-            # status label would otherwise freeze on the last live state —
-            # except when Prerender/Skip Render already set a terminal
-            # status (_prerender_locked), which should stick rather than
-            # being overwritten by a plain "done". A real failure (nonzero
-            # exit) still always gets surfaced, locked or not.
-            if code != 0:
-                self.watch_state_var.set(f"stopped (exit {code})")
-                self.watch_status_label.configure(foreground=PALETTE["danger"])
-            elif not self._prerender_locked:
-                self.watch_state_var.set("done")
-                self.watch_status_label.configure(foreground=PALETTE["success"])
-            self._update_mark_buttons(None)
+            # watch() never exits on its own any more — the only ways it
+            # ends are Stop (this) or Ctrl+C in a terminal — so a nonzero
+            # exit code here is the normal case, not a sign anything went
+            # wrong; show it plainly rather than as an error.
+            self.watch_state_var.set(f"stopped (exit {code})")
+            self.watch_status_label.configure(foreground=PALETTE["muted"])
+            self._update_live_buttons(None)
         self._current_command = None
         self._set_busy(False)
 
@@ -1810,85 +1828,84 @@ class App(tk.Tk):
             text = text_repr
         self.config_window.add_learned_slide(uid, text)
 
+    def _handle_offline_trim_line(self, line: str):
+        """Auto-points Main clip at the Offline tab's Trim button's own
+        output once it succeeds, so a follow-up Stitch click picks it up
+        without the user having to re-Browse to it themselves."""
+        m = TRIMMED_PATH_RE.match(line)
+        if m:
+            self.vars["st_main"].set(m.group(1).strip())
+
     def _handle_watch_line(self, line: str):
         m = STATE_RE.search(line)
         if m:
             raw_state = m.group(1)
-            # Once Prerender/Skip Render has set a terminal status, later
-            # state-machine transitions (recording stopping moves the
-            # internal state to TRIM even though nothing more will
-            # actually render) shouldn't overwrite it.
-            if not self._prerender_locked:
-                self.watch_state_var.set(WATCH_STATE_LABELS.get(raw_state, raw_state))
-                self.watch_status_label.configure(foreground=PALETTE["accent"])
-            self._update_mark_buttons(raw_state)
+            self.watch_state_var.set(WATCH_STATE_LABELS.get(raw_state, raw_state))
+            self.watch_status_label.configure(foreground=PALETTE["accent"])
+            self._update_live_buttons(raw_state)
         m2 = RENDER_STATE_PATH_RE.search(line)
         if m2:
             path = m2.group(1).strip()
             self.render_state_var.set(path)
             self._log(f"[gui] captured render-state path for the Offline tab: {path}")
-        m3 = PRERENDER_STATUS_RE.search(line)
+        m3 = TRIM_STITCH_STATUS_RE.search(line)
         if m3:
-            self._handle_prerender_status(m3.group(1))
+            self._handle_trim_stitch_status(m3.group(1), m3.group(2))
 
-    def _update_mark_buttons(self, raw_state: str | None):
+    def _update_live_buttons(self, raw_state: str | None):
         """Mirrors service_video.py's own guard on manual mark_begin/
-        mark_end/prerender/skip_render commands (see watch()'s "manual"
-        event handling) so a click is never possible when the backend
-        would just ignore it: Mark Start is live in WAIT_BEGIN_SLIDE
-        (first mark) and WAIT_END_SLIDE (re-mark); Mark End is live in
+        mark_end/trim/stitch commands (see watch()'s "manual" event
+        handling) so a click is never possible when the backend would
+        just ignore it: Mark Start is live in WAIT_BEGIN_SLIDE (first
+        mark) and WAIT_END_SLIDE (re-mark); Mark End is live in
         WAIT_END_SLIDE (first mark) and WAIT_RECORD_STOP (re-mark) — and
         once end is marked, start locks (WAIT_RECORD_STOP has Start
-        disabled). Prerender/Skip Render both need an end already marked."""
+        disabled).
+
+        Trim just needs an end to have been marked at some point this
+        run — unlike Mark Start/End, this doesn't reset if a later state
+        somehow doesn't imply it (there's no such state — once end is
+        marked, every later state is "after that"), so _live_end_marked
+        is tracked separately rather than computed fresh from raw_state
+        each time, and stays enabled through the new RECORDING_STOPPED
+        state and beyond. Stitch's own enablement is independent of
+        raw_state entirely — see _handle_trim_stitch_status()."""
         start_enabled = raw_state in ("WAIT_BEGIN_SLIDE", "WAIT_END_SLIDE")
         end_enabled = raw_state in ("WAIT_END_SLIDE", "WAIT_RECORD_STOP")
-        # Prerender is deliberately left clickable throughout
-        # WAIT_RECORD_STOP rather than disabling after one use: it can
-        # fail simply from being tried too soon after the end was marked
-        # (the encoder hasn't flushed that far yet, not a real
-        # incompatibility), so retrying needs to stay possible — the
-        # backend's own "one already running"/"already done" guards are
-        # what actually prevent redoing it once it's succeeded. Once it
-        # actually succeeds (or Skip Render is used), _handle_prerender_
-        # status() takes over and locks all four buttons for the rest of
-        # this run — that's not state-driven, so it can't be expressed
-        # here (this only fires on a genuine "state = ..." transition).
-        prerender_enabled = raw_state == "WAIT_RECORD_STOP"
+        if raw_state in ("WAIT_RECORD_STOP", "RECORDING_STOPPED"):
+            self._live_end_marked = True
         self.mark_start_btn.configure(state="normal" if start_enabled else "disabled")
         self.mark_end_btn.configure(state="normal" if end_enabled else "disabled")
-        self.prerender_btn.configure(state="normal" if prerender_enabled else "disabled")
-        self.skip_render_btn.configure(state="normal" if prerender_enabled else "disabled")
+        self.live_trim_btn.configure(state="normal" if self._live_end_marked else "disabled")
+        self.live_stitch_btn.configure(state="normal" if self._live_trimmed else "disabled")
 
-    def _handle_prerender_status(self, status: str):
+    def _handle_trim_stitch_status(self, which: str, status: str):
+        """which is "trim" or "stitch" (see TRIM_STITCH_STATUS_RE). Unlike
+        the old Prerender/Skip Render, neither Trim nor Stitch is a
+        one-shot terminal action — both stay re-clickable once done (or
+        failed), so this never permanently locks anything the way
+        _handle_prerender_status() used to; it just reflects whatever
+        most recently happened."""
+        btn = self.live_trim_btn if which == "trim" else self.live_stitch_btn
+        running_label = {"trim": "Trimming…", "stitch": "Stitching…"}[which]
+        done_label = {"trim": "Trimmed", "stitch": "Stitched"}[which]
+        failed_label = {"trim": "Trim failed", "stitch": "Stitch failed"}[which]
         if status == "RUNNING":
-            self.watch_state_var.set("Prerendering")
+            self.watch_state_var.set(running_label)
             self.watch_status_label.configure(foreground=PALETTE["info"])
-            self._set_prerender_buttons(enabled=False)
+            btn.configure(state="disabled")
         elif status == "DONE":
-            self.watch_state_var.set("Done (Prerendered)")
+            self.watch_state_var.set(done_label)
             self.watch_status_label.configure(foreground=PALETTE["success"])
-            self._set_prerender_buttons(enabled=False)
-            self._prerender_locked = True
-        elif status == "SKIPPED":
-            self.watch_state_var.set("Done (Skipped Render)")
-            self.watch_status_label.configure(foreground=PALETTE["warning"])
-            self._set_prerender_buttons(enabled=False)
-            self._prerender_locked = True
+            btn.configure(state="normal")
+            if which == "trim":
+                self._live_trimmed = True
+                self.live_stitch_btn.configure(state="normal")
         elif status == "FAILED":
-            self._log("[gui] prerender failed — see the console output above for why; safe to try again")
-            # Back to the ordinary WAIT_RECORD_STOP button state so
-            # retrying (prerender again, or Skip Render instead) is
-            # possible — nothing was actually marked done.
-            self._update_mark_buttons("WAIT_RECORD_STOP")
-            self.watch_state_var.set(WATCH_STATE_LABELS.get("WAIT_RECORD_STOP", "WAIT_RECORD_STOP"))
-            self.watch_status_label.configure(foreground=PALETTE["accent"])
-
-    def _set_prerender_buttons(self, enabled: bool):
-        state = "normal" if enabled else "disabled"
-        self.mark_start_btn.configure(state=state)
-        self.mark_end_btn.configure(state=state)
-        self.prerender_btn.configure(state=state)
-        self.skip_render_btn.configure(state=state)
+            self._log(f"[gui] {which} failed — see the console output above for why; safe to try again")
+            self.watch_state_var.set(failed_label)
+            self.watch_status_label.configure(foreground=PALETTE["danger"])
+            btn.configure(state="normal")
 
     def _mark_sermon_start(self):
         self.runner.send_line("mark_begin")
@@ -1898,13 +1915,13 @@ class App(tk.Tk):
         self.runner.send_line("mark_end")
         self._log("[gui] sent: mark sermon end")
 
-    def _prerender(self):
-        self.runner.send_line("prerender")
-        self._log("[gui] sent: prerender")
+    def _trim_live(self):
+        self.runner.send_line("trim")
+        self._log("[gui] sent: trim")
 
-    def _skip_render(self):
-        self.runner.send_line("skip_render")
-        self._log("[gui] sent: skip render")
+    def _stitch_live(self):
+        self.runner.send_line("stitch")
+        self._log("[gui] sent: stitch")
 
     # -- per-mode run handlers ---------------------------------------------
 
@@ -1919,17 +1936,18 @@ class App(tk.Tk):
         args = ["watch", "-c", self.config_path_var.get().strip()]
         if self.watch_debug_var.get():
             args.append("--debug")
-        self._prerender_locked = False
+        self._live_end_marked = False
+        self._live_trimmed = False
         self.watch_state_var.set("starting…")
         self.watch_status_label.configure(foreground=PALETTE["accent"])
-        self._update_mark_buttons(None)
+        self._update_live_buttons(None)
         self._start("watch", args)
 
     def _collect_offline_fields(self, error_title: str = "Render") -> dict | None:
         """Validate and collect the Offline tab's fields as a plain dict —
-        shared by _run_render() and _export_render_state(), since both
-        need the same inputs (just doing different things with them
-        afterward). Returns None (after showing an error dialog titled
+        shared by _run_trim()/_run_stitch()/_export_render_state(), since
+        all three need the same inputs (just doing different things with
+        them afterward). Returns None (after showing an error dialog titled
         `error_title`) if something required is missing or invalid."""
         intro = self.vars["st_intro"].get().strip()
         main_clip = self.vars["st_main"].get().strip()
@@ -1964,14 +1982,16 @@ class App(tk.Tk):
         }
 
     @staticmethod
-    def _build_render_state(f: dict, trim_output: str, state_output: str) -> dict:
+    def _build_render_state(f: dict, trim_output: str, state_output: str, stitch_auto: bool = True) -> dict:
         """A render_state dict from _collect_offline_fields()'s result —
         i.e. everything 'watch' writes after a live run, but built from
         fields picked by hand instead. trim_output/state_output are
         threaded through separately since where they come from differs
         between callers: an already-loaded file's own values when
-        re-trimming it (_run_render), or generic defaults when there's no
-        loaded file to inherit them from (_export_render_state)."""
+        re-trimming it (_run_trim), or generic defaults when there's no
+        loaded file to inherit them from (_export_render_state).
+        stitch_auto is False for _run_trim() (trim only, no stitch — see
+        its docstring), True everywhere else."""
         return {
             "recording_path": f["main_clip"],
             "raw_begin_offset": format_timestamp(f["start_ts"]),
@@ -1987,7 +2007,7 @@ class App(tk.Tk):
                 "encoder_preset": f["encoder_preset"],
             },
             "stitch": {
-                "auto": True,
+                "auto": stitch_auto,
                 "intro": f["intro"],
                 "outro": f["outro"],
                 "intro_duration": f["intro_duration"],
@@ -2003,61 +2023,79 @@ class App(tk.Tk):
             },
         }
 
-    def _run_render(self):
-        f = self._collect_offline_fields()
+    def _offline_use_raw_trim(self, main_clip: str) -> bool:
+        """Whether Main clip is still the raw recording a loaded render-
+        state file named (see _load_render_state_json()) — the only case
+        Trim (below) actually has a raw source to trim from."""
+        raw = self._offline_raw_state
+        return raw is not None and raw["recording_path"] == main_clip
+
+    def _run_trim(self):
+        """Re-trims the raw recording down to Sermon start/Sermon end —
+        i.e. just the trim half of what a live Watch run does — writing
+        the result to Main clip so a follow-up Stitch click picks it up
+        (see _handle_offline_command_line()/TRIMMED_PATH_RE). Only
+        meaningful right after "Load from JSON", before Main clip is
+        changed — Sermon start/end are absolute timestamps a person picked
+        by eye, not a raw/pad split (there's no slide detection here), so
+        they're passed straight through as the offsets with zero padding."""
+        f = self._collect_offline_fields(error_title="Trim")
         if f is None:
             return
-
         raw = self._offline_raw_state
-        use_raw_trim = raw is not None and raw["recording_path"] == f["main_clip"]
+        if not self._offline_use_raw_trim(f["main_clip"]):
+            messagebox.showerror(
+                "Trim",
+                "Main clip isn't the raw recording from a loaded render-state file — "
+                "Trim only works right after \"Load from JSON\", before Main clip is "
+                "changed. Use Stitch instead if Main clip is already trimmed.",
+            )
+            return
 
-        if not use_raw_trim and (f["start_ts"] or f["end_ts"]):
+        # 'render' needs a render-state *file* to read (not stdin), but
+        # that doesn't have to be the loaded one — an offline trim is
+        # exploratory (tweak timestamps/settings, see what comes out),
+        # not something that should silently overwrite your saved record
+        # of what actually happened live just because you clicked Trim.
+        # So this writes to a throwaway temp file instead (cleaned up
+        # once the process exits, see _on_process_exit()); use "Export to
+        # JSON" if you actually want to keep these settings.
+        render_state = self._build_render_state(f, raw["trim_output"], raw["state_output"], stitch_auto=False)
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="render_state_", delete=False
+        )
+        with temp_file:
+            json.dump(render_state, temp_file, indent=2)
+        self._temp_render_state_path = temp_file.name
+        self._start("trim", ["render", temp_file.name])
+
+    def _run_stitch(self):
+        """Crossfades Intro/Main clip/Outro as-is — Main clip is assumed
+        to already be trimmed (a prior Trim click already points it at
+        the result — see _run_trim() — or it's some other already-
+        trimmed file picked by hand)."""
+        f = self._collect_offline_fields(error_title="Stitch")
+        if f is None:
+            return
+        if self._offline_use_raw_trim(f["main_clip"]) and (f["start_ts"] or f["end_ts"]):
             self._log(
-                "[gui] note: the sermon start/end timestamps are ignored — Main "
-                "clip isn't the raw recording from a loaded render-state file "
-                "(they only apply right after \"Load from JSON\", before Main clip "
-                "is changed)."
+                "[gui] note: Sermon start/Sermon end are ignored by Stitch — trim first, "
+                "or edit Main clip to point at an already-trimmed clip."
             )
-
-        if use_raw_trim:
-            # Re-trim the raw recording to these exact timestamps, then
-            # stitch — i.e. everything 'watch' does after a live run.
-            # They're absolute timestamps a person picked by eye, not a
-            # raw/pad split (there's no slide detection here), so pass
-            # them straight through as the offsets with zero padding.
-            #
-            # 'render' needs a render-state *file* to read (not stdin),
-            # but that doesn't have to be the loaded one — an offline
-            # render is exploratory (tweak timestamps/settings, see what
-            # comes out), not something that should silently overwrite
-            # your saved record of what actually happened live just
-            # because you clicked Run Render. So this writes to a
-            # throwaway temp file instead (cleaned up once the process
-            # exits, see _on_process_exit()); use "Export to JSON" if you
-            # actually want to keep these settings.
-            render_state = self._build_render_state(f, raw["trim_output"], raw["state_output"])
-            temp_file = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", prefix="render_state_", delete=False
-            )
-            with temp_file:
-                json.dump(render_state, temp_file, indent=2)
-            self._temp_render_state_path = temp_file.name
-            self._start("render", ["render", temp_file.name])
-        else:
-            args = [
-                "stitch", f["intro"], f["main_clip"], f["outro"],
-                "-o", f["output"], "-d", str(f["duration"]), "-t", f["transition"], "--crf", str(f["crf"]),
-                "--intro-duration", str(f["intro_duration"]), "--outro-duration", str(f["outro_duration"]),
-                "--encoder", f["encoder"],
-            ]
-            if f["encoder_preset"]:
-                args += ["--encoder-preset", f["encoder_preset"]]
-            self._start("stitch", args)
+        args = [
+            "stitch", f["intro"], f["main_clip"], f["outro"],
+            "-o", f["output"], "-d", str(f["duration"]), "-t", f["transition"], "--crf", str(f["crf"]),
+            "--intro-duration", str(f["intro_duration"]), "--outro-duration", str(f["outro_duration"]),
+            "--encoder", f["encoder"],
+        ]
+        if f["encoder_preset"]:
+            args += ["--encoder-preset", f["encoder_preset"]]
+        self._start("stitch", args)
 
     def _export_render_state(self):
         """Build a render_state.json from whatever's currently in the
         Offline tab's fields — Main clip is always treated as the raw
-        recording here (unlike _run_render(), which only does that when it
+        recording here (unlike _run_trim(), which only does that when it
         happens to match a previously-loaded file), since the point of
         this button is authoring a render-state file from scratch rather
         than redoing an existing one. The result is exactly what a live
@@ -2106,8 +2144,8 @@ class OfflineAdvancedWindow(tk.Toplevel):
     deiconify() rather than destroyed on close, so reopening is instant —
     same pattern as ConfigWindow. All actual state lives in app.vars; this
     window just hosts widgets bound to it (the same st_crf/
-    st_trim_fast_copy/st_encoder/st_encoder_preset vars _run_render()/
-    _export_render_state() already read)."""
+    st_trim_fast_copy/st_encoder/st_encoder_preset vars _run_trim()/
+    _run_stitch()/_export_render_state() already read)."""
 
     def __init__(self, app: App):
         super().__init__(app)
@@ -2124,9 +2162,9 @@ class OfflineAdvancedWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Applies to \"Run Render\" on the Offline tab — the re-trim step "
-            "(only when re-trimming a raw recording, right after \"Load from "
-            "JSON\") and the crossfade itself.",
+            text="Applies to Trim and Stitch on the Offline tab — Trim's re-trim step "
+            "(only works when re-trimming a raw recording, right after \"Load from "
+            "JSON\") and Stitch's crossfade.",
             style="Muted.TLabel", wraplength=380, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
 

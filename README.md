@@ -72,34 +72,39 @@ each week. A Live/Offline notebook plus the console:
   sets how long to show it for if it is one (ignored otherwise). Everything
   else (connection details, slide matching, trim padding) comes from
   Config. Start/Stop, a status readout tracking the state machine (waiting
-  for recording, waiting for begin/end slide, rendering, done — plus
-  Prerendering/Done (Prerendered)/Done (Skipped Render), each in their own
-  color, once Prerender or Skip Render is used — see below), Mark Sermon
-  Start/Mark Sermon End buttons for marking those moments by hand — either
-  as the primary way to run a service with no ProPresenter connection at
-  all, or to override ProPresenter slide detection live if something goes
-  wrong — Prerender/Skip Render buttons
-  (see below) for once an end is marked, each enabled only when it's
-  actually meaningful for the current state, and the render-state
-  file path captured once Watch finishes, with a button to jump straight
-  to Offline if a redo is needed.
+  for recording, waiting for begin/end slide, recording stopped), Mark
+  Sermon Start/Mark Sermon End buttons for marking those moments by hand —
+  either as the primary way to run a service with no ProPresenter
+  connection at all, or to override ProPresenter slide detection live if
+  something goes wrong — and Trim/Stitch buttons (see below) once an end
+  is marked. Nothing renders on its own: Watch only tracks the service and
+  keeps a render-state file up to date (see below) — trimming and
+  stitching only ever happen when you click Trim/Stitch (or run `render`/
+  `stitch` yourself against that file later). The render-state file path
+  is shown as soon as it exists (right when Watch starts, not just once
+  it finishes), with a button to jump straight to Offline.
 - **Offline** — crossfade an intro, main clip, and outro into the final
-  video. Fill in the fields yourself, or click "Load from JSON" to pull
-  them out of a `render_state_*.json` file a previous Watch run wrote.
-  Doesn't need a config file or any live connection either way. Includes
-  Sermon start/Sermon end fields — absolute timestamps into the recording,
-  entered/shown as `HH:MM:SS.mmm`, not the offsets from Config's Render
-  tab, since there's no slide detection here to offset from — just someone
-  looking at the footage and picking exact points. They only take effect right after
-  "Load from JSON" (prefilled with the raw slide-detected timestamps, i.e.
-  `raw_begin_offset`/`raw_end_offset` plus whatever padding was applied
-  live): Main clip gets pointed at the *raw* OBS recording instead of the
-  already-trimmed clip, so Run re-trims it to those exact timestamps
-  before stitching (the `render` subcommand under the hood, updating that
-  same `render_state_*.json` file in place with whatever you changed). If
-  you then change Main clip to something else, the timestamps stop
-  applying and Run goes back to a plain crossfade (`stitch`) of whatever's
-  in the fields, on the assumption that clip is already trimmed.
+  video, via separate Trim and Stitch buttons. Fill in the fields
+  yourself, or click "Load from JSON" to pull them out of a
+  `render_state_*.json` file a Watch run wrote — even one still in
+  progress, read straight off disk. Doesn't need a config file or any
+  live connection either way. Includes Sermon start/Sermon end fields —
+  absolute timestamps into the recording, entered/shown as
+  `HH:MM:SS.mmm`, not the offsets from Config's Render tab, since there's
+  no slide detection here to offset from — just someone looking at the
+  footage and picking exact points. They only take effect right after
+  "Load from JSON" (prefilled with the raw slide-detected timestamps,
+  i.e. `raw_begin_offset`/`raw_end_offset` plus whatever padding was
+  applied live), and only for Trim: Main clip gets pointed at the *raw*
+  OBS recording instead of the already-trimmed clip, so Trim re-trims it
+  to those exact timestamps (the `render` subcommand under the hood,
+  writing to a throwaway temp file rather than overwriting your saved
+  render-state) and then points Main clip at the result, ready for a
+  follow-up Stitch click. If Main clip isn't the raw recording a loaded
+  file named, Trim refuses (with a clear message) rather than doing
+  nothing meaningful — Stitch works either way, crossfading whatever's
+  currently in Intro/Main clip/Outro on the assumption Main clip is
+  already trimmed.
   "Export to JSON" is the reverse of "Load from JSON": it writes a
   `render_state_*.json` file — the same format Watch itself writes — from
   whatever's currently in the fields, treating Main clip as the raw
@@ -136,20 +141,25 @@ lives at the top, then four tabs:
   through them in ProPresenter; select a row and click "Use as Begin/End
   Slide" to fill them in.
 - **OBS** — host/port/password.
-- **Render** — the trim + auto-stitch settings a live Watch run uses once
-  it finishes (trimmed output path, pad start/end, transition type,
-  transition duration, CRF, the fast copy toggle, auto-stitch toggle) —
-  same fields, layout, and order as the Offline tab, since these
-  are exactly what it defaults to before you override them per run. The
-  Offline tab's manual crossfade tool doesn't read these values, though.
+- **Render** — the trim/stitch settings the Live tab's Trim/Stitch
+  buttons use (trimmed output path, pad start/end, transition type,
+  transition duration, CRF, the fast copy toggle) — same fields, layout,
+  and order as the Offline tab, since these are exactly what it defaults
+  to before you override them per run. The auto-stitch toggle here
+  (`stitch.auto`) only matters for `render` run by hand later against a
+  saved render-state file (or a script that calls it) — the Live tab's
+  Trim and Stitch are always two separate clicks regardless of it. The
+  Offline tab's manual crossfade tool doesn't read any of these values,
+  though.
 
 Starting Watch or Learn auto-saves whatever's currently in both windows to
 the config file path shown in Config, so there's no separate "save before
 running" step. Only one operation runs at a time across both windows; the
-Stop button (in the main window's console bar) terminates it immediately
-(for `watch`, this skips the graceful "interrupted, exiting without
-trimming" message the terminal version prints on Ctrl+C — it's an abrupt
-kill, not a clean cancel).
+Stop button (in the main window's console bar) terminates it immediately.
+`watch` never exits on its own any more — it just keeps tracking the
+service (and answering Trim/Stitch clicks) until you click Stop, or press
+Ctrl+C in a terminal — so this is the normal, expected way every Watch
+session ends, not a sign anything went wrong.
 
 ## Subcommands
 
@@ -309,9 +319,14 @@ UID is always present and stable.
 
 State machine: wait for OBS recording to start → wait for the begin slide
 → wait for the end slide → wait for OBS recording to stop (to get the
-final file path) → trim → stitch. The begin/end transitions happen either
-from a ProPresenter slide match (if configured) or a manual mark (below);
-nothing else in the state machine cares which one drove it.
+final file path) → keep running. `watch` itself never trims or stitches
+anything at any point in this — see "Trim/Stitch" below for the only way
+either one actually happens — and there's no state after "recording
+stopped" to wait for either: it just keeps tracking things (and keeping
+the render-state file current) for as long as it's left running. The
+begin/end transitions happen either from a ProPresenter slide match (if
+configured) or a manual mark (below); nothing else in the state machine
+cares which one drove it.
 
 When ProPresenter is configured, its connection drops periodically as a
 matter of course — that's normal behavior of the legacy protocol, not a
@@ -334,48 +349,41 @@ re-marks it at the new time rather than being ignored, so a mistaken mark
 can be corrected. Once an end is marked, start locks — nothing later can
 re-open it.
 
-**Prerender** — once an end is marked, sending `prerender` (the GUI's
-"Prerender" button) starts the real trim+stitch early, reading the
-recording while OBS is still writing the rest of the service, instead of
-waiting for the recording to actually stop. It's treated as the actual
-render, not a preview: it writes the render-state file and the configured
-`trim.output`/`stitch.output` paths, same as if recording had already
-ended, and `watch`'s own end-of-recording render is skipped once it
-succeeds — so there's no double work and no risk of the two racing on the
-same output files. The GUI's status label reads "Prerendering" (blue)
-while it runs and "Done (Prerendered)" (green) once it succeeds.
+**Trim/Stitch** — `watch` itself never trims or stitches anything; it only
+tracks the service and keeps a render-state file up to date (see below).
+Sending `trim` (the GUI's "Trim" button) once an end is marked starts the
+real trim right then — reading the recording while OBS is still writing
+the rest of the service if it hasn't stopped yet, instead of waiting for
+it to. It's treated as a real trim, not a preview: it writes the
+configured `trim.output` path for real. Sending `stitch` (the GUI's
+"Stitch" button) crossfades that trimmed clip with the intro/outro,
+writing `stitch.output` — only available once a trim this run has
+actually succeeded. Neither is a one-way decision: both stay clickable
+(and re-clickable) for as long as `watch` keeps running, which is until
+you stop it.
 
-This relies on Matroska (MKV) not needing a finalized index to be read,
-unlike MP4's `moov` atom — but a second process reading a file OBS still
-holds open for writing isn't universally guaranteed to work, and testing
-this while building it turned up a real, expected failure mode worth
-knowing about: there's a lag between what's been recorded and what's
-actually flushed to disk and safe to read (encoder lookahead, Matroska's
-cluster-based writes) — a couple of seconds isn't necessarily enough,
-even once the on-screen recording time is well past what you need. If
-it's clicked too soon, it just fails and logs why (the status label and
-buttons revert so it's obvious this happened); it's safe to try again a
-bit later.
+Trimming before the recording stops relies on Matroska (MKV) not needing
+a finalized index to be read, unlike MP4's `moov` atom — but a second
+process reading a file OBS still holds open for writing isn't universally
+guaranteed to work, and testing this while building it turned up a real,
+expected failure mode worth knowing about: there's a lag between what's
+been recorded and what's actually flushed to disk and safe to read
+(encoder lookahead, Matroska's cluster-based writes) — a couple of
+seconds isn't necessarily enough, even once the on-screen recording time
+is well past what you need. If Trim is clicked and that first attempt
+fails, it doesn't just give up: it automatically waits for the recording
+to actually finish and tries again once more against the finalized file,
+logging that it's doing so — only a second failure (after the recording
+is genuinely done) is reported as a real failure.
 
-It finds the in-progress recording file itself, since OBS doesn't expose
-that while still recording (only once it stops) — it asks OBS for the
-configured recording directory, then picks whichever video file there has
-been modified most recently, on the assumption that OBS is the only thing
-actively appending to a file in that folder. That's why it's important
-this points at a directory OBS actually uses for recording and not
-something shared with other video files being actively touched by
-something else.
-
-**Skip Render** — also only available once an end is marked, `skip_render`
-(the GUI's "Skip Render" button) is for when you already know the timing
-will need adjusting by hand afterward: the render-state file still gets
-written normally when recording stops, but the automatic trim+stitch is
-skipped, so nothing runs (and nothing needs cancelling) before you make
-that adjustment and render it yourself via the Offline tab or `render`.
-The status label reads "Done (Skipped Render)" (yellow) as soon as it's
-used — it's a one-way decision for that run, same as a successful
-prerender, so Mark Start/Mark End/Prerender/Skip Render are all disabled
-afterward; there's nothing left to decide.
+Trimming before recording stops finds the in-progress recording file
+itself, since OBS doesn't expose that while still recording (only once it
+stops) — it asks OBS for the configured recording directory, then picks
+whichever video file there has been modified most recently, on the
+assumption that OBS is the only thing actively appending to a file in
+that folder. That's why it's important this points at a directory OBS
+actually uses for recording and not something shared with other video
+files being actively touched by something else.
 
 ### `learn` — find your begin/end slide UIDs
 
@@ -392,12 +400,21 @@ on it — no need to hand-parse `--debug` output.
 Every `watch` run writes a render-state JSON file (path configurable via
 `trim.state_output`, default `render_state_%Y%m%d_%H%M%S.json` — supports
 the same strftime placeholders as `trim.output`/`stitch.output`, see
-"Output paths" above) right before trimming. It's fully self-contained:
-the OBS recording's path, the raw begin/end
-timestamps (`raw_begin_offset`/`raw_end_offset`, as `HH:MM:SS.mmm` —
-plain numbers of seconds still work too, for older files or hand-editing),
+"Output paths" above) — created the moment `watch` starts, then kept up
+to date as the service actually happens (every time a begin/end mark
+lands, auto or manual, and once recording stops), rather than only once
+at the end. It's fully self-contained: the OBS recording's path (`null`
+until known), the raw begin/end timestamps (`raw_begin_offset`/
+`raw_end_offset`, as `HH:MM:SS.mmm` — plain numbers of seconds still work
+too, for older files or hand-editing — `null` until both are marked),
 and the `trim`/`stitch` settings used — no ProPresenter/OBS credentials in
-it. `watch` prints the exact command to reuse it.
+it. `watch` prints the exact command to reuse it every time it rewrites
+the file.
+
+`render` needs the file to actually be complete (`recording_path`/
+`raw_begin_offset`/`raw_end_offset` all filled in, not `null`) — if you
+open one mid-service it may not be yet; use Trim from the Live tab
+instead, or wait.
 
 If the timing was off or a render step failed, edit that file (most often
 `pad_start_seconds`/`pad_end_seconds`) and rerun:
