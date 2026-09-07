@@ -19,6 +19,9 @@ anyone who'd rather not use the terminal.
 - Python 3.10+.
 - `pip install -r requirements.txt` — only needed for `watch`/`learn`
   (`obsws-python`, `websockets`). `stitch` and `render` only need ffmpeg.
+  `fastapi`/`uvicorn` (also in there) are only needed if you turn on the
+  optional control API (`api.enabled` — see "Control API" below); `watch`
+  runs fine without them installed as long as it stays off.
 - For `gui.py` only: a Tk-enabled Python. Tk ships with the standard
   Windows/Mac Python installers; on Linux it's usually a separate package
   (e.g. `sudo pacman -S tk` or `sudo apt install python3-tk`).
@@ -121,7 +124,7 @@ each week. A Live/Offline notebook plus the console:
 **Config window** — everything set once and rarely touched again, opened
 via the main window's "Config" button. Hidden rather than closed when
 you dismiss it, so reopening is instant. The config file path (Load/Save)
-lives at the top, then four tabs:
+lives at the top, then five tabs:
 
 - **General** — currently just Console log path: where the console pane's
   own output is mirrored to disk, in addition to what's shown on screen.
@@ -134,6 +137,10 @@ lives at the top, then four tabs:
   a single file rather than being split one-per-run. Leave the field
   blank to turn file logging off entirely; the console pane itself is
   unaffected either way.
+- **API** — the optional control API (see "Control API" below): an
+  Enabled checkbox (off by default), Host/Port, and Password (HTTP Basic
+  Auth, checked on every request — leave blank to run with no
+  authentication at all).
 - **ProPresenter** — entirely optional (leave it blank to run on Mark
   Sermon Start/Mark Sermon End alone): host/port/password/reconnect
   interval, begin/end slide matching (by UID or by text), and Learn mode:
@@ -385,6 +392,35 @@ that folder. That's why it's important this points at a directory OBS
 actually uses for recording and not something shared with other video
 files being actively touched by something else.
 
+**Control API** — an optional HTTP API, off by default (`api.enabled`),
+for marking sermon start/end and checking the current watch state from
+something other than this app's own GUI/terminal — a phone, a separate
+control surface, etc. Starts (and stops) with `watch` itself, listening
+on `api.host`/`api.port` (default `127.0.0.1:8765`):
+
+| Method | Path | Does |
+|---|---|---|
+| `POST` | `/mark/start` | Same as Mark Sermon Start/`mark_begin` |
+| `POST` | `/mark/end` | Same as Mark Sermon End/`mark_end` |
+| `GET` | `/state` | Current state, recording/begin/end-marked flags, Trim/Stitch status, render-state file path |
+
+`POST` requests are fire-and-forget, same as typing `mark_begin`/`mark_end`
+into `watch`'s own stdin — they're only actually applied if the state
+machine is currently expecting one (marking an end before a begin is
+ignored, same as everywhere else this can happen), so check `GET /state`
+afterward to see whether it took. Interactive Swagger docs are served at
+`/swagger` (and the raw schema at `/openapi.json`).
+
+Requires `fastapi`/`uvicorn` (see Requirements above) — if they're not
+installed, `watch` logs why and runs on without the API rather than
+failing outright. Secured with HTTP Basic Auth against `api.password`
+(any username is accepted; only the password is checked, since this is a
+single shared secret, not real user management) — leave it blank to run
+with no authentication at all, which is logged loudly every time `watch`
+starts that way, since it means anyone who can reach `host:port` can mark
+start/end. Every route requires it when a password is set, `/swagger`
+included.
+
 ### `learn` — find your begin/end slide UIDs
 
 ```
@@ -464,6 +500,12 @@ ProPresenter or OBS is made.
     "log_path": "console_%Y%m%d_%H%M%S.log" // optional, default shown — same placeholders as "output" fields
                                            // below, but expanded only once per app session, not per line; "" turns
                                            // off file logging (the console pane itself still works either way)
+  },
+  "api": {                                // entirely optional — see "Control API" above
+    "enabled": false,                     // optional, default false
+    "host": "127.0.0.1",                  // optional, default shown
+    "port": 8765,                         // optional, default shown
+    "password": ""                        // optional, default "" (no authentication — see "Control API" above)
   },
   "propresenter": {                       // entirely optional — leave "host" "" (or omit
                                            // this whole section) to run on manual marking alone

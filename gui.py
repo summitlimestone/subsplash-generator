@@ -62,6 +62,12 @@ def default_config() -> dict:
         "general": {
             "log_path": DEFAULT_LOG_PATH,
         },
+        "api": {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 8765,
+            "password": "",
+        },
         "propresenter": {
             "host": "",
             "port": 1025,
@@ -361,6 +367,25 @@ LOG_PATH_HELP = (
     "written — so a whole session's console output lands in one file. "
     "Leave blank to turn off file logging entirely; the console pane "
     "itself is unaffected either way."
+)
+
+API_HELP = (
+    "An optional HTTP API for marking sermon start/end and checking the "
+    "current watch state from something other than this app — a phone, "
+    "a separate control surface, etc. Only runs during a live Watch "
+    "session (it starts/stops with Watch, same as the ProPresenter/manual-"
+    "mark connections). Interactive docs are served at /swagger once it's "
+    "running. Requires fastapi and uvicorn to be installed "
+    "(pip install fastapi uvicorn) — if they're not, Watch still runs "
+    "fine, it just logs why the API didn't start."
+)
+
+API_PASSWORD_HELP = (
+    "HTTP Basic Auth password required on every request — any username is "
+    "accepted, only the password is checked (there's no user management "
+    "here). Leave blank to run with no authentication at all; anyone who "
+    "can reach host:port could mark start/end — a clear warning is logged "
+    "each time Watch starts with this blank."
 )
 
 LIVE_TRIM_HELP = (
@@ -1498,12 +1523,18 @@ class App(tk.Tk):
             return
 
         general = cfg.get("general", {})
+        api = cfg.get("api", {})
         pp = cfg.get("propresenter", {})
         obs = cfg.get("obs", {})
         trim = cfg.get("trim", {})
         stitch = cfg.get("stitch", {})
 
         self.vars["log_path"].set(general.get("log_path", DEFAULT_LOG_PATH))
+
+        self.vars["api_enabled"].set(bool(api.get("enabled", False)))
+        self.vars["api_host"].set(api.get("host", "127.0.0.1"))
+        self.vars["api_port"].set(str(api.get("port", 8765)))
+        self.vars["api_password"].set(api.get("password", ""))
 
         self.vars["pp_host"].set(pp.get("host", ""))
         self.vars["pp_port"].set(str(pp.get("port", "")))
@@ -1599,6 +1630,12 @@ class App(tk.Tk):
                 # this doesn't fall back to DEFAULT_LOG_PATH the way those
                 # do.
                 "log_path": v["log_path"].get().strip(),
+            },
+            "api": {
+                "enabled": bool(v["api_enabled"].get()),
+                "host": v["api_host"].get().strip() or "127.0.0.1",
+                "port": to_int(v["api_port"].get().strip() or "8765", "API port"),
+                "password": v["api_password"].get(),
             },
             "propresenter": {
                 # Host (and everything else here) is optional — see
@@ -2222,6 +2259,7 @@ class ConfigWindow(tk.Toplevel):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._build_general_tab(notebook)
+        self._build_api_tab(notebook)
         self._build_propresenter_tab(notebook)
         self._build_obs_tab(notebook)
         self._build_render_settings_tab(notebook)
@@ -2259,6 +2297,33 @@ class ConfigWindow(tk.Toplevel):
         app._labeled_entry(frame, 1, "Console log path", "log_path", colspan=3, help_text=LOG_PATH_HELP)
         app._add_browse(frame, 1, "log_path", save=True, filetypes=LOG_FILETYPES, col=3)
 
+    # -- API tab: optional HTTP control API (mark start/end, get state) ---
+
+    def _build_api_tab(self, notebook):
+        app = self.app
+        _outer, frame = app._make_scrollable_tab(notebook, "API")
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        ttk.Label(
+            frame, text=API_HELP, style="Muted.TLabel", wraplength=540, justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        app.vars["api_enabled"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame, text="Enabled", variable=app.vars["api_enabled"],
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=3)
+
+        app._labeled_entry(frame, 2, "Host", "api_host")
+        app.vars["api_host"].set("127.0.0.1")
+        app._labeled_entry(frame, 2, "Port", "api_port", width=10, col=2)
+        app.vars["api_port"].set("8765")
+
+        api_pw_entry = app._labeled_entry(
+            frame, 3, "Password", "api_password", show="•", help_text=API_PASSWORD_HELP,
+        )
+        app._pw_entries.append(api_pw_entry)
+
     # -- ProPresenter tab: connection + slide matching + Learn -------------
 
     def _build_propresenter_tab(self, notebook):
@@ -2284,7 +2349,10 @@ class ConfigWindow(tk.Toplevel):
         ttk.Checkbutton(
             frame, text="Show passwords", variable=app.show_pw_var, command=app._toggle_show_passwords
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        app._pw_entries = [pw_entry]
+        # Appended, not reset, since a tab built earlier (the API tab) may
+        # have already registered its own password entry here — the list
+        # itself is initialized once in App.__init__.
+        app._pw_entries.append(pw_entry)
 
         app._build_slide_picker(frame, row=4, prefix="begin", label="Begin slide")
         app._build_slide_picker(frame, row=9, prefix="end", label="End slide")
