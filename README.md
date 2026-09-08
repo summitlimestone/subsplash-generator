@@ -4,7 +4,7 @@ Produces a service recording: watches for a "begin" and "end" moment,
 correlates those against an OBS recording, trims it down to the body
 clip, and stitches it together with an intro and outro (crossfade at each
 join). Begin/end can come from ProPresenter slide detection or be marked
-by hand — ProPresenter is entirely optional; OBS is the only connection
+by hand. ProPresenter is entirely optional; OBS is the only connection
 actually required.
 
 Everything lives in `service_video.py`, with four subcommands. `gui.py`
@@ -14,7 +14,7 @@ is an optional desktop GUI over the same four subcommands.
 
 - `ffmpeg` and `ffprobe` on PATH.
 - Python 3.10+.
-- `pip install -r requirements.txt` — only needed for `watch`/`learn`.
+- `pip install -r requirements.txt`: only needed for `watch`/`learn`.
   `stitch` and `render` only need ffmpeg.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
@@ -26,22 +26,22 @@ python gui.py
 ```
 
 Runs the same `service_video.py` CLI as a subprocess per action; the
-console pane shows its output (also mirrored to a log file — Config >
+console pane shows its output (also mirrored to a log file, see Config >
 General), with a progress bar tracking ffmpeg's own steps. Creates a
 starter `config.json` next to the script on first run if none exists.
 
-**Main window** — Live/Offline tabs plus the console:
+**Main window**: Live/Offline tabs plus the console.
 - **Live**: intro/outro/output fields, Start Watch, Mark Sermon
   Start/Mark Sermon End (the only way to run without ProPresenter, or to
   override it live), Prerender/Skip Render once an end is marked, and the
   render-state file path once Watch finishes.
 - **Offline**: crossfade an intro/main/outro by hand, or "Load from
-  JSON" a render-state file to redo one — this also enables Sermon
+  JSON" a render-state file to redo one; this also enables Sermon
   start/end fields to re-trim the raw recording before stitching.
   "Export to JSON" builds a render-state file from the fields as-is.
   "Advanced…" holds CRF/Fast copy/Encoder settings.
 
-**Config window** (the main window's "Config" button) — General (console
+**Config window** (the main window's "Config" button): General (console
 log path), ProPresenter (connection + slide matching + Learn mode), OBS
 (connection), and Render (the trim/stitch defaults a live Watch run
 uses, same fields as Offline's Advanced). Starting Watch or Learn
@@ -49,7 +49,7 @@ auto-saves both windows' fields to the config path shown here first.
 
 ## Subcommands
 
-### `stitch` — crossfade three clips into one video
+### `stitch`: crossfade three clips into one video
 
 Standalone; no config file or live connection needed.
 
@@ -74,8 +74,8 @@ webp); `main` must be a video. Output paths (here and in
 filename, e.g. `final_%Y-%m-%d_%H-%M-%S.mp4`.
 
 **Fast copy**: re-encodes only the two crossfade windows and stream-
-copies the untouched middle, instead of re-encoding everything — much
-faster on a long clip. Off by default for `stitch`: testing found the
+copies the untouched middle instead of re-encoding everything, which is
+much faster on a long clip. Off by default for `stitch`: testing found the
 re-encoded crossfade windows never end up compatible enough with the
 untouched middle to actually stream-copy, so it just adds time before
 falling back to a full re-encode anyway. `trim`'s fast copy has no such
@@ -85,17 +85,17 @@ it either way, so it's never unsafe to leave on.
 **Encoder**: `nvenc` at CRF 23 is the default (benchmarked as a good
 speed/quality balance); falls back to `software` (libx264) automatically,
 logging why, if the hardware encoder fails to run. A hardware encoder's
-CRF/CQ scale isn't quite the same as software's — treat the number as a
+CRF/CQ scale isn't quite the same as software's; treat the number as a
 starting point and adjust by eye against your own footage.
 
-### `watch` — the live pipeline
+### `watch`: the live pipeline
 
 ```
 python service_video.py watch -c config.json [--debug]
 ```
 
 Needs OBS (obs-websocket v5, built into OBS 28+) to know when recording
-starts/stops. ProPresenter's legacy stage-display API is optional — leave
+starts/stops. ProPresenter's legacy stage-display API is optional; leave
 `propresenter.host` blank to run on manual marking alone.
 
 State machine: wait for recording to start → wait for begin slide → wait
@@ -103,19 +103,19 @@ for end slide → wait for recording to stop → trim → stitch.
 
 **Manual marking**: type `mark_begin`/`mark_end` into `watch`'s stdin (or
 use the GUI's Mark Sermon Start/End buttons) to mark those moments by
-hand — the only way when ProPresenter isn't configured, and an override
+hand: the only way when ProPresenter isn't configured, and an override
 if something goes wrong with it live.
 
 **Prerender**: once an end is marked, starts the real trim+stitch early,
 reading the recording while OBS is still writing the rest of the service.
 Can fail if tried too soon after marking the end (the encoder hasn't
-flushed that far yet) — safe to just try again.
+flushed that far yet); safe to just try again.
 
 **Skip Render**: writes the render-state file as usual when recording
 stops, but skips the automatic trim+stitch, for when you already know
 you'll adjust the timing by hand afterward.
 
-### `learn` — find your begin/end slide UIDs
+### `learn`: find your begin/end slide UIDs
 
 ```
 python service_video.py learn -c config.json
@@ -124,10 +124,10 @@ python service_video.py learn -c config.json
 Connects to ProPresenter only. Step through your slides and it prints
 each one's UID (and text, if any) as you land on it.
 
-### `render` — redo just the trim+stitch, no live connection needed
+### `render`: redo just the trim+stitch, no live connection needed
 
 Every `watch` run writes a render-state JSON file (path configurable via
-`trim.state_output`) — self-contained: the recording's path, the raw
+`trim.state_output`), self-contained: the recording's path, the raw
 begin/end timestamps, and the `trim`/`stitch` settings used. `watch`
 prints the exact command to reuse it. Edit the file (most often
 `pad_start_seconds`/`pad_end_seconds`) and rerun:
@@ -141,12 +141,12 @@ python service_video.py render render_state_20260823_133005.json
 1. `pip install -r requirements.txt`
 2. In OBS: **Tools → WebSocket Server Settings**, enable it, note the port
    (default `4455`) and password.
-3. *(Optional — skip to step 6 for manual marking only.)* In
+3. *(Optional; skip to step 6 for manual marking only.)* In
    ProPresenter: **Preferences → Network**, enable the network API, note
    the port (and password, if set).
 4. Copy `config.example.json` → `config.json` and fill in
    `propresenter`/`obs` host, port, password (leave `propresenter.host`
-   blank to skip it). Skip this if using `gui.py` — it creates a starter
+   blank to skip it). Skip this if using `gui.py`, which creates a starter
    config on first run.
 5. *(Optional, requires step 3)* Find your begin/end slide UIDs:
    ```
@@ -165,7 +165,7 @@ python service_video.py render render_state_20260823_133005.json
   "general": {                            // GUI-only
     "log_path": "console_%Y%m%d_%H%M%S.log" // optional, default shown; "" turns off file logging
   },
-  "propresenter": {                       // entirely optional — leave "host" "" to run on manual marking alone
+  "propresenter": {                       // entirely optional; leave "host" "" to run on manual marking alone
     "host": "192.168.1.50",
     "port": 1025,
     "password": "",
@@ -192,13 +192,13 @@ python service_video.py render render_state_20260823_133005.json
     "auto": true,
     "intro": "intro.mp4",                 // video, or a still image (jpg/png/bmp/tif/tiff/webp)
     "outro": "outro.mp4",                 // same
-    "intro_duration": 5.0,                // optional, default 5.0 — only used if intro is a still image
-    "outro_duration": 5.0,                // optional, default 5.0 — only used if outro is a still image
+    "intro_duration": 5.0,                // optional, default 5.0; only used if intro is a still image
+    "outro_duration": 5.0,                // optional, default 5.0; only used if outro is a still image
     "output": "final.mp4",
     "transition_duration": 1.0,
-    "transition": "fade",                 // optional, default "fade" — any ffmpeg xfade transition name
+    "transition": "fade",                 // optional, default "fade"; any ffmpeg xfade transition name
     "crf": 23,                            // optional, default 23
-    "fast_copy": false,                   // optional, default false — see "Fast copy" above (usually a no-op)
+    "fast_copy": false,                   // optional, default false; see "Fast copy" above (usually a no-op)
     "encoder": "nvenc",                   // optional, default "nvenc"
     "encoder_preset": null                // optional, default null (encoder's own default, p4 for nvenc)
   }
@@ -209,5 +209,5 @@ python service_video.py render render_state_20260823_133005.json
 `stitch.transition`/`stitch.crf` apply to the final crossfaded output,
 separately from `trim.crf` (the trimmed intermediate clip). The GUI
 exposes one "Fast copy" checkbox (`trim.fast_copy`) and one "Encoder"
-dropdown (sets both `trim.encoder` and `stitch.encoder` together) — see
+dropdown (sets both `trim.encoder` and `stitch.encoder` together); see
 "Fast copy"/"Encoder" under `stitch` above for what each does.
