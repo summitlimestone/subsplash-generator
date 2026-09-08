@@ -10,3 +10,8 @@ output.mp4
 
 __pycache__/
 *.pyc
+
+# PyInstaller build output (packaging/build.py)
+build/
+dist/
+*.spec

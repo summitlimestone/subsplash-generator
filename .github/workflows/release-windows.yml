@@ -1,0 +1,64 @@
+name: Windows Release
+
+# Fires only on pushing a tag like "v1.2.0" — never on ordinary commits/PRs
+# (those stay on ci.yml). The tag name becomes the app version baked into
+# the build and the release's name.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # to create the GitHub Release and upload its assets
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download ffmpeg/ffprobe (static Windows build)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extracted
+          $bin = (Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter ffmpeg.exe | Select-Object -First 1).Directory.FullName
+          New-Item -ItemType Directory -Force -Path ffmpeg_bin | Out-Null
+          Copy-Item (Join-Path $bin "ffmpeg.exe") ffmpeg_bin/
+          Copy-Item (Join-Path $bin "ffprobe.exe") ffmpeg_bin/
+
+      - name: Build executables
+        shell: pwsh
+        run: python packaging/build.py "${{ github.ref_name }}"
+
+      - name: Assemble release folder
+        shell: pwsh
+        run: |
+          $name = "SubsplashGenerator-${{ github.ref_name }}-windows"
+          $out = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item dist/SubsplashGenerator.exe $out/
+          Copy-Item dist/service_video.exe $out/
+          Copy-Item ffmpeg_bin/ffmpeg.exe $out/
+          Copy-Item ffmpeg_bin/ffprobe.exe $out/
+          Copy-Item config.example.json $out/
+          Copy-Item README.md $out/
+          Compress-Archive -Path "$out/*" -DestinationPath "dist/$name.zip"
+          echo "ZIP_PATH=dist/$name.zip" >> $env:GITHUB_ENV
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
