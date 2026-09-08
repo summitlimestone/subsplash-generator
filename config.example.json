@@ -25,6 +25,8 @@
     "pad_end_seconds": 0,
     "crf": 23,
     "fast_copy": true,
+    "normalize_audio": true,
+    "normalize_target_lufs": -16.0,
     "encoder": "nvenc",
     "encoder_preset": null
   },
