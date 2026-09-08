@@ -43,13 +43,17 @@ starter `config.json` next to the script on first run if none exists.
   it resolves, disconnects OBS and ends the Watch run — from there Stitch
   (and a retried Trim, if it failed) work the same way the Offline tab's
   own buttons do, straight off the render-state file this run wrote.
-- **Offline**: crossfade an intro/main/outro by hand via separate Trim
-  and Stitch buttons, or "Load from JSON" a render-state file (even one
-  still in progress) to redo one; this also enables Sermon start/end
-  fields so Trim re-trims the raw recording to those exact points before
-  a follow-up Stitch. "Export to JSON" builds a render-state file from
-  the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio
-  (and its Target LUFS), and Encoder settings.
+- **Offline**: crossfade an intro/outro with a trimmed clip by hand via
+  separate Trim and Stitch buttons, or "Load from JSON" a render-state
+  file (even one still in progress) to redo one; this also enables
+  Sermon start/end fields so Trim re-trims Main clip (the raw recording)
+  to those exact points. Trimmed clip is Trim's own output and always
+  what Stitch reads as its main clip — never Main clip itself — so it's
+  greyed out until Trimmed clip actually points at something, whether
+  that's a fresh Trim result, `trimmed_path` from a loaded render-state
+  file, or one picked by hand. "Export to JSON" builds a render-state
+  file from the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize
+  audio (and its Target LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),
@@ -174,7 +178,9 @@ each one's UID (and text, if any) as you land on it.
 
 Every `watch` run writes a render-state JSON file (path configurable via
 `trim.state_output`): the recording's path, the raw begin/end timestamps,
-and the `trim`/`stitch` settings used. Created the moment `watch` starts
+the trimmed clip's path once Trim has actually produced one (`null`
+until then), and the `trim`/`stitch` settings used. Created the moment
+`watch` starts
 and kept up to date as marks land and recording stops, rather than only
 written once at the end; `render` needs it complete (not still `null`) to
 run. `watch` prints the exact command to reuse it. Edit the file (most

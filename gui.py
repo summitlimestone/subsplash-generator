@@ -1435,10 +1435,10 @@ class App(tk.Tk):
             "Fill in the fields yourself, or click \"Load from JSON\" to pull them out "
             "of a render_state_*.json file a Watch run wrote (even one still in "
             "progress). Loading from JSON also enables the sermon start/end "
-            "timestamps below, which Trim uses to re-trim the raw recording to those "
-            "exact points, pointing Main clip at the result for a follow-up Stitch — "
-            "otherwise Main clip is assumed to already be trimmed and Stitch alone is "
-            "what you want. Doesn't need a config file or any live connection either way.",
+            "timestamps below, which Trim uses to re-trim the raw recording to "
+            "those exact points, writing the result to Trimmed clip — Stitch "
+            "always reads from there, not Main clip. Doesn't need a config file "
+            "or any live connection either way.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
@@ -1457,26 +1457,28 @@ class App(tk.Tk):
         )
         self._labeled_entry(frame, 3, "Main clip", "st_main", colspan=3)
         self._add_browse(frame, 3, "st_main", filetypes=VIDEO_FILETYPES, col=3)
-        self._labeled_entry(frame, 4, "Outro clip", "st_outro", colspan=3)
-        self._add_browse(frame, 4, "st_outro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
+        self._labeled_entry(frame, 4, "Trimmed clip", "st_trimmed", colspan=3, help_text=TIMESTAMP_HELP)
+        self._add_browse(frame, 4, "st_trimmed", save=True, filetypes=VIDEO_FILETYPES, col=3)
+        self._labeled_entry(frame, 5, "Outro clip", "st_outro", colspan=3)
+        self._add_browse(frame, 5, "st_outro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
         self._labeled_spinbox(
-            frame, 4, "Duration (s)", "st_outro_duration", from_=0.1, to=120.0,
+            frame, 5, "Duration (s)", "st_outro_duration", from_=0.1, to=120.0,
             default=str(DEFAULT_IMAGE_DURATION), width=6, col=5, help_text=IMAGE_DURATION_HELP,
         )
-        self._labeled_entry(frame, 5, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
-        self._add_browse(frame, 5, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
+        self._labeled_entry(frame, 6, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
+        self._add_browse(frame, 6, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
         self.vars["st_output"].set("output.mp4")
 
-        self._labeled_entry(frame, 6, "Sermon start", "st_start", width=13, col=0)
+        self._labeled_entry(frame, 7, "Sermon start", "st_start", width=13, col=0)
         self.vars["st_start"].set("00:00:00.000")
-        self._labeled_entry(frame, 6, "Sermon end", "st_end", width=13, col=2, pad_left=16)
+        self._labeled_entry(frame, 7, "Sermon end", "st_end", width=13, col=2, pad_left=16)
         self.vars["st_end"].set("00:00:00.000")
 
         self._labeled_combobox(
-            frame, 7, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
+            frame, 8, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
         )
         self.vars["st_transition"].set("fade")
-        self._labeled_entry(frame, 7, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
+        self._labeled_entry(frame, 8, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
         self.vars["st_duration"].set("1.0")
 
         # CRF/Fast copy/Encoder/Encoder preset live in their own "Advanced"
@@ -1484,11 +1486,11 @@ class App(tk.Tk):
         # tuning knobs set once and rarely touched, unlike everything
         # above, which changes per run.
         ttk.Button(frame, text="Advanced…", command=self._open_offline_advanced_window).grid(
-            row=8, column=0, sticky="w", pady=(6, 0)
+            row=9, column=0, sticky="w", pady=(6, 0)
         )
 
         offline_btn_row = ttk.Frame(frame)
-        offline_btn_row.grid(row=9, column=0, sticky="w", pady=(10, 0))
+        offline_btn_row.grid(row=10, column=0, sticky="w", pady=(10, 0))
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
@@ -1497,21 +1499,17 @@ class App(tk.Tk):
         )
         self.offline_stitch_btn.pack(side="left", padx=(8, 0))
         self._start_buttons.append(self.offline_stitch_btn)
-        # Greyed out whenever Main clip is still the untrimmed raw
-        # recording from a loaded render-state file (_offline_use_raw_trim())
-        # — Stitch would just crossfade unedited footage in that case; run
-        # Trim first. Recomputed live off Main clip itself (typed, Browse'd,
-        # or auto-set by a successful Trim — see _handle_offline_trim_line())
-        # rather than only at Load-from-JSON time, so it stays right no
-        # matter how Main clip got to its current value. Doesn't apply
-        # (Stitch stays enabled) once there's no loaded raw state at all —
-        # see _offline_use_raw_trim()'s own docstring.
-        self.vars["st_main"].trace_add("write", self._update_offline_stitch_button)
+        # Greyed out whenever Trimmed clip is empty — Stitch always reads
+        # its main clip from there (never Main clip, which is Trim's own
+        # raw source), so there's nothing to crossfade until either Trim
+        # has actually produced one (see _handle_offline_trim_line()) or
+        # it's filled in by hand/Load from JSON.
+        self.vars["st_trimmed"].trace_add("write", self._update_offline_stitch_button)
         self._update_offline_stitch_button()
 
     def _update_offline_stitch_button(self, *_args):
-        raw_trim = self._offline_use_raw_trim(self.vars["st_main"].get().strip())
-        self.offline_stitch_btn.configure(state="disabled" if raw_trim else "normal")
+        has_trimmed = bool(self.vars["st_trimmed"].get().strip())
+        self.offline_stitch_btn.configure(state="normal" if has_trimmed else "disabled")
 
     def _open_offline_advanced_window(self):
         self.offline_advanced_window.deiconify()
@@ -1581,13 +1579,13 @@ class App(tk.Tk):
             and state.get("raw_end_offset") is not None
         )
         if has_raw:
-            # Point Main clip at the raw recording (not the already-trimmed
-            # clip) so the timestamp fields below have something meaningful
-            # to trim from — see _run_trim(). Shown as the actual computed
-            # trim points (raw slide-detected offset + any padding that was
-            # applied live), not as a raw/pad split — there's no slide
-            # detection here, just a person looking at footage and picking
-            # exact timestamps.
+            # Point Main clip at the raw recording so the timestamp fields
+            # below have something meaningful to trim from — see
+            # _run_trim(). Shown as the actual computed trim points (raw
+            # slide-detected offset + any padding that was applied live),
+            # not as a raw/pad split — there's no slide detection here,
+            # just a person looking at footage and picking exact
+            # timestamps.
             self.vars["st_main"].set(state["recording_path"])
             try:
                 start_ts = parse_timestamp(state["raw_begin_offset"]) + trim_cfg.get("pad_start_seconds", 0)
@@ -1603,29 +1601,38 @@ class App(tk.Tk):
             self.vars["st_end"].set(format_timestamp(end_ts))
             self._offline_raw_state = {
                 "recording_path": state["recording_path"],
-                "trim_output": trim_cfg.get("output", "body_trimmed.mp4"),
                 "state_output": trim_cfg.get("state_output", DEFAULT_STATE_OUTPUT),
                 "state_path": path,
             }
             self._log(f"[gui] loaded render fields from {path} (timestamps active — Run will re-trim the raw recording)")
         else:
             # Older/hand-built state file missing the raw recording info —
-            # fall back to the pre-trimmed clip, same as before this file
-            # could drive a re-trim at all. Reset the timestamp fields so
-            # they don't show stale numbers left over from a previous load.
-            if "output" in trim_cfg:
-                self.vars["st_main"].set(trim_cfg["output"])
+            # Main clip has nothing meaningful to point at. Reset the
+            # timestamp fields so they don't show stale numbers left over
+            # from a previous load.
             self.vars["st_start"].set("00:00:00.000")
             self.vars["st_end"].set("00:00:00.000")
             self._offline_raw_state = None
             self._log(
                 f"[gui] loaded render fields from {path} (no raw recording info in "
-                "this file — timestamps won't apply; Main clip is treated as already trimmed)"
+                "this file — timestamps won't apply; Trim needs Main clip and both "
+                "set by hand or from a different file)"
             )
-        # Covers the one case a plain Main-clip trace can't: _offline_raw_state
-        # itself just changed above without necessarily re-setting Main clip
-        # to a new value (e.g. the "else" branch above when "output" isn't in
-        # trim_cfg) — see _update_offline_stitch_button()/_offline_use_raw_trim().
+        # Trimmed clip: the real trimmed_path if this state already has
+        # one (see _write_render_state()/service_video.py) — a trim
+        # really happened for it — else blank, not a guess at
+        # trim.output: Stitch's own greying (_update_offline_stitch_button())
+        # keys off this field being non-empty, so pre-filling it with a
+        # destination Trim hasn't actually written yet would make Stitch
+        # look ready when it isn't. Trim falls back to trim.output's own
+        # default on its own once clicked, blank field or not — see
+        # _run_trim(). Independent of has_raw above, so this applies
+        # either way.
+        self.vars["st_trimmed"].set(state.get("trimmed_path") or "")
+        # Covers the one case a plain Trimmed-clip trace can't: it may not
+        # have changed value even though the render-state file (and so
+        # what Stitch would actually use) has — see
+        # _update_offline_stitch_button().
         self._update_offline_stitch_button()
 
     def _open_last_state_in_offline_tab(self):
@@ -2182,15 +2189,16 @@ class App(tk.Tk):
                 # the same way Offline's already do: prefill the Offline
                 # tab from the render-state file this run wrote (the same
                 # "Load from JSON" path, including this session's
-                # Stitch-greying), then point Main clip at the trimmed
-                # clip's own path if Trim actually succeeded (captured off
+                # Stitch-greying), then point Trimmed clip at the trim's
+                # own output path if it actually succeeded (captured off
                 # the console the same way _handle_offline_trim_line() does
                 # for the Offline tab's own Trim — see _handle_watch_line())
-                # instead of the raw recording _load_render_state_json()
-                # would otherwise leave it pointing at.
+                # — the render-state file's own trimmed_path should
+                # already agree (service_video.py writes it too), but this
+                # is the app's own real-time knowledge, so it wins if not.
                 self._load_render_state_json(self.render_state_var.get().strip())
                 if self._live_trimmed_path:
-                    self.vars["st_main"].set(self._live_trimmed_path)
+                    self.vars["st_trimmed"].set(self._live_trimmed_path)
                 self.live_trim_btn.configure(state="normal")
                 self.live_stitch_btn.configure(state=str(self.offline_stitch_btn["state"]))
                 self.mark_start_btn.configure(state="disabled")
@@ -2254,12 +2262,12 @@ class App(tk.Tk):
         self.config_window.add_learned_slide(uid, text)
 
     def _handle_offline_trim_line(self, line: str):
-        """Auto-points Main clip at the Offline tab's Trim button's own
+        """Auto-points Trimmed clip at the Offline tab's Trim button's own
         output once it succeeds, so a follow-up Stitch click picks it up
         without the user having to re-Browse to it themselves."""
         m = TRIMMED_PATH_RE.match(line)
         if m:
-            self.vars["st_main"].set(m.group(1).strip())
+            self.vars["st_trimmed"].set(m.group(1).strip())
 
     def _handle_watch_line(self, line: str):
         m = STATE_RE.search(line)
@@ -2436,15 +2444,18 @@ class App(tk.Tk):
     def _collect_offline_fields(self, error_title: str = "Render") -> dict | None:
         """Validate and collect the Offline tab's fields as a plain dict —
         shared by _run_trim()/_run_stitch()/_export_render_state(), since
-        all three need the same inputs (just doing different things with
-        them afterward). Returns None (after showing an error dialog titled
+        all three need most of the same inputs (just doing different
+        things with them afterward, and each requiring their own subset —
+        e.g. Stitch needs Trimmed clip, not Main clip; see each caller's
+        own check). Returns None (after showing an error dialog titled
         `error_title`) if something required is missing or invalid."""
         intro = self.vars["st_intro"].get().strip()
         main_clip = self.vars["st_main"].get().strip()
+        trimmed_clip = self.vars["st_trimmed"].get().strip()
         outro = self.vars["st_outro"].get().strip()
         output = self.vars["st_output"].get().strip() or "output.mp4"
-        if not intro or not main_clip or not outro:
-            messagebox.showerror(error_title, "Intro, main clip, and outro paths are all required.")
+        if not intro or not outro:
+            messagebox.showerror(error_title, "Intro and outro paths are both required.")
             return None
         try:
             duration = to_float(self.vars["st_duration"].get().strip() or "1.0", "Transition duration")
@@ -2469,7 +2480,7 @@ class App(tk.Tk):
             return None
         transition = self.vars["st_transition"].get().strip() or "fade"
         return {
-            "intro": intro, "main_clip": main_clip, "outro": outro, "output": output,
+            "intro": intro, "main_clip": main_clip, "trimmed_clip": trimmed_clip, "outro": outro, "output": output,
             "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
             "crf": crf, "trim_fast_copy": trim_fast_copy,
             "normalize_audio": normalize_audio, "normalize_target_lufs": normalize_target_lufs,
@@ -2487,11 +2498,15 @@ class App(tk.Tk):
         re-trimming it (_run_trim), or generic defaults when there's no
         loaded file to inherit them from (_export_render_state).
         stitch_auto is False for _run_trim() (trim only, no stitch — see
-        its docstring), True everywhere else."""
+        its docstring), True everywhere else. trimmed_path is whatever's
+        currently in Trimmed clip, if anything — same field Stitch itself
+        reads from (see _run_stitch()) — so a round trip through Export
+        to JSON then Load from JSON preserves it."""
         return {
             "recording_path": f["main_clip"],
             "raw_begin_offset": format_timestamp(f["start_ts"]),
             "raw_end_offset": format_timestamp(f["end_ts"]),
+            "trimmed_path": f.get("trimmed_clip") or None,
             "trim": {
                 "output": trim_output,
                 "state_output": state_output,
@@ -2531,12 +2546,13 @@ class App(tk.Tk):
     def _run_trim(self):
         """Re-trims the raw recording down to Sermon start/Sermon end —
         i.e. just the trim half of what a live Watch run does — writing
-        the result to Main clip so a follow-up Stitch click picks it up
-        (see _handle_offline_command_line()/TRIMMED_PATH_RE). Only
-        meaningful right after "Load from JSON", before Main clip is
-        changed — Sermon start/end are absolute timestamps a person picked
-        by eye, not a raw/pad split (there's no slide detection here), so
-        they're passed straight through as the offsets with zero padding."""
+        the result to Trimmed clip (see _handle_offline_trim_line()/
+        TRIMMED_PATH_RE for how the actual resolved path lands there) so
+        a follow-up Stitch click picks it up. Only meaningful right after
+        "Load from JSON", before Main clip is changed — Sermon start/end
+        are absolute timestamps a person picked by eye, not a raw/pad
+        split (there's no slide detection here), so they're passed
+        straight through as the offsets with zero padding."""
         f = self._collect_offline_fields(error_title="Trim")
         if f is None:
             return
@@ -2546,7 +2562,8 @@ class App(tk.Tk):
                 "Trim",
                 "Main clip isn't the raw recording from a loaded render-state file — "
                 "Trim only works right after \"Load from JSON\", before Main clip is "
-                "changed. Use Stitch instead if Main clip is already trimmed.",
+                "changed. Use Stitch instead if Trimmed clip already points at an "
+                "already-trimmed clip.",
             )
             return
 
@@ -2557,8 +2574,11 @@ class App(tk.Tk):
         # of what actually happened live just because you clicked Trim.
         # So this writes to a throwaway temp file instead (cleaned up
         # once the process exits, see _on_process_exit()); use "Export to
-        # JSON" if you actually want to keep these settings.
-        render_state = self._build_render_state(f, raw["trim_output"], raw["state_output"], stitch_auto=False)
+        # JSON" if you actually want to keep these settings. Trimmed clip
+        # itself is where Trim actually writes — whatever's currently in
+        # that field, same as Stitch will read from once this succeeds.
+        trim_output = f["trimmed_clip"] or "body_trimmed.mp4"
+        render_state = self._build_render_state(f, trim_output, raw["state_output"], stitch_auto=False)
         temp_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="render_state_", delete=False
         )
@@ -2568,20 +2588,22 @@ class App(tk.Tk):
         self._start("trim", ["render", temp_file.name])
 
     def _run_stitch(self):
-        """Crossfades Intro/Main clip/Outro as-is — Main clip is assumed
-        to already be trimmed (a prior Trim click already points it at
-        the result — see _run_trim() — or it's some other already-
-        trimmed file picked by hand)."""
+        """Crossfades Intro/Trimmed clip/Outro as-is — Trimmed clip is
+        assumed to already be trimmed (a prior Trim click already points
+        it at the result — see _run_trim() — or it's some other already-
+        trimmed file picked by hand); Main clip (the raw recording) is
+        never read here."""
         f = self._collect_offline_fields(error_title="Stitch")
         if f is None:
             return
-        if self._offline_use_raw_trim(f["main_clip"]) and (f["start_ts"] or f["end_ts"]):
-            self._log(
-                "[gui] note: Sermon start/Sermon end are ignored by Stitch — trim first, "
-                "or edit Main clip to point at an already-trimmed clip."
+        if not f["trimmed_clip"]:
+            messagebox.showerror(
+                "Stitch", "Trimmed clip is required — run Trim first, or fill it in "
+                "with an already-trimmed file.",
             )
+            return
         args = [
-            "stitch", f["intro"], f["main_clip"], f["outro"],
+            "stitch", f["intro"], f["trimmed_clip"], f["outro"],
             "-o", f["output"], "-d", str(f["duration"]), "-t", f["transition"], "--crf", str(f["crf"]),
             "--intro-duration", str(f["intro_duration"]), "--outro-duration", str(f["outro_duration"]),
             "--encoder", f["encoder"],
@@ -2603,11 +2625,15 @@ class App(tk.Tk):
         f = self._collect_offline_fields(error_title="Export to JSON")
         if f is None:
             return
+        if not f["main_clip"]:
+            messagebox.showerror("Export to JSON", "Main clip is required.")
+            return
         if f["end_ts"] <= f["start_ts"]:
             messagebox.showerror("Export to JSON", "Sermon end must be after Sermon start.")
             return
 
-        render_state = self._build_render_state(f, "body_trimmed.mp4", DEFAULT_STATE_OUTPUT)
+        trim_output = f["trimmed_clip"] or "body_trimmed.mp4"
+        render_state = self._build_render_state(f, trim_output, DEFAULT_STATE_OUTPUT)
         default_name = f"render_state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path = filedialog.asksaveasfilename(
             title="Export render-state JSON", defaultextension=".json",
