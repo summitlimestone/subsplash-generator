@@ -568,6 +568,15 @@ class App(tk.Tk):
         # Both reset at the start of each watch run (_run_watch()).
         self._live_trim_resolved = False
         self._live_trimmed_path: str | None = None
+        # "trim" or "stitch" while a post-exit Live Trim/Stitch click (see
+        # _trim_live()/_stitch_live()) is running its own freshly spawned
+        # process — None otherwise, including for a genuine Offline-tab
+        # Trim/Stitch click, which goes through the exact same _run_trim()/
+        # _run_stitch() but shouldn't touch the Live tab's own status
+        # readout. Lets _on_process_exit() know to update watch_state_var/
+        # the Live buttons for this one, the same way _handle_trim_stitch_status()
+        # did while watch() itself was still running.
+        self._live_handoff_which: str | None = None
         # See _handle_progress_line(): whether the most recently parsed
         # line was a "[progress] step N/M" marker (or a progress field
         # following one) — while true, key=value lines get swallowed
@@ -1899,6 +1908,31 @@ class App(tk.Tk):
                 self.watch_state_var.set(f"stopped (exit {code})")
                 self.watch_status_label.configure(foreground=PALETTE["muted"])
                 self._update_live_buttons(None)
+        elif label in ("trim", "stitch") and self._live_handoff_which == label:
+            # A post-exit Live Trim/Stitch click (see _trim_live()/
+            # _stitch_live()) — reflect its outcome in the Live tab's own
+            # status readout the same way _handle_trim_stitch_status() did
+            # while watch() was still running, even though this ran as a
+            # plain Offline-style process instead. A genuine Offline-tab
+            # click never sets _live_handoff_which, so this never fires for
+            # those.
+            btn = self.live_trim_btn if label == "trim" else self.live_stitch_btn
+            if code == 0:
+                self.watch_state_var.set({"trim": "Trimmed", "stitch": "Stitched"}[label])
+                self.watch_status_label.configure(foreground=PALETTE["success"])
+                if label == "trim":
+                    # Main clip (and therefore offline_stitch_btn's state)
+                    # was already updated as the trim's own output line
+                    # streamed in — see _handle_offline_trim_line() — so
+                    # this is just mirroring the now-current state onto the
+                    # Live tab's own Stitch button, same as right after the
+                    # very first live Trim.
+                    self.live_stitch_btn.configure(state=str(self.offline_stitch_btn["state"]))
+            else:
+                self.watch_state_var.set({"trim": "Trim failed", "stitch": "Stitch failed"}[label])
+                self.watch_status_label.configure(foreground=PALETTE["danger"])
+            btn.configure(state="normal")
+            self._live_handoff_which = None
         self._current_command = None
         self._set_busy(False)
 
@@ -2018,12 +2052,24 @@ class App(tk.Tk):
         # once a live Trim resolves), there's no process left to send
         # "trim" to; this button now works the same way Offline's Trim
         # does instead, straight off the Offline tab's own fields (already
-        # prefilled from this run — see _on_process_exit()).
+        # prefilled from this run — see _on_process_exit()). The Live
+        # tab's own status readout (watch_state_var) doesn't come along
+        # for free once it's a plain Offline-style run — _live_handoff_which
+        # plus the check below (self.runner.running(), true only if
+        # _run_trim() actually started something rather than bailing on a
+        # validation error) are what let _on_process_exit() keep updating
+        # it here the same way _handle_trim_stitch_status() did while
+        # watch() was still running.
         if self.runner.running():
             self.runner.send_line("trim")
             self._log("[gui] sent: trim")
         else:
             self._run_trim()
+            if self.runner.running():
+                self._live_handoff_which = "trim"
+                self.watch_state_var.set("Trimming…")
+                self.watch_status_label.configure(foreground=PALETTE["info"])
+                self.live_trim_btn.configure(state="disabled")
 
     def _stitch_live(self):
         if self.runner.running():
@@ -2031,6 +2077,11 @@ class App(tk.Tk):
             self._log("[gui] sent: stitch")
         else:
             self._run_stitch()
+            if self.runner.running():
+                self._live_handoff_which = "stitch"
+                self.watch_state_var.set("Stitching…")
+                self.watch_status_label.configure(foreground=PALETTE["info"])
+                self.live_stitch_btn.configure(state="disabled")
 
     # -- per-mode run handlers ---------------------------------------------
 
@@ -2049,6 +2100,7 @@ class App(tk.Tk):
         self._live_trimmed = False
         self._live_trim_resolved = False
         self._live_trimmed_path = None
+        self._live_handoff_which = None
         self.watch_state_var.set("starting…")
         self.watch_status_label.configure(foreground=PALETTE["accent"])
         self._update_live_buttons(None)
