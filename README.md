@@ -33,20 +33,31 @@ starter `config.json` next to the script on first run if none exists.
 **Main window**: Live/Offline tabs plus the console.
 - **Live**: intro/outro/output fields, Start Watch, Mark Sermon
   Start/Mark Sermon End (the only way to run without ProPresenter, or to
-  override it live), Prerender/Skip Render once an end is marked, and the
-  render-state file path once Watch finishes.
-- **Offline**: crossfade an intro/main/outro by hand, or "Load from
-  JSON" a render-state file to redo one; this also enables Sermon
-  start/end fields to re-trim the raw recording before stitching.
-  "Export to JSON" builds a render-state file from the fields as-is.
-  "Advanced…" holds CRF, Fast copy, Normalize audio (and its Target
-  LUFS), and Encoder settings.
+  override it live), Trim once an end is marked (works even before
+  recording stops; nothing renders automatically), and the render-state
+  file path, shown as soon as Watch starts and kept current throughout.
+  Trim disconnects ProPresenter (begin/end are decided by then) and, once
+  it resolves, disconnects OBS and ends the Watch run — from there Stitch
+  (and a retried Trim, if it failed) work the same way the Offline tab's
+  own buttons do, straight off the render-state file this run wrote.
+- **Offline**: crossfade an intro/main/outro by hand via separate Trim
+  and Stitch buttons, or "Load from JSON" a render-state file (even one
+  still in progress) to redo one; this also enables Sermon start/end
+  fields so Trim re-trims the raw recording to those exact points before
+  a follow-up Stitch. "Export to JSON" builds a render-state file from
+  the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio
+  (and its Target LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
 log path), ProPresenter (connection + slide matching + Learn mode), OBS
-(connection), and Render (the trim/stitch defaults a live Watch run uses,
-same fields as Offline's Advanced). Starting Watch or Learn auto-saves
-both windows' fields to the config path shown here first.
+(connection), and Render (the trim/stitch defaults the Live tab's
+Trim/Stitch buttons use, same fields as Offline's Advanced). Starting
+Watch or Learn auto-saves both windows' fields to the config path shown
+here first. `watch` disconnects ProPresenter the moment Trim is triggered
+and OBS the moment Trim resolves or recording stops (whichever's first),
+then exits once Trim has actually resolved — nothing live is left to do
+by then. Click Stop or press Ctrl+C to end it early instead, before that
+point.
 
 ## Subcommands
 
@@ -100,21 +111,28 @@ starts/stops. ProPresenter's legacy stage-display API is optional; leave
 `propresenter.host` blank to run on manual marking alone.
 
 State machine: wait for recording to start → wait for begin slide → wait
-for end slide → wait for recording to stop → trim → stitch.
+for end slide → wait for recording to stop → keep running until Trim
+resolves. `watch` never trims or stitches on its own; Trim (below) is the
+only way it happens.
 
 **Manual marking**: type `mark_begin`/`mark_end` into `watch`'s stdin (or
 use the GUI's Mark Sermon Start/End buttons) to mark those moments by
 hand: the only way when ProPresenter isn't configured, and an override
 if something goes wrong with it live.
 
-**Prerender**: once an end is marked, starts the real trim+stitch early,
-reading the recording while OBS is still writing the rest of the service.
-Can fail if tried too soon after marking the end (the encoder hasn't
-flushed that far yet); safe to just try again.
-
-**Skip Render**: writes the render-state file as usual when recording
-stops, but skips the automatic trim+stitch, for when you already know
-you'll adjust the timing by hand afterward.
+**Trim**: once an end is marked, send `trim` (the GUI's "Trim" button) to
+trim right then, even before recording stops (it reads the in-progress
+recording file; if that fails, it waits for recording to finish and
+retries once more). Triggering Trim disconnects ProPresenter (nothing
+left for it to do); once Trim resolves — succeeded or failed, no retry
+left pending — `watch` disconnects OBS too and exits, since nothing live
+is left to do either way. From there, redo a failed Trim or run Stitch
+the offline way, against the render-state file `watch` printed the path
+to: `render` re-trims (and, if `stitch.auto`, stitches); plain `stitch`
+crossfades an already-trimmed clip directly. The GUI's Live tab does this
+handoff for you automatically — its Trim/Stitch buttons keep working
+after `watch` exits, now driving the same fields/buttons as its Offline
+tab underneath.
 
 ### `learn`: find your begin/end slide UIDs
 
@@ -128,10 +146,12 @@ each one's UID (and text, if any) as you land on it.
 ### `render`: redo just the trim+stitch, no live connection needed
 
 Every `watch` run writes a render-state JSON file (path configurable via
-`trim.state_output`), self-contained: the recording's path, the raw
-begin/end timestamps, and the `trim`/`stitch` settings used. `watch`
-prints the exact command to reuse it. Edit the file (most often
-`pad_start_seconds`/`pad_end_seconds`) and rerun:
+`trim.state_output`): the recording's path, the raw begin/end timestamps,
+and the `trim`/`stitch` settings used. Created the moment `watch` starts
+and kept up to date as marks land and recording stops, rather than only
+written once at the end; `render` needs it complete (not still `null`) to
+run. `watch` prints the exact command to reuse it. Edit the file (most
+often `pad_start_seconds`/`pad_end_seconds`) and rerun:
 
 ```
 python service_video.py render render_state_20260823_133005.json
