@@ -50,6 +50,7 @@ Install dependencies first:
 import argparse
 import asyncio
 import json
+import math
 import queue
 import re
 import secrets
@@ -1394,7 +1395,7 @@ def _measure_loudness(src: str, start: float, end: float, target_i: float) -> di
         )
         return None
     try:
-        return json.loads(matches[-1])
+        measured = json.loads(matches[-1])
     except json.JSONDecodeError:
         print(
             "[trim] normalize audio: loudnorm's measurement report wasn't valid JSON — "
@@ -1402,6 +1403,28 @@ def _measure_loudness(src: str, start: float, end: float, target_i: float) -> di
             file=sys.stderr,
         )
         return None
+
+    # Silent (or otherwise degenerate, e.g. a test recording with no real
+    # audio) source measures at -inf LUFS — loudnorm's own second pass then
+    # rejects that outright ("Value -inf for parameter 'measured_I' out of
+    # range"), which would otherwise only surface much later, inside
+    # trim_clip()'s actual encode. Catch it here instead, the same as any
+    # other failed measurement: there's no real loudness to normalize in a
+    # silent clip anyway, so skipping is the correct outcome, not just a
+    # crash to avoid.
+    for key in ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset"):
+        try:
+            valid = math.isfinite(float(measured[key]))
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            print(
+                f"[trim] normalize audio: measured {key} is {measured.get(key)!r} — likely "
+                "silent source audio — skipping normalization for this trim",
+                file=sys.stderr,
+            )
+            return None
+    return measured
 
 
 def _loudnorm_filter_arg(target_i: float, measured: dict | None) -> str:
