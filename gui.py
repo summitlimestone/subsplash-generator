@@ -582,6 +582,17 @@ class App(tk.Tk):
         # Reset at the start of each watch run (_run_watch()).
         self._live_end_marked = False
         self._live_trimmed = False
+        # Set once this run's live Trim has genuinely resolved (DONE or
+        # FAILED, no retry still pending — see _handle_trim_stitch_status())
+        # — watch() itself exits right after that (see its own docstring),
+        # so _on_process_exit() uses this to know a just-finished "watch"
+        # run should hand off to the Offline tab's own Trim/Stitch (below)
+        # rather than just going idle. _live_trimmed_path is the trimmed
+        # clip's actual path, captured the same way _handle_offline_trim_line()
+        # already does for the Offline tab's own Trim — see _handle_watch_line().
+        # Both reset at the start of each watch run (_run_watch()).
+        self._live_trim_resolved = False
+        self._live_trimmed_path: str | None = None
         # See _handle_progress_line(): whether the most recently parsed
         # line was a "[progress] step N/M" marker (or a progress field
         # following one) — while true, key=value lines get swallowed
@@ -1898,13 +1909,33 @@ class App(tk.Tk):
         else:
             self._log(f"[gui] {label} exited with code {code}.\n")
         if label == "watch":
-            # watch() never exits on its own any more — the only ways it
-            # ends are Stop (this) or Ctrl+C in a terminal — so a nonzero
-            # exit code here is the normal case, not a sign anything went
-            # wrong; show it plainly rather than as an error.
-            self.watch_state_var.set(f"stopped (exit {code})")
-            self.watch_status_label.configure(foreground=PALETTE["muted"])
-            self._update_live_buttons(None)
+            if self._live_trim_resolved and self.render_state_var.get().strip():
+                # watch() itself now exits once a live Trim resolves (see
+                # its own docstring) — from here on, Live Trim/Stitch work
+                # the same way Offline's already do: prefill the Offline
+                # tab from the render-state file this run wrote (the same
+                # "Load from JSON" path, including this session's
+                # Stitch-greying), then point Main clip at the trimmed
+                # clip's own path if Trim actually succeeded (captured off
+                # the console the same way _handle_offline_trim_line() does
+                # for the Offline tab's own Trim — see _handle_watch_line())
+                # instead of the raw recording _load_render_state_json()
+                # would otherwise leave it pointing at.
+                self._load_render_state_json(self.render_state_var.get().strip())
+                if self._live_trimmed_path:
+                    self.vars["st_main"].set(self._live_trimmed_path)
+                self.live_trim_btn.configure(state="normal")
+                self.live_stitch_btn.configure(state=str(self.offline_stitch_btn["state"]))
+                self.mark_start_btn.configure(state="disabled")
+                self.mark_end_btn.configure(state="disabled")
+            else:
+                # watch() never got to a resolved live Trim this run (e.g.
+                # Stop was clicked early) — a nonzero exit code here is the
+                # normal case then, not a sign anything went wrong; show it
+                # plainly rather than as an error.
+                self.watch_state_var.set(f"stopped (exit {code})")
+                self.watch_status_label.configure(foreground=PALETTE["muted"])
+                self._update_live_buttons(None)
         self._current_command = None
         self._set_busy(False)
 
@@ -1942,6 +1973,16 @@ class App(tk.Tk):
         m3 = TRIM_STITCH_STATUS_RE.search(line)
         if m3:
             self._handle_trim_stitch_status(m3.group(1), m3.group(2))
+        # Same line, same regex _handle_offline_trim_line() already watches
+        # for on the Offline tab's own Trim — service_video.py's live
+        # _trim_worker() prints the identical wording on success now (see
+        # its own comment), so this is "the same place the application
+        # already derives a trim's output path," reused here rather than a
+        # separate render-state JSON field. Consumed once watch() exits —
+        # see _on_process_exit().
+        m4 = TRIMMED_PATH_RE.match(line)
+        if m4:
+            self._live_trimmed_path = m4.group(1).strip()
 
     def _update_live_buttons(self, raw_state: str | None):
         """Mirrors service_video.py's own guard on manual mark_begin/
@@ -1991,12 +2032,15 @@ class App(tk.Tk):
             btn.configure(state="normal")
             if which == "trim":
                 self._live_trimmed = True
+                self._live_trim_resolved = True
                 self.live_stitch_btn.configure(state="normal")
         elif status == "FAILED":
             self._log(f"[gui] {which} failed — see the console output above for why; safe to try again")
             self.watch_state_var.set(failed_label)
             self.watch_status_label.configure(foreground=PALETTE["danger"])
             btn.configure(state="normal")
+            if which == "trim":
+                self._live_trim_resolved = True
 
     def _mark_sermon_start(self):
         self.runner.send_line("mark_begin")
@@ -2007,12 +2051,23 @@ class App(tk.Tk):
         self._log("[gui] sent: mark sermon end")
 
     def _trim_live(self):
-        self.runner.send_line("trim")
-        self._log("[gui] sent: trim")
+        # Once watch() has already exited (see its own docstring — it does
+        # once a live Trim resolves), there's no process left to send
+        # "trim" to; this button now works the same way Offline's Trim
+        # does instead, straight off the Offline tab's own fields (already
+        # prefilled from this run — see _on_process_exit()).
+        if self.runner.running():
+            self.runner.send_line("trim")
+            self._log("[gui] sent: trim")
+        else:
+            self._run_trim()
 
     def _stitch_live(self):
-        self.runner.send_line("stitch")
-        self._log("[gui] sent: stitch")
+        if self.runner.running():
+            self.runner.send_line("stitch")
+            self._log("[gui] sent: stitch")
+        else:
+            self._run_stitch()
 
     # -- per-mode run handlers ---------------------------------------------
 
@@ -2029,6 +2084,8 @@ class App(tk.Tk):
             args.append("--debug")
         self._live_end_marked = False
         self._live_trimmed = False
+        self._live_trim_resolved = False
+        self._live_trimmed_path = None
         self.watch_state_var.set("starting…")
         self.watch_status_label.configure(foreground=PALETTE["accent"])
         self._update_live_buttons(None)

@@ -1876,7 +1876,11 @@ def _trim_worker(
             events_q.put(("trim_result", time.time(), {"succeeded": False, "trimmed_path": None}))
             return
 
-    print(f"[watcher] trim: trimmed -> {trimmed_path}")
+    # Same wording render()'s own trim step prints (see TRIMMED_PATH_RE in
+    # gui.py) — one canonical "trim succeeded, here's the path" line for
+    # both the offline and live paths, rather than two differently-worded
+    # ones, so the GUI can recognize either one the same way.
+    print(f"\nTrimmed body clip -> {trimmed_path}")
     events_q.put(("trim_result", time.time(), {"succeeded": True, "trimmed_path": trimmed_path}))
 
 
@@ -2061,15 +2065,26 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     actually stops. Trim/Stitch are triggered independently, at any time,
     via the 'trim'/'stitch' manual commands (the GUI's Trim/Stitch
     buttons; see _trim_worker()/_stitch_worker()) — Trim works even
-    before recording stops, reading the in-progress file. This process
-    just keeps running for as long as the operator leaves it running
-    (Stop in the GUI, or Ctrl+C in a terminal) — there's no automatic
-    exit once recording stops, since nothing here waits to be "finished"
-    the way a one-shot render does.
+    before recording stops, reading the in-progress file.
+
+    Each connection closes as soon as its own job is done rather than
+    staying open for the rest of the run: ProPresenter (if connected at
+    all) disconnects the moment Trim is actually triggered, since begin/end
+    are decided by then; OBS disconnects the moment either Trim resolves
+    (succeeded or failed — see the 'trim_result' handling below) or
+    recording itself stops, whichever comes first, since neither has
+    anything further to report after that. Once Trim has resolved, this
+    process itself exits (there's nothing further only a live connection
+    can do — Stitch and any retried Trim work fine offline, see render());
+    if recording stops before Trim is ever triggered, only OBS disconnects
+    at that point — the process stays up so Trim (still a pending action)
+    keeps working, now straight off the finalized file with no OBS needed.
 
     If api.enabled is set, also starts the optional control API (see
     start_api_thread()) so mark_begin/mark_end and the current state are
-    reachable over HTTP too, not just via stdin/the GUI."""
+    reachable over HTTP too, not just via stdin/the GUI — it shares this
+    process's lifetime, so it stops right along with everything else
+    above."""
     import obsws_python as obs
 
     obs_cfg = cfg["obs"]
@@ -2102,8 +2117,12 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     # connection thread if a host was actually configured; otherwise there's
     # nothing to connect to, and trying would just reconnect-loop forever
     # against an empty host for no benefit.
+    # Captured so a later 'trim' can signal this connection to stop
+    # reconnecting once begin/end are decided and it's no longer needed —
+    # see the 'trim' manual-command handling below.
+    pp_stop_event: threading.Event | None = None
     if pp_cfg.get("host"):
-        start_propresenter_thread(pp_cfg, events_q)
+        pp_stop_event = start_propresenter_thread(pp_cfg, events_q)
     else:
         print("[watcher] no ProPresenter host configured — skipping that connection; use manual Mark Start/Mark End instead")
     start_stdin_thread(events_q)
@@ -2152,6 +2171,21 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                 "render_state_path": str(state_path),
             })
 
+    obs_disconnected = False
+
+    def disconnect_obs():
+        """Closes both OBS connections — idempotent (safe to call from more
+        than one place, see watch()'s own docstring for the two triggers)
+        since there's nothing left for OBS to tell this process once either
+        fires."""
+        nonlocal obs_disconnected
+        if obs_disconnected:
+            return
+        obs_disconnected = True
+        obs_event_client.disconnect()
+        obs_req_client.disconnect()
+        print("[watcher] disconnected from OBS — nothing further to watch for from it this run")
+
     if already_recording:
         print(
             "WARNING: OBS is already recording. t0 (recording start) will be "
@@ -2199,6 +2233,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                     print(f"[watcher] -> state = {state}")
                     recording_stopped_event.set()
                     sync_state()
+                    disconnect_obs()
 
             elif kind == "pp_raw":
                 result = extract_current_slide(payload)
@@ -2262,6 +2297,12 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                     elif trim_thread is not None and trim_thread.is_alive():
                         print("[watcher] ignoring trim — one is already running", file=sys.stderr)
                     else:
+                        # Begin/end are decided the moment Trim is actually
+                        # triggered — ProPresenter has nothing further to do
+                        # this run, whether or not this particular attempt
+                        # ends up succeeding.
+                        if pp_stop_event is not None:
+                            pp_stop_event.set()
                         print("[watcher] trim status = RUNNING")
                         trim_status_str = "running"
                         sync_state()
@@ -2297,7 +2338,19 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                 else:
                     trim_status_str = "failed"
                     print("[watcher] trim status = FAILED")
+                # Trim is genuinely resolved now (no retry still pending
+                # either way — see _trim_worker()) — nothing live is left
+                # to do: OBS has nothing further to report (this also
+                # covers succeeding while still recording, which no longer
+                # has to wait for a stop event to matter), and Stitch (or a
+                # retried Trim, if this one failed) works fine offline from
+                # here — see render(). Exit rather than sit idle. sync_state()
+                # covers both the render-state file and the control API's
+                # shared status dict, so this one call is enough for both.
+                disconnect_obs()
                 sync_state()
+                print("[watcher] nothing left to watch for — exiting")
+                return
 
             elif kind == "stitch_result":
                 if payload["succeeded"]:
