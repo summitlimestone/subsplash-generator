@@ -48,7 +48,8 @@ starter `config.json` next to the script on first run if none exists.
   still in progress) to redo one; this also enables Sermon start/end
   fields so Trim re-trims the raw recording to those exact points before
   a follow-up Stitch. "Export to JSON" builds a render-state file from
-  the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio
+  the fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
+  "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
   (and its Target LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
@@ -106,6 +107,7 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 | `--fast-copy`/`--no-fast-copy` | off | Skip re-encoding untouched footage (see below) |
 | `--encoder` | `nvenc` | `software`, `nvenc`, `qsv`, `amf`, or `videotoolbox` |
 | `--encoder-preset` | encoder's own default | That encoder's speed/quality preset |
+| `--subsplash-preset` | off | Match Subsplash's own recommended settings instead of `--crf` (see below) |
 
 `intro`/`outro` can each be a video or a still image (jpg/png/bmp/tif/
 webp); `main` must be a video. Output paths (here and in
@@ -126,6 +128,20 @@ speed/quality balance); falls back to `software` (libx264) automatically,
 logging why, if the hardware encoder fails to run. A hardware encoder's
 CRF/CQ scale isn't quite the same as software's; treat the number as a
 starting point and adjust by eye against your own footage.
+
+**Subsplash preset**: matches Subsplash's own recommended On-Demand
+1080p settings (distributed as a HandBrake preset) instead of `--crf`
+and the output's own resolution/framerate — profile High, level 4.0,
+`keyint=60`, 1920x1080 at 30fps (letterboxed/pillarboxed and upscaled as
+needed, same as any other resolution mismatch here), ~2400kbps video,
+AAC 160kbps audio, and no `+faststart`. `--encoder` still picks the
+actual encode backend; this only changes the quality-control flags and
+picture format, as a modification to the same encode command rather than
+a second pass over the finished file — so it lands close to 2400kbps,
+not as precisely as HandBrake's own 2-pass encoding would. Ignored by
+`--fast-copy` (its whole point is leaving most of the file stream-copied
+untouched, which can never comply with a specific target bitrate) — a
+full re-encode runs instead if both are set.
 
 ### `watch`: the live pipeline
 
@@ -253,7 +269,8 @@ python service_video.py render render_state_20260823_133005.json
     "output": "final.mp4",
     "transition_duration": 1.0,
     "transition": "fade",                 // optional, default "fade"; any ffmpeg xfade transition name
-    "crf": 23,                            // optional, default 23
+    "crf": 23,                            // optional, default 23; ignored if subsplash_preset is true
+    "subsplash_preset": false,            // optional, default false; see "Subsplash preset" below
     "fast_copy": false,                   // optional, default false; see "Fast copy" above (usually a no-op)
     "encoder": "nvenc",                   // optional, default "nvenc"
     "encoder_preset": null                // optional, default null (encoder's own default, p4 for nvenc)

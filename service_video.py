@@ -653,15 +653,22 @@ def build_filter_complex(
         )
 
     # Video: chain two xfade transitions, intro->main, then result->outro.
+    # xfade doesn't reliably preserve yuv420p even though every input above
+    # was already forced to it — confirmed by direct testing: it can hand
+    # the encoder 4:4:4 instead, which a profile-constrained encode (e.g.
+    # stitch()'s subsplash_preset, "-profile:v high") then rejects outright
+    # ("high profile doesn't support 4:4:4"). Re-forcing format=yuv420p on
+    # each xfade's own output avoids that regardless of profile, so it's
+    # unconditional here, not just when a profile happens to be set.
     offset1 = clips[0]["duration"] - duration
     parts.append(
         f"[v0][v1]xfade=transition={transition}:duration={duration}:"
-        f"offset={offset1:.3f}[v01]"
+        f"offset={offset1:.3f},format=yuv420p[v01]"
     )
     offset2 = clips[0]["duration"] + clips[1]["duration"] - 2 * duration
     parts.append(
         f"[v01][v2]xfade=transition={transition}:duration={duration}:"
-        f"offset={offset2:.3f}[vout]"
+        f"offset={offset2:.3f},format=yuv420p[vout]"
     )
 
     # Audio: chain two acrossfade transitions the same way. Any clip missing
@@ -899,12 +906,23 @@ def expand_output_path(path: str) -> str:
 # real side-by-side quality/timing check against "software" once
 # configured, and please report back if any of these need adjusting for
 # your actual hardware/driver combination.
+#
+# bitrate_args is the same idea, but for a target average bitrate instead
+# of a fixed quality — used only by stitch()'s subsplash_preset (see
+# SUBSPLASH_1080P), single-pass ABR rather than CRF/CQ. Confirmed by
+# direct testing that "software"'s produces a real, playable encode with
+# the requested bitrate/profile/level actually applied; the hardware
+# ones carry the same not-yet-verified-end-to-end caveat as their `args`
+# above.
 ENCODER_PROFILES = {
     "software": {
         "codec": "libx264",
         "presets": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
         "default_preset": "veryfast",
         "args": lambda crf, preset: ["-crf", str(crf), "-preset", preset],
+        # No -crf: libx264 drops into single-pass average-bitrate mode
+        # automatically once only -b:v is given.
+        "bitrate_args": lambda bitrate, preset: ["-b:v", f"{bitrate}k", "-preset", preset],
     },
     "nvenc": {
         # NVIDIA. -cq is NVENC's closest equivalent to x264's -crf (same
@@ -922,6 +940,7 @@ ENCODER_PROFILES = {
         "presets": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
         "default_preset": "p4",
         "args": lambda crf, preset: ["-rc", "vbr", "-cq", str(crf), "-preset", preset],
+        "bitrate_args": lambda bitrate, preset: ["-rc", "vbr", "-b:v", f"{bitrate}k", "-preset", preset],
     },
     "qsv": {
         # Intel Quick Sync. -global_quality under QSV's default ICQ
@@ -932,6 +951,7 @@ ENCODER_PROFILES = {
         "presets": ["veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
         "default_preset": "veryfast",
         "args": lambda crf, preset: ["-global_quality", str(crf), "-preset", preset],
+        "bitrate_args": lambda bitrate, preset: ["-b:v", f"{bitrate}k", "-preset", preset],
     },
     "amf": {
         # AMD. No direct CRF equivalent; constant-QP mode (-rc cqp) with
@@ -945,6 +965,7 @@ ENCODER_PROFILES = {
         "args": lambda crf, preset: [
             "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf), "-quality", preset,
         ],
+        "bitrate_args": lambda bitrate, preset: ["-rc", "vbr_latency", "-b:v", f"{bitrate}k", "-quality", preset],
     },
     "videotoolbox": {
         # Apple (macOS only — this encoder doesn't exist on other
@@ -957,11 +978,45 @@ ENCODER_PROFILES = {
         "presets": [],
         "default_preset": None,
         "args": lambda crf, preset: ["-q:v", str(max(1, min(100, round(100 - (crf / 51) * 100))))],
+        "bitrate_args": lambda bitrate, preset: ["-b:v", f"{bitrate}k"],
     },
 }
 
 
-def _encode_with_fallback(build_cmd, encoder: str, crf: int, preset: str | None, label: str):
+# Fixed settings for stitch()'s subsplash_preset — Subsplash's own
+# recommended encoding settings for On-Demand 1080p uploads, distributed
+# as a HandBrake preset (Subsplash On-Demand (1080p).json). Decoded from
+# that preset's JSON: "VideoQualityType": 1 is HandBrake's Average
+# Bitrate mode (not Constant Quality — confirmed against HandBrake's own
+# libhb/preset.c, where vqtype 1 sets "Bitrate" and vqtype 2 sets
+# "Quality") at "VideoAvgBitrate": 2400 (kbps); "VideoEncoder": "x264",
+# "VideoProfile": "high", "VideoLevel": "4.0", "VideoOptionExtra":
+# "keyint=60"; "VideoFramerate": "30" at "VideoFramerateMode": "cfr";
+# "PictureWidth"/"PictureHeight": 1920/1080 (with "PictureAllowUpscaling":
+# true — the existing scale=...force_original_aspect_ratio=decrease,pad=...
+# filter chain in build_filter_complex() already upscales smaller sources
+# to fit, so no change needed there); "AudioBitrate": 160.
+#
+# HandBrake's own preset also sets "VideoTwoPass"/"VideoTurboTwoPass":
+# true — real 2-pass encoding, for more precise bitrate targeting. This
+# uses a single pass instead (see stitch()'s subsplash_preset docstring
+# for why), so the final size/bitrate will be close to 2400kbps but not
+# as tightly controlled as HandBrake's own 2-pass would be.
+SUBSPLASH_1080P = {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "profile": "high",
+    "level": "4.0",
+    "keyint": 60,
+    "video_bitrate": 2400,
+    "audio_bitrate": 160,
+}
+
+
+def _encode_with_fallback(
+    build_cmd, encoder: str, crf: int, preset: str | None, label: str, bitrate: int | None = None,
+):
     """Run an ffmpeg encode command for one of trim_clip()'s/stitch()'s
     full re-encode paths, using the requested encoder profile (see
     ENCODER_PROFILES) — `build_cmd(codec, codec_args)` returns the full
@@ -975,7 +1030,13 @@ def _encode_with_fallback(build_cmd, encoder: str, crf: int, preset: str | None,
     — the way a hardware encoder typically fails, distinct from a normal
     encode failure) — since this is meant to be a speed option, not a new
     way for a render to fail outright. Exits (like the rest of this
-    file's ffmpeg calls) if software itself fails too."""
+    file's ffmpeg calls) if software itself fails too.
+
+    bitrate (default None): when given, uses that profile's
+    `bitrate_args` (single-pass average-bitrate, in kbps) instead of
+    `args` (crf/cq) — see ENCODER_PROFILES and stitch()'s
+    subsplash_preset. `crf` is simply ignored in that case rather than
+    needing two near-identical call sites."""
     profile = ENCODER_PROFILES.get(encoder)
     if profile is None:
         print(
@@ -995,7 +1056,10 @@ def _encode_with_fallback(build_cmd, encoder: str, crf: int, preset: str | None,
     if preset is None:
         preset = profile["default_preset"]
 
-    cmd = build_cmd(profile["codec"], profile["args"](crf, preset))
+    def quality_args(p, this_preset):
+        return p["bitrate_args"](bitrate, this_preset) if bitrate is not None else p["args"](crf, this_preset)
+
+    cmd = build_cmd(profile["codec"], quality_args(profile, preset))
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
     if result.returncode == 0:
@@ -1005,7 +1069,7 @@ def _encode_with_fallback(build_cmd, encoder: str, crf: int, preset: str | None,
 
     print(f"[{label}] {encoder} failed to encode — falling back to software (libx264)", file=sys.stderr)
     sw = ENCODER_PROFILES["software"]
-    sw_cmd = build_cmd(sw["codec"], sw["args"](crf, sw["default_preset"]))
+    sw_cmd = build_cmd(sw["codec"], quality_args(sw, sw["default_preset"]))
     print("Running:", " ".join(sw_cmd))
     result = subprocess.run(sw_cmd, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
@@ -1017,6 +1081,7 @@ def stitch(
     transition_duration: float = 1.0, transition: str = "fade", crf: int = 23,
     intro_duration: float | None = None, outro_duration: float | None = None,
     fast_copy: bool = False, encoder: str = "nvenc", encoder_preset: str | None = None,
+    subsplash_preset: bool = False,
 ) -> str:
     """Crossfade an intro, main body, and outro clip into one video. intro/
     outro can each be either a video or a still image (jpg/png/etc.) — a
@@ -1025,7 +1090,22 @@ def stitch(
     main_clip must be a real video (it's the trimmed recording).
     Returns the resolved output path (after strftime expansion).
 
-    fast_copy (default OFF, unlike trim_clip()'s — see below): try
+    subsplash_preset (default off): overrides crf/quality and the output
+    resolution/framerate to match Subsplash's own recommended On-Demand
+    1080p HandBrake preset instead (see SUBSPLASH_1080P) — a modification
+    to this same encode command, not a separate re-encode pass over the
+    finished file. Single-pass average bitrate (ffmpeg -b:v), not
+    HandBrake's own 2-pass, so the final size/bitrate lands close to
+    2400kbps but isn't as tightly controlled as a real 2-pass encode
+    would be — confirmed a reasonable trade-off for staying one pass.
+    `encoder` still chooses the actual hardware/software backend (and
+    `encoder_preset` its speed preset) the same as always; only the
+    quality-control flags and picture format change.
+
+    fast_copy (default OFF, unlike trim_clip()'s — see below; skipped
+    entirely when subsplash_preset is also on, since a stream-copied
+    middle can never comply with a specific target bitrate/profile — see
+    subsplash_preset above): try
     _fast_copy_stitch() first — only the two short crossfade windows get
     re-encoded, and the untouched middle of main_clip is stream-copied
     instead of being decoded and re-encoded along with everything else.
@@ -1097,13 +1177,30 @@ def stitch(
                 f"for a {transition_duration}s crossfade."
             )
 
-    # Use the main clip's resolution/fps as the target for the whole video.
-    width, height, fps = clips[1]["width"], clips[1]["height"], clips[1]["fps"]
+    if subsplash_preset:
+        # Forced resolution/framerate, not derived from main_clip — see
+        # SUBSPLASH_1080P. build_filter_complex()'s own
+        # scale=...force_original_aspect_ratio=decrease,pad=... chain
+        # (below) already letterboxes/pillarboxes and upscales smaller
+        # sources to fit, so nothing else needs to change here for that.
+        width, height, fps = SUBSPLASH_1080P["width"], SUBSPLASH_1080P["height"], SUBSPLASH_1080P["fps"]
+    else:
+        # Use the main clip's resolution/fps as the target for the whole video.
+        width, height, fps = clips[1]["width"], clips[1]["height"], clips[1]["fps"]
     # xfade requires even dimensions for yuv420p.
     width -= width % 2
     height -= height % 2
 
-    if fast_copy:
+    if fast_copy and subsplash_preset:
+        # fast_copy's whole technique is leaving main_clip's own untouched
+        # middle stream-copied, unre-encoded — which can never actually
+        # comply with subsplash_preset's specific bitrate/profile/level
+        # (the copied middle just keeps whatever encoding main_clip
+        # already had), so producing a file that's only partially
+        # Subsplash-compliant would be misleading. Skip straight to the
+        # full re-encode below instead, which does comply throughout.
+        print("[stitch] subsplash_preset is on — skipping fast copy (its stream-copied middle can't comply), doing a full re-encode")
+    elif fast_copy:
         result = _fast_copy_stitch(
             intro, main_clip, outro, output,
             is_image_flags, clips, width, height, fps,
@@ -1151,6 +1248,17 @@ def stitch(
     base_cmd = cmd + ["-filter_complex", filter_complex, "-map", v_out, "-map", a_out]
 
     def build_cmd(codec, codec_args):
+        if subsplash_preset:
+            return base_cmd + [
+                "-c:v", codec, *codec_args,
+                "-profile:v", SUBSPLASH_1080P["profile"], "-level:v", SUBSPLASH_1080P["level"],
+                "-g", str(SUBSPLASH_1080P["keyint"]),
+                "-c:a", "aac", "-b:a", f"{SUBSPLASH_1080P['audio_bitrate']}k",
+                # No +faststart: Subsplash's own preset has this off
+                # ("Mp4HttpOptimize": false) — the opposite of the
+                # default below.
+                output,
+            ]
         return base_cmd + [
             "-c:v", codec, *codec_args,
             "-c:a", "aac", "-b:a", "192k",
@@ -1160,7 +1268,8 @@ def stitch(
 
     total_duration = clips[0]["duration"] + clips[1]["duration"] + clips[2]["duration"] - 2 * transition_duration
     _print_step(total_duration, "encoding")
-    _encode_with_fallback(build_cmd, encoder, crf, encoder_preset, "stitch")
+    bitrate = SUBSPLASH_1080P["video_bitrate"] if subsplash_preset else None
+    _encode_with_fallback(build_cmd, encoder, crf, encoder_preset, "stitch", bitrate=bitrate)
 
     print(f"\nDone -> {output}")
     return output
@@ -1751,6 +1860,7 @@ def render(state: dict):
             outro_duration=stitch_cfg.get("outro_duration"),
             fast_copy=stitch_cfg.get("fast_copy", False),
             encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
+            subsplash_preset=stitch_cfg.get("subsplash_preset", False),
         )
 
 
@@ -1922,6 +2032,7 @@ def _stitch_worker(events_q: "queue.Queue", trimmed_path: str, stitch_cfg: dict)
             outro_duration=stitch_cfg.get("outro_duration"),
             fast_copy=stitch_cfg.get("fast_copy", False),
             encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
+            subsplash_preset=stitch_cfg.get("subsplash_preset", False),
         )
     except (SystemExit, Exception) as e:
         print(f"[watcher] stitch failed: {e}", file=sys.stderr)
@@ -2286,6 +2397,13 @@ def main():
              "ENCODER_PROFILES; e.g. libx264: veryfast/medium/slow/etc., nvenc: p1-p7). Default: "
              "that encoder's own default preset.",
     )
+    p_stitch.add_argument(
+        "--subsplash-preset", action="store_true",
+        help="Override quality/resolution/framerate to match Subsplash's own recommended "
+             "On-Demand 1080p settings instead of --crf/the source's own resolution (see "
+             "SUBSPLASH_1080P) — profile high, level 4.0, keyint 60, 1920x1080 at 30fps CFR, "
+             "~2400kbps single-pass video, AAC 160kbps audio, no +faststart.",
+    )
     p_stitch.add_argument("--machine-progress", **machine_progress_kwargs)
 
     args = parser.parse_args()
@@ -2300,6 +2418,7 @@ def main():
             transition_duration=args.transition_duration, transition=args.transition, crf=args.crf,
             intro_duration=args.intro_duration, outro_duration=args.outro_duration,
             fast_copy=args.fast_copy, encoder=args.encoder, encoder_preset=args.encoder_preset,
+            subsplash_preset=args.subsplash_preset,
         )
         return
 
