@@ -2,6 +2,12 @@
   "general": {
     "log_path": "console_%Y%m%d_%H%M%S.log"
   },
+  "api": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "password": ""
+  },
   "propresenter": {
     "host": "192.168.1.50",
     "port": 1025,

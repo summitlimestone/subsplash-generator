@@ -1,2 +1,4 @@
 obsws-python
 websockets
+fastapi
+uvicorn

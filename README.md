@@ -15,7 +15,10 @@ is an optional desktop GUI over the same four subcommands.
 - `ffmpeg` and `ffprobe` on PATH.
 - Python 3.10+.
 - `pip install -r requirements.txt`: only needed for `watch`/`learn`.
-  `stitch` and `render` only need ffmpeg.
+  `stitch` and `render` only need ffmpeg. `fastapi`/`uvicorn` (also in
+  there) are only needed for `gui.py`'s optional control API
+  (Config > API's "Enabled" checkbox; see "Control API" below) — nothing
+  in `service_video.py` itself needs them.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
 
@@ -49,15 +52,39 @@ starter `config.json` next to the script on first run if none exists.
   (and its Target LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
-log path), ProPresenter (connection + slide matching + Learn mode), OBS
-(connection), and Render (the trim/stitch defaults the Live tab's
-Trim/Stitch buttons use, same fields as Offline's Advanced). Starting
-Watch or Learn auto-saves both windows' fields to the config path shown
-here first. `watch` disconnects ProPresenter the moment Trim is triggered
-and OBS the moment Trim resolves or recording stops (whichever's first),
-then exits once Trim has actually resolved — nothing live is left to do
-by then. Click Stop or press Ctrl+C to end it early instead, before that
-point.
+log path), API (the control API below: Enabled, Host/Port, Password),
+ProPresenter (connection + slide matching + Learn mode), OBS (connection),
+and Render (the trim/stitch defaults the Live tab's Trim/Stitch buttons
+use, same fields as Offline's Advanced). Starting Watch or Learn
+auto-saves both windows' fields to the config path shown here first.
+`watch` disconnects ProPresenter the moment Trim is triggered and OBS the
+moment Trim resolves or recording stops (whichever's first), then exits
+once Trim has actually resolved — nothing live is left to do by then.
+Click Stop or press Ctrl+C to end it early instead, before that point.
+
+**Control API** (Config > API's "Enabled" checkbox): an optional HTTP
+API for marking sermon start/end and checking the current state from
+something other than this app itself — a phone or a separate control
+surface. Runs inside the GUI itself, independent of Start Watch/Stop —
+starts the moment the checkbox is ticked (or the GUI loads a config with
+it already on) and keeps running whether or not a watch session is
+currently active, listening on `api.host`/`api.port` (default
+`127.0.0.1:8765`):
+
+| Method | Path | Does |
+|---|---|---|
+| `POST` | `/mark/start` | Same as clicking Mark Sermon Start |
+| `POST` | `/mark/end` | Same as clicking Mark Sermon End |
+| `GET` | `/state` | State ("idle" if no watch is running), recording/begin/end-marked flags, Trim/Stitch status, render-state path |
+
+Marks are synchronous: `POST` returns 200 once actually applied, or 409
+if there's no active watch session or the mark doesn't apply in the
+current state (e.g. marking end before start). Interactive Swagger docs
+are served at `/swagger`. Secured with HTTP Basic Auth against
+`api.password` (any username accepted, only the password checked, since
+this is a single shared secret, not real user management); leave it
+blank to run with no authentication at all, logged loudly in the console
+pane every time the API starts that way.
 
 ## Subcommands
 
@@ -185,6 +212,12 @@ python service_video.py render render_state_20260823_133005.json
 {
   "general": {                            // GUI-only
     "log_path": "console_%Y%m%d_%H%M%S.log" // optional, default shown; "" turns off file logging
+  },
+  "api": {                                // GUI-only, entirely optional; see "Control API" above
+    "enabled": false,                     // optional, default false
+    "host": "127.0.0.1",                  // optional, default shown
+    "port": 8765,                         // optional, default shown
+    "password": ""                        // optional, default "" (no authentication)
   },
   "propresenter": {                       // entirely optional; leave "host" "" to run on manual marking alone
     "host": "192.168.1.50",

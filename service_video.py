@@ -1999,8 +1999,8 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     obs_req_client = obs.ReqClient(
         host=obs_cfg["host"], port=obs_cfg["port"], password=obs_cfg.get("password", "")
     )
-    status = obs_req_client.get_record_status()
-    already_recording = status.output_active
+    record_status = obs_req_client.get_record_status()
+    already_recording = record_status.output_active
 
     # ProPresenter is optional: Mark Start/Mark End (the 'manual' events
     # below) can drive the whole state machine by hand, so a service can be
@@ -2174,6 +2174,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                         if pp_stop_event is not None:
                             pp_stop_event.set()
                         print("[watcher] trim status = RUNNING")
+                        sync_state()
                         trim_thread = threading.Thread(
                             target=_trim_worker,
                             args=(events_q, t_begin - t0, t_end - t0, trim_cfg, record_dir, recording_stopped_event, lambda: final_output_path),
@@ -2189,6 +2190,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                         print("[watcher] ignoring stitch — one is already running", file=sys.stderr)
                     else:
                         print("[watcher] stitch status = RUNNING")
+                        sync_state()
                         stitch_thread = threading.Thread(
                             target=_stitch_worker, args=(events_q, trimmed_path, stitch_cfg), daemon=True,
                         )
@@ -2219,6 +2221,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                     print("[watcher] stitch status = DONE")
                 else:
                     print("[watcher] stitch status = FAILED")
+                sync_state()
     except KeyboardInterrupt:
         sys.exit("\nStopped.")
 
