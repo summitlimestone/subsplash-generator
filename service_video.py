@@ -226,7 +226,18 @@ def probe(path: str) -> dict:
     clean rational like "30/1"), read from the container's stream info
     rather than computed from potentially-imprecise per-frame timestamps,
     so it isn't vulnerable to this class of problem even if some other,
-    not-yet-found timestamp issue crops up here again later."""
+    not-yet-found timestamp issue crops up here again later.
+
+    duration comes back None (rather than raising) if ffprobe's own output
+    doesn't have one, confirmed by direct testing to genuinely happen for
+    an MKV OBS still has open for writing (its Segment/Cues aren't
+    finalized yet, so ffprobe can't report an overall duration without a
+    full decode) — exactly the file _fast_copy_trim() probes when Live
+    Trim runs before recording stops, its whole point. That caller never
+    reads this field, so leave it to whichever caller actually needs a
+    real duration (e.g. stitch(), always against already-finalized clips)
+    to fail with a clear error against a None instead of every probe() call
+    hard-crashing here regardless of whether its caller needed the value."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -242,7 +253,8 @@ def probe(path: str) -> dict:
         sys.exit(f"ffprobe failed on {path!r}:\n{result.stderr}")
 
     data = json.loads(result.stdout)
-    duration = float(data["format"]["duration"])
+    duration_raw = data["format"].get("duration")
+    duration = float(duration_raw) if duration_raw is not None else None
 
     video_stream = next(
         (s for s in data["streams"] if s.get("codec_type") == "video"), None
@@ -294,8 +306,8 @@ def is_image_file(path: str) -> bool:
 
 def probe_image_dimensions(path: str) -> dict:
     """Return width/height for a still image via ffprobe. Separate from
-    probe() because a lone image file typically has no "duration" entry at
-    all in ffprobe's output (probe() would KeyError on it) — a still
+    probe() (which returns None for duration rather than crashing, but
+    still expects a real video stream with a frame rate) because a still
     image's duration is a config choice (see stitch()'s intro_duration/
     outro_duration), not something to read off the file."""
     cmd = [
