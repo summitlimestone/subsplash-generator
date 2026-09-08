@@ -1301,9 +1301,26 @@ class App(tk.Tk):
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
-        stitch_btn = ttk.Button(offline_btn_row, text="Stitch", style="Accent.TButton", command=self._run_stitch)
-        stitch_btn.pack(side="left", padx=(8, 0))
-        self._start_buttons.append(stitch_btn)
+        self.offline_stitch_btn = ttk.Button(
+            offline_btn_row, text="Stitch", style="Accent.TButton", command=self._run_stitch,
+        )
+        self.offline_stitch_btn.pack(side="left", padx=(8, 0))
+        self._start_buttons.append(self.offline_stitch_btn)
+        # Greyed out whenever Main clip is still the untrimmed raw
+        # recording from a loaded render-state file (_offline_use_raw_trim())
+        # — Stitch would just crossfade unedited footage in that case; run
+        # Trim first. Recomputed live off Main clip itself (typed, Browse'd,
+        # or auto-set by a successful Trim — see _handle_offline_trim_line())
+        # rather than only at Load-from-JSON time, so it stays right no
+        # matter how Main clip got to its current value. Doesn't apply
+        # (Stitch stays enabled) once there's no loaded raw state at all —
+        # see _offline_use_raw_trim()'s own docstring.
+        self.vars["st_main"].trace_add("write", self._update_offline_stitch_button)
+        self._update_offline_stitch_button()
+
+    def _update_offline_stitch_button(self, *_args):
+        raw_trim = self._offline_use_raw_trim(self.vars["st_main"].get().strip())
+        self.offline_stitch_btn.configure(state="disabled" if raw_trim else "normal")
 
     def _open_offline_advanced_window(self):
         self.offline_advanced_window.deiconify()
@@ -1414,6 +1431,11 @@ class App(tk.Tk):
                 f"[gui] loaded render fields from {path} (no raw recording info in "
                 "this file — timestamps won't apply; Main clip is treated as already trimmed)"
             )
+        # Covers the one case a plain Main-clip trace can't: _offline_raw_state
+        # itself just changed above without necessarily re-setting Main clip
+        # to a new value (e.g. the "else" branch above when "output" isn't in
+        # trim_cfg) — see _update_offline_stitch_button()/_offline_use_raw_trim().
+        self._update_offline_stitch_button()
 
     def _open_last_state_in_offline_tab(self):
         path = self.render_state_var.get().strip()
