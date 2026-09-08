@@ -108,9 +108,11 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 | `--encoder-preset` | encoder's own default | That encoder's speed/quality preset |
 
 `intro`/`outro` can each be a video or a still image (jpg/png/bmp/tif/
-webp); `main` must be a video. Output paths (here and in
-`trim.output`/`stitch.output`) accept strftime placeholders in the
-filename, e.g. `final_%Y-%m-%d_%H-%M-%S.mp4`.
+webp); `main` must be a video. Output paths (here, `trim.output`/
+`stitch.output`, `trim.state_output`, and the GUI's `general.log_path`)
+accept strftime placeholders anywhere in the path, directories included
+— e.g. `recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory
+that doesn't already exist yet is created automatically.
 
 **Fast copy**: re-encodes only the two crossfade windows and stream-
 copies the untouched middle instead of re-encoding everything, which is
