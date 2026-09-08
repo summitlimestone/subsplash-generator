@@ -14,4 +14,4 @@ jobs:
       - name: Compile check
         run: python -m py_compile service_video.py gui.py
       - name: Ruff
-        uses: astral-sh/ruff-action@v4
+        uses: astral-sh/ruff-action@v4.1.0
