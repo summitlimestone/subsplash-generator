@@ -42,7 +42,8 @@ starter `config.json` next to the script on first run if none exists.
   still in progress) to redo one; this also enables Sermon start/end
   fields so Trim re-trims the raw recording to those exact points before
   a follow-up Stitch. "Export to JSON" builds a render-state file from
-  the fields as-is. "Advanced…" holds CRF/Fast copy/Encoder settings.
+  the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio
+  (and its Target LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
 log path), ProPresenter (connection + slide matching + Learn mode), OBS
@@ -193,6 +194,8 @@ python service_video.py render render_state_20260823_133005.json
     "pad_end_seconds": 0,                 // + = later/more buffer, - = earlier/tighter end
     "crf": 23,
     "fast_copy": true,                    // optional, default true
+    "normalize_audio": true,              // optional, default true; see "Normalize audio" below
+    "normalize_target_lufs": -16.0,       // optional, default -16.0
     "encoder": "nvenc",                   // optional, default "nvenc"
     "encoder_preset": null                // optional, default null (encoder's own default, p4 for nvenc)
   },
@@ -219,3 +222,14 @@ separately from `trim.crf` (the trimmed intermediate clip). The GUI
 exposes one "Fast copy" checkbox (`trim.fast_copy`) and one "Encoder"
 dropdown (sets both `trim.encoder` and `stitch.encoder` together); see
 "Fast copy"/"Encoder" under `stitch` above for what each does.
+
+**Normalize audio** (`trim.normalize_audio`, on by default;
+`trim.normalize_target_lufs`, default `-16.0`): loudness-normalizes the
+trimmed clip's audio via ffmpeg's `loudnorm` filter, since a live
+recording's levels can vary service to service in a way CRF/encoder
+choice has no bearing on. Trim-only: intro/outro and the final stitched
+crossfade are untouched, on the assumption they're already mixed at their
+own intentional level. `-16` LUFS is a common streaming/YouTube target;
+`-23` is the EBU R128 broadcast standard, quieter with more headroom. A
+failed measurement just skips normalization for that render rather than
+failing it outright.

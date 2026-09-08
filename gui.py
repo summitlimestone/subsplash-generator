@@ -82,6 +82,8 @@ def default_config() -> dict:
             "pad_end_seconds": 0.0,
             "crf": 23,
             "fast_copy": True,
+            "normalize_audio": True,
+            "normalize_target_lufs": -16.0,
             "encoder": "nvenc",
             "encoder_preset": None,
         },
@@ -395,6 +397,24 @@ FAST_COPY_HELP = (
     "compatible enough with the trimmed clip's own encoding to stream-copy "
     "the rest, so there's no equivalent toggle for it. It uses a fast x264 "
     "preset instead.)"
+)
+
+NORMALIZE_AUDIO_HELP = (
+    "Loudness-normalizes the trimmed clip's audio to Target LUFS via "
+    "ffmpeg's loudnorm filter — useful since a live recording's levels can "
+    "vary service to service (mic gain, distance from the mic, etc.) in a "
+    "way a fixed CRF/encoder choice has no bearing on. Measures the whole "
+    "trimmed range once, up front, so a fast-copy trim's separately "
+    "re-encoded sliver and tail both get the exact same correction rather "
+    "than risking an audible jump where they join. Video is untouched "
+    "either way; a failed measurement just skips normalization for that "
+    "render rather than failing it outright."
+)
+NORMALIZE_TARGET_HELP = (
+    "Integrated loudness target, in LUFS (lower = quieter). -16 is a "
+    "common streaming/YouTube target and a good match for spoken-word "
+    "content; -23 is the EBU R128 broadcast standard, quieter with more "
+    "headroom."
 )
 
 
@@ -1304,6 +1324,12 @@ class App(tk.Tk):
             self.vars["st_crf"].set(max(0, min(51, round(crf_val))))
         if "fast_copy" in trim_cfg:
             self.vars["st_trim_fast_copy"].set(bool(trim_cfg["fast_copy"]))
+        # Trim-only (no stitch equivalent — see _run_render()), so no
+        # stitch_cfg fallback the way crf/encoder above have.
+        if "normalize_audio" in trim_cfg:
+            self.vars["st_normalize_audio"].set(bool(trim_cfg["normalize_audio"]))
+        if "normalize_target_lufs" in trim_cfg:
+            self.vars["st_normalize_target_lufs"].set(str(trim_cfg["normalize_target_lufs"]))
         if "encoder" in stitch_cfg or "encoder" in trim_cfg:
             # Set encoder_preset *after* encoder — see load_config()'s
             # identical comment on why the order matters here.
@@ -1522,6 +1548,8 @@ class App(tk.Tk):
         self.vars["trim_pad_end"].set(str(trim.get("pad_end_seconds", 0)))
         self.vars["trim_crf"].set(max(0, min(51, round(trim.get("crf", 23)))))
         self.vars["trim_fast_copy"].set(bool(trim.get("fast_copy", True)))
+        self.vars["trim_normalize_audio"].set(bool(trim.get("normalize_audio", True)))
+        self.vars["trim_normalize_target_lufs"].set(str(trim.get("normalize_target_lufs", -16.0)))
         # One shared control for both trim.encoder and stitch.encoder (see
         # collect_config()) — on load, prefer stitch's (what determines
         # the final video's encoder, same as the Offline tab's CRF field
@@ -1624,6 +1652,10 @@ class App(tk.Tk):
                 "pad_end_seconds": to_float(v["trim_pad_end"].get().strip() or "0", "Pad end seconds"),
                 "crf": v["trim_crf"].get(),
                 "fast_copy": bool(v["trim_fast_copy"].get()),
+                "normalize_audio": bool(v["trim_normalize_audio"].get()),
+                "normalize_target_lufs": to_float(
+                    v["trim_normalize_target_lufs"].get().strip() or "-16.0", "Normalize target LUFS"
+                ),
                 "encoder": v["encoder"].get(),
                 "encoder_preset": v["encoder_preset"].get() or None,
             },
@@ -1966,6 +1998,10 @@ class App(tk.Tk):
             )
             crf = self.vars["st_crf"].get()
             trim_fast_copy = bool(self.vars["st_trim_fast_copy"].get())
+            normalize_audio = bool(self.vars["st_normalize_audio"].get())
+            normalize_target_lufs = to_float(
+                self.vars["st_normalize_target_lufs"].get().strip() or "-16.0", "Normalize target LUFS"
+            )
             encoder = self.vars["st_encoder"].get()
             encoder_preset = self.vars["st_encoder_preset"].get() or None
             start_ts = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
@@ -1977,7 +2013,9 @@ class App(tk.Tk):
         return {
             "intro": intro, "main_clip": main_clip, "outro": outro, "output": output,
             "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
-            "crf": crf, "trim_fast_copy": trim_fast_copy, "encoder": encoder, "encoder_preset": encoder_preset,
+            "crf": crf, "trim_fast_copy": trim_fast_copy,
+            "normalize_audio": normalize_audio, "normalize_target_lufs": normalize_target_lufs,
+            "encoder": encoder, "encoder_preset": encoder_preset,
             "start_ts": start_ts, "end_ts": end_ts, "transition": transition,
         }
 
@@ -2003,6 +2041,8 @@ class App(tk.Tk):
                 "pad_end_seconds": 0,
                 "crf": f["crf"],
                 "fast_copy": f["trim_fast_copy"],
+                "normalize_audio": f["normalize_audio"],
+                "normalize_target_lufs": f["normalize_target_lufs"],
                 "encoder": f["encoder"],
                 "encoder_preset": f["encoder_preset"],
             },
@@ -2151,7 +2191,7 @@ class OfflineAdvancedWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.title("Service Video — Advanced Render Settings")
-        self.geometry("420x300")
+        self.geometry("420x380")
         self.configure(bg=PALETTE["bg"])
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
 
@@ -2179,12 +2219,25 @@ class OfflineAdvancedWindow(tk.Toplevel):
                 "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
                 "is then assumed to already be trimmed.", font=app.ui_font)
 
-        encoder_combo = app._labeled_combobox(frame, 3, "Encoder", "st_encoder", ENCODER_CHOICES, width=14, col=0)
+        app.vars["st_normalize_audio"] = tk.BooleanVar(value=True)
+        normalize_cb = ttk.Checkbutton(
+            frame, text="Normalize audio (recommended)", variable=app.vars["st_normalize_audio"],
+        )
+        normalize_cb.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP + " Only applies when re-trimming from a raw "
+                "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
+                "is then assumed to already be trimmed.", font=app.ui_font)
+
+        lufs_entry = app._labeled_entry(frame, 4, "Target LUFS", "st_normalize_target_lufs", width=8, col=0)
+        app.vars["st_normalize_target_lufs"].set("-16.0")
+        Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
+
+        encoder_combo = app._labeled_combobox(frame, 5, "Encoder", "st_encoder", ENCODER_CHOICES, width=14, col=0)
         encoder_combo.configure(state="readonly")
         app.vars["st_encoder"].set("nvenc")
         Tooltip(encoder_combo, ENCODER_HELP, font=app.ui_font)
 
-        preset_combo = app._labeled_combobox(frame, 4, "Encoder preset", "st_encoder_preset", [], width=14, col=0)
+        preset_combo = app._labeled_combobox(frame, 6, "Encoder preset", "st_encoder_preset", [], width=14, col=0)
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("st_encoder", preset_combo, "st_encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
@@ -2415,23 +2468,34 @@ class ConfigWindow(tk.Toplevel):
         fast_trim_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(fast_trim_cb, FAST_COPY_HELP, font=app.ui_font)
 
-        encoder_combo = app._labeled_combobox(frame, 8, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
+        app.vars["trim_normalize_audio"] = tk.BooleanVar(value=True)
+        normalize_cb = ttk.Checkbutton(
+            frame, text="Normalize audio (recommended)", variable=app.vars["trim_normalize_audio"],
+        )
+        normalize_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP, font=app.ui_font)
+
+        lufs_entry = app._labeled_entry(frame, 9, "Target LUFS", "trim_normalize_target_lufs", width=8, col=0)
+        app.vars["trim_normalize_target_lufs"].set("-16.0")
+        Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
+
+        encoder_combo = app._labeled_combobox(frame, 10, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
         encoder_combo.configure(state="readonly")
         app.vars["encoder"].set("nvenc")
         Tooltip(encoder_combo, ENCODER_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
-        preset_combo = app._labeled_combobox(frame, 9, "Encoder preset", "encoder_preset", [], width=14, col=0)
+        preset_combo = app._labeled_combobox(frame, 11, "Encoder preset", "encoder_preset", [], width=14, col=0)
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("encoder", preset_combo, "encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=10, column=0, columnspan=5, sticky="ew", pady=(12, 8)
+            row=12, column=0, columnspan=5, sticky="ew", pady=(12, 8)
         )
         app.vars["stitch_auto"] = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame, text="Auto-stitch after trim", variable=app.vars["stitch_auto"],
-        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
 
 
 if __name__ == "__main__":
