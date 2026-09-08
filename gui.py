@@ -692,8 +692,7 @@ def _build_api_app(app: "App"):
 
     @fastapi_app.get("/brew/coffee", summary="Brew coffee")
     def brew_coffee():
-        """RFC 2324: this server is, in fact, a teapot."""
-        raise HTTPException(status_code=418, detail="I'm a teapot — can't brew coffee")
+        raise HTTPException(status_code=418, detail="I'm a teapot")
 
     return fastapi_app
 
