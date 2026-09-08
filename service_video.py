@@ -104,6 +104,12 @@ def _ffmpeg_output_args() -> list[str]:
 TRIM_FAST_COPY_STEPS = 3
 STITCH_FAST_COPY_STEPS = 4
 FALLBACK_STEPS = 1
+# One more reserved step whenever trim.normalize_audio is on, on top of
+# whichever of the above applies — trim_clip() always measures loudness
+# once (see _measure_loudness()) before choosing a video path, regardless
+# of fast_copy, so this applies unconditionally rather than only on one
+# branch. See _trim_worst_case_steps().
+NORMALIZE_MEASURE_STEPS = 1
 
 # Tracks a running step N/M count across a whole top-level operation —
 # render() (trim_clip() then, if auto-stitch, stitch() too), a single
@@ -136,6 +142,17 @@ def _phase_worst_case_steps(fast_copy_enabled: bool, fast_copy_step_count: int) 
     fast_copy isn't even enabled, just the one fallback step it goes
     straight to."""
     return fast_copy_step_count + FALLBACK_STEPS if fast_copy_enabled else FALLBACK_STEPS
+
+
+def _trim_worst_case_steps(trim_cfg: dict) -> int:
+    """_phase_worst_case_steps() for trim_clip() specifically, plus
+    NORMALIZE_MEASURE_STEPS whenever trim.normalize_audio is on — separate
+    from the generic helper above since this extra step is a trim-only
+    concept stitch() has no equivalent of."""
+    total = _phase_worst_case_steps(trim_cfg.get("fast_copy", True), TRIM_FAST_COPY_STEPS)
+    if trim_cfg.get("normalize_audio", True):
+        total += NORMALIZE_MEASURE_STEPS
+    return total
 
 
 def _reset_steps(total: int = 0):
@@ -177,12 +194,12 @@ def _print_step(duration: float, what: str):
 def _render_step_total(trim_cfg: dict, stitch_cfg: dict) -> int:
     """The upfront step total for a whole render (trim_clip() then, if
     auto-stitch, stitch() too) — see _reset_steps()/
-    _phase_worst_case_steps(). Used by render(), the only place that still
-    runs both phases from one config pair as a single operation — a live
-    watch() run's Trim/Stitch are separate, independently triggered
-    actions (see _trim_worker()/_stitch_worker()), each with its own
-    _phase_worst_case_steps() window instead of sharing this one."""
-    total = _phase_worst_case_steps(trim_cfg.get("fast_copy", True), TRIM_FAST_COPY_STEPS)
+    _phase_worst_case_steps()/_trim_worst_case_steps(). Used by render(),
+    the only place that still runs both phases from one config pair as a
+    single operation — a live watch() run's Trim/Stitch are separate,
+    independently triggered actions (see _trim_worker()/_stitch_worker()),
+    each with its own worst-case window instead of sharing this one."""
+    total = _trim_worst_case_steps(trim_cfg)
     if stitch_cfg.get("auto"):
         total += _phase_worst_case_steps(stitch_cfg.get("fast_copy", False), STITCH_FAST_COPY_STEPS)
     return total
@@ -1309,8 +1326,98 @@ def start_stdin_thread(out_queue: "queue.Queue"):
 # — inaudible/invisible for this pipeline's purposes.
 FAST_COPY_END_TRIM_FRAMES = 1.5
 
+# loudnorm's own defaults for the two knobs this project doesn't expose as
+# separate config — true peak ceiling and loudness range, in that order.
+# Only the integrated-loudness target (trim.normalize_target_lufs) is
+# actually meant to vary per user/platform; these two rarely need tuning
+# alongside it.
+NORMALIZE_TARGET_TP = -2.0
+NORMALIZE_TARGET_LRA = 7.0
 
-def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> str | None:
+
+def _measure_loudness(src: str, start: float, end: float, target_i: float) -> dict | None:
+    """Run loudnorm's first analysis pass over exactly [start, end] of
+    src's audio (video untouched — -vn, so this is cheap regardless of how
+    long the video itself is, or which video path trim_clip() ends up
+    taking) and return the measured stats (input_i/input_tp/input_lra/
+    input_thresh/target_offset) loudnorm's own second pass needs.
+
+    This matters specifically because trim_clip()'s fast-copy path
+    (see _fast_copy_trim()) can encode this same audio range as two
+    separate pieces (a re-encoded sliver and a stream-copied tail, each
+    with their own -c:a aac re-encode) rather than one continuous pass —
+    loudnorm's single-pass ("streaming") mode makes its own gain decision
+    from a limited look-ahead window, which isn't guaranteed to agree
+    between two disjoint chunks of the same program, risking an audible
+    level jump right at the join. Measuring once, up front, over the
+    *whole* trimmed range and feeding the identical measured values into
+    both pieces' second-pass filters (see _loudnorm_filter_arg()) applies
+    one single, fixed, program-consistent correction to each of them
+    instead, the way ffmpeg's own documentation recommends normalizing a
+    program that has to be encoded in more than one pass.
+
+    Returns None (after logging why) if the analysis pass fails or its
+    report can't be parsed, so the caller can skip normalization for this
+    render rather than fail it outright over what's meant to be a quality
+    improvement, not a hard requirement."""
+    cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-ss", f"{start:.3f}", "-i", src, "-t", f"{end - start:.3f}",
+        "-vn", "-af", f"loudnorm=I={target_i}:TP={NORMALIZE_TARGET_TP}:LRA={NORMALIZE_TARGET_LRA}:print_format=json",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    # loudnorm prints its JSON report on stderr partway through (ffmpeg's
+    # own muxing summary and final progress line still follow it, so it's
+    # not simply the last thing printed) mixed in with the rest of
+    # ffmpeg's normal console output — it's the only brace-delimited block
+    # in there, confirmed by direct testing, so the last one found (in
+    # case ffmpeg ever logs another one first) is always it.
+    matches = re.findall(r"\{[^{}]*\}", result.stderr)
+    if not matches:
+        print(
+            "[trim] normalize audio: couldn't find loudnorm's measurement report in ffmpeg's output "
+            "(the analysis pass may have failed) — skipping normalization for this trim",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return json.loads(matches[-1])
+    except json.JSONDecodeError:
+        print(
+            "[trim] normalize audio: loudnorm's measurement report wasn't valid JSON — "
+            "skipping normalization for this trim",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _loudnorm_filter_arg(target_i: float, measured: dict | None) -> str:
+    """Build loudnorm's -af argument. With `measured` (see
+    _measure_loudness()), this is its precise second pass: a fixed gain
+    correction computed from stats measured over the *entire* trimmed
+    range, safe to apply identically to each separately-encoded piece of
+    it (see _measure_loudness()'s docstring for why that consistency
+    matters). Without it (measured is None, e.g. trim.normalize_audio is
+    off), this is a plain single-pass filter — only ever used for
+    trim_clip()'s full re-encode fallback, which is always one continuous
+    pass over the whole range and so has no cross-piece consistency
+    concern to begin with."""
+    if measured is None:
+        return f"loudnorm=I={target_i}:TP={NORMALIZE_TARGET_TP}:LRA={NORMALIZE_TARGET_LRA}"
+    return (
+        f"loudnorm=I={target_i}:TP={NORMALIZE_TARGET_TP}:LRA={NORMALIZE_TARGET_LRA}:"
+        f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+        f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
+        f"offset={measured['target_offset']}:linear=true:print_format=summary"
+    )
+
+
+def _fast_copy_trim(
+    src: str, dst: str, start: float, end: float, crf: int,
+    normalize_audio: bool = False, normalize_target_lufs: float = -16.0,
+    measured_loudness: dict | None = None,
+) -> str | None:
     """trim_clip()'s fast path: re-encode only the sliver from `start` to
     the nearest keyframe at/after it (needed because a decode has to begin
     on a keyframe), then stream-copy the video from that keyframe through
@@ -1318,6 +1425,16 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
     way its start does, only its start, so the entire rest of the clip
     (very likely almost all of it) never gets decoded or re-encoded at
     all. The two pieces are joined with the concat demuxer.
+
+    normalize_audio/normalize_target_lufs/measured_loudness: whether (and
+    to what target) to loudness-normalize the audio in both the sliver's
+    and the tail's own -c:a re-encode (audio is always re-encoded here,
+    even though video is stream-copied for the tail — see trim_clip()'s
+    docstring). `measured_loudness` must be trim_clip()'s own single,
+    upfront measurement over this whole [start, end] range (see
+    _measure_loudness()), not measured separately per piece here — that's
+    what keeps the two pieces' corrections consistent with each other
+    across their join. Ignored entirely when normalize_audio is False.
 
     Returns dst on success. Returns None (after cleaning up any partial
     output) if the fast path isn't usable or safe here, so the caller can
@@ -1352,6 +1469,9 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
 
     fps = info["fps"]
     tail_margin = FAST_COPY_END_TRIM_FRAMES / fps if fps > 0 else 0.0
+    audio_filter_args = (
+        ["-af", _loudnorm_filter_arg(normalize_target_lufs, measured_loudness)] if normalize_audio else []
+    )
 
     # Close enough to already be a keyframe: skip the sliver re-encode
     # entirely and just copy the whole range, no re-encoding at all.
@@ -1360,7 +1480,7 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
         cmd = [
             "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{keyframe_time:.3f}", "-i", src, "-t", f"{tail_duration:.3f}",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", *audio_filter_args,
             "-video_track_timescale", str(CONCAT_TIMESCALE),
             dst,
         ]
@@ -1381,7 +1501,7 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
             "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{start:.3f}", "-i", src, "-t", f"{keyframe_time - start:.3f}",
             "-c:v", codec_info["encoder"], "-crf", str(crf), "-preset", "veryfast", *codec_info["extra"],
-            "-c:a", "aac", "-b:a", "192k",
+            "-c:a", "aac", "-b:a", "192k", *audio_filter_args,
             "-video_track_timescale", str(CONCAT_TIMESCALE),
             str(sliver_path),
         ]
@@ -1397,7 +1517,7 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
         tail_cmd = [
             "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-ss", f"{keyframe_time:.3f}", "-i", src, "-t", f"{tail_duration:.3f}",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", *audio_filter_args,
             "-video_track_timescale", str(CONCAT_TIMESCALE),
             str(tail_path),
         ]
@@ -1426,6 +1546,7 @@ def _fast_copy_trim(src: str, dst: str, start: float, end: float, crf: int) -> s
 def trim_clip(
     src: str, dst: str, start: float, end: float, crf: int = 23,
     fast_copy: bool = True, encoder: str = "nvenc", encoder_preset: str | None = None,
+    normalize_audio: bool = True, normalize_target_lufs: float = -16.0,
 ) -> str:
     """Trim src down to [start, end] and write it to dst. Returns the
     resolved destination path (dst after strftime expansion) — use this,
@@ -1450,24 +1571,52 @@ def trim_clip(
     _encode_with_fallback() for the available names, per-encoder presets,
     and the automatic fallback-to-software behavior if a hardware one
     fails to run. Doesn't apply to fast_copy's own (much smaller) sliver
-    re-encode."""
+    re-encode.
+
+    normalize_audio/normalize_target_lufs (default on/-16.0): loudness-
+    normalize the trimmed clip's audio to `normalize_target_lufs`
+    integrated LUFS via ffmpeg's loudnorm filter — useful since a live
+    recording's levels can vary service to service (mic gain, distance
+    from the mic, etc.) in a way a fixed CRF/encoder choice has no bearing
+    on. Audio only; doesn't touch video. Measured once, here, over the
+    *whole* [start, end] range regardless of which video path ends up
+    being used below (fast_copy on or off) — see _measure_loudness()'s
+    docstring for why that has to happen exactly once, up front, rather
+    than being left to each encode below to work out on its own. A failed
+    measurement (logged, either way) just skips normalization for this
+    render rather than failing it outright."""
     dst = expand_output_path(dst)
 
+    measured_loudness = None
+    if normalize_audio:
+        _print_step(end - start, "measuring loudness")
+        measured_loudness = _measure_loudness(src, start, end, normalize_target_lufs)
+        if measured_loudness is None:
+            normalize_audio = False
+
     if fast_copy:
-        result = _fast_copy_trim(src, dst, start, end, crf)
+        result = _fast_copy_trim(
+            src, dst, start, end, crf,
+            normalize_audio=normalize_audio, normalize_target_lufs=normalize_target_lufs,
+            measured_loudness=measured_loudness,
+        )
         if result is not None:
             return result
         print("[trim] continuing with a full re-encode")
 
     # Frame-accurate trim: -ss/-to placed after -i forces ffmpeg to decode
     # from the start rather than snapping to the nearest keyframe.
+    audio_filter_args = (
+        ["-af", _loudnorm_filter_arg(normalize_target_lufs, measured_loudness)] if normalize_audio else []
+    )
+
     def build_cmd(codec, codec_args):
         return [
             "ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(),
             "-i", src,
             "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
             "-c:v", codec, *codec_args,
-            "-c:a", "aac", "-b:a", "192k",
+            "-c:a", "aac", "-b:a", "192k", *audio_filter_args,
             dst,
         ]
 
@@ -1552,6 +1701,8 @@ def render(state: dict):
         start_offset, end_offset, crf=trim_cfg.get("crf", 23),
         fast_copy=trim_cfg.get("fast_copy", True), encoder=trim_cfg.get("encoder", "nvenc"),
         encoder_preset=trim_cfg.get("encoder_preset"),
+        normalize_audio=trim_cfg.get("normalize_audio", True),
+        normalize_target_lufs=trim_cfg.get("normalize_target_lufs", -16.0),
     )
     print(f"\nTrimmed body clip -> {trimmed_path}")
 
@@ -1663,7 +1814,7 @@ def _trim_worker(
     Reports back over events_q rather than returning anything, since this
     runs in its own background thread — the main watch() loop is what
     updates its own bookkeeping and prints status."""
-    _reset_steps(_phase_worst_case_steps(trim_cfg.get("fast_copy", True), TRIM_FAST_COPY_STEPS))
+    _reset_steps(_trim_worst_case_steps(trim_cfg))
 
     def attempt(recording_path: str) -> str:
         start_offset, end_offset = compute_trim_offsets(
@@ -1674,6 +1825,8 @@ def _trim_worker(
             recording_path, trim_cfg.get("output", "body_trimmed.mp4"), start_offset, end_offset,
             crf=trim_cfg.get("crf", 23), fast_copy=trim_cfg.get("fast_copy", True),
             encoder=trim_cfg.get("encoder", "nvenc"), encoder_preset=trim_cfg.get("encoder_preset"),
+            normalize_audio=trim_cfg.get("normalize_audio", True),
+            normalize_target_lufs=trim_cfg.get("normalize_target_lufs", -16.0),
         )
 
     candidate = get_final_output_path() or (find_active_recording_file(record_dir) if record_dir else None)
