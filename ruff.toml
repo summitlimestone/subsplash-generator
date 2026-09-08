@@ -1,0 +1,6 @@
+# Kept intentionally narrow (pyflakes + basic pycodestyle errors) so CI
+# only catches genuinely broken code (undefined names, unused imports,
+# syntax issues also caught by py_compile) rather than every stylistic
+# opinion in ruff's full default rule set.
+[lint]
+select = ["E4", "E7", "E9", "F"]
