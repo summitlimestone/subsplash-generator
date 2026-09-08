@@ -22,6 +22,18 @@ is an optional desktop GUI over the same four subcommands.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
 
+### Windows: prebuilt executables
+
+No Python or ffmpeg install needed. Push a tag like `v1.2.0` and the
+`Windows Release` GitHub Actions workflow builds a zip and attaches it to
+a matching GitHub Release — see the repo's Releases page. It contains
+`SubsplashGenerator.exe` (the GUI), `service_video.exe` (the CLI), and
+`ffmpeg.exe`/`ffprobe.exe`; unzip anywhere and double-click
+`SubsplashGenerator.exe`, or run `service_video.exe` the same way the
+Subcommands below describe `python service_video.py`. See
+`packaging/build.py` to build the same thing locally on a Windows
+machine, without waiting on a tag/CI.
+
 ## GUI
 
 ```

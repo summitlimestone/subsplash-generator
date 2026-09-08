@@ -35,6 +35,7 @@ tk` / `sudo apt install python3-tk`).
 
 import ast
 import json
+import os
 import queue
 import re
 import secrets
@@ -48,9 +49,33 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+from _version import VERSION
+
+FROZEN = getattr(sys, "frozen", False)
+# A PyInstaller build's sys.executable is this GUI's own .exe, not a Python
+# interpreter — SCRIPT_DIR has to follow it there, and service_video.py
+# ships as its own separately-built service_video.exe next to it (see
+# service_command() below and packaging/build.py).
+SCRIPT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SERVICE_SCRIPT = SCRIPT_DIR / "service_video.py"
+SERVICE_EXE = SCRIPT_DIR / "service_video.exe"
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
+
+if FROZEN:
+    # ffmpeg.exe/ffprobe.exe/service_video.exe ship alongside this .exe
+    # instead of being installed on the system PATH — service_video.py's
+    # shutil.which("ffmpeg") lookups (and the service_command() launch
+    # below) rely on that being findable.
+    os.environ["PATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PATH", "")
+
+
+def service_command(args: list[str]) -> list[str]:
+    """The argv used to launch service_video.py/.exe with the given
+    subcommand args. Frozen builds run the separately-packaged
+    service_video.exe directly rather than 'python service_video.py'."""
+    if FROZEN:
+        return [str(SERVICE_EXE), *args]
+    return [sys.executable, "-u", str(SERVICE_SCRIPT), *args]
 
 
 def default_config() -> dict:
@@ -527,10 +552,14 @@ class ProcessRunner:
         # status instead of logging it (see App._handle_progress_line()).
         if args and args[0] in ("watch", "render", "stitch"):
             args = [*args, "--machine-progress"]
-        cmd = [sys.executable, "-u", str(SERVICE_SCRIPT), *args]
+        cmd = service_command(args)
+        # PYTHONUNBUFFERED covers the frozen service_video.exe case, where
+        # there's no python.exe front-end to hand the -u flag to; it's
+        # redundant with -u above in dev mode but harmless there.
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, env=env,
         )
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -700,7 +729,7 @@ def _build_api_app(app: "App"):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Service Video — Control Panel")
+        self.title(f"Service Video — Control Panel ({VERSION})" if VERSION != "dev" else "Service Video — Control Panel")
         self.geometry("820x680")
         self.minsize(640, 520)
 
@@ -2066,7 +2095,7 @@ class App(tk.Tk):
         self._set_busy(True, command_name)
         self._reset_progress()
         self._run_started_at = time.monotonic()
-        self._log(f"[gui] running: {' '.join([sys.executable, '-u', str(SERVICE_SCRIPT), *args])}")
+        self._log(f"[gui] running: {' '.join(service_command(args))}")
         try:
             self.runner.start(args)
         except RuntimeError as e:

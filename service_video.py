@@ -51,6 +51,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import queue
 import re
 import shutil
@@ -61,6 +62,17 @@ import time
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
+
+if getattr(sys, "frozen", False):
+    # A PyInstaller build of this script (service_video.exe, shipped
+    # alongside the GUI's own .exe — see packaging/build.py) has no
+    # system-wide install step, so ffmpeg.exe/ffprobe.exe travel with it
+    # in the same folder instead of living on PATH. Prepend that folder so
+    # the shutil.which()/bare "ffmpeg" calls below find them. When this
+    # script is instead launched as a subprocess by gui.py, gui.py has
+    # already done the equivalent for its own process, which this
+    # subprocess inherits — this covers running service_video.exe directly.
+    os.environ["PATH"] = str(Path(sys.executable).resolve().parent) + os.pathsep + os.environ.get("PATH", "")
 
 # obsws_python and websockets are only needed for 'watch'/'learn' (they talk
 # to OBS and ProPresenter); imported lazily inside those code paths so
