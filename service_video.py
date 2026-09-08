@@ -53,7 +53,6 @@ import json
 import math
 import queue
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -1951,129 +1950,6 @@ def _get_record_dir(obs_req_client) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# Optional control API — mark sermon start/end and check watch()'s state
-# over HTTP, for a phone or a separate control surface rather than only
-# this app's own GUI/terminal. Off by default (api.enabled); both fastapi
-# and uvicorn are only ever imported inside start_api_thread() (never at
-# module load time), so nothing else in this file needs them installed.
-# --------------------------------------------------------------------------
-
-def _build_api_app(events_q: "queue.Queue", shared_status: dict, status_lock: threading.Lock, password: str):
-    """Builds the FastAPI app backing the control API: POST /mark/start,
-    POST /mark/end (both just enqueue the same manual mark_begin/mark_end
-    event start_stdin_thread() already feeds watch() from an operator's
-    keystrokes or the GUI's own buttons — so every bit of the existing
-    "only accepted in the right state"/re-marking logic in watch() applies
-    for free, nothing new to get right there), and GET /state (a snapshot
-    of `shared_status`, kept current by watch()'s own sync_state()).
-    Interactive Swagger docs are served at /swagger.
-
-    HTTP Basic Auth, gated on `password` alone (no separate username —
-    only a single shared password was asked for, not real user
-    management): every route requires it via the app-level `dependencies`
-    UNLESS `password` is empty, in which case nothing here is protected at
-    all — logged loudly once, since that's a real thing to know about an
-    API with a network listener.
-
-    FastAPI's own auto-generated docs/OpenAPI-schema routes are exempt
-    from app-level `dependencies` (a known FastAPI quirk, confirmed by
-    direct testing — /swagger came back 200 with no credentials even with
-    app-level dependencies set), so both are disabled here
-    (docs_url=None, openapi_url=None) and reimplemented as plain routes
-    of our own below, which aren't exempt."""
-    from fastapi import Depends, FastAPI, HTTPException
-    from fastapi.openapi.docs import get_swagger_ui_html
-    from fastapi.openapi.utils import get_openapi
-    from fastapi.security import HTTPBasic, HTTPBasicCredentials
-
-    security = HTTPBasic()
-
-    def require_password(credentials: HTTPBasicCredentials = Depends(security)):
-        # secrets.compare_digest(), not ==, so a wrong guess can't be
-        # narrowed down by how long the comparison took to fail.
-        if not secrets.compare_digest(credentials.password, password):
-            raise HTTPException(status_code=401, detail="Incorrect password", headers={"WWW-Authenticate": "Basic"})
-
-    if password:
-        app_dependencies = [Depends(require_password)]
-    else:
-        app_dependencies = []
-        print(
-            "[watcher] api.password is empty — the control API is running with NO "
-            "authentication; anyone who can reach it can mark start/end. Set "
-            "api.password (Config > API in the GUI) to require one.",
-            file=sys.stderr,
-        )
-
-    app = FastAPI(
-        title="sclc-subsplash-generator control API",
-        description="Mark the sermon's start/end and check the live watch state.",
-        docs_url=None, openapi_url=None, redoc_url=None,
-        dependencies=app_dependencies,
-    )
-
-    @app.get("/openapi.json", include_in_schema=False)
-    def openapi_schema():
-        return get_openapi(title=app.title, version="1.0.0", description=app.description, routes=app.routes)
-
-    @app.get("/swagger", include_in_schema=False)
-    def swagger_ui():
-        return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} — Swagger UI")
-
-    @app.post("/mark/start", summary="Mark sermon start")
-    def mark_start():
-        """Equivalent to the GUI's "Mark Sermon Start" button (or typing
-        `mark_begin` into `watch`'s stdin) — only actually applied if
-        watch()'s state machine is currently expecting it; check GET
-        /state afterward to see whether it took."""
-        events_q.put(("manual", time.time(), "mark_begin"))
-        return {"status": "queued"}
-
-    @app.post("/mark/end", summary="Mark sermon end")
-    def mark_end():
-        """Equivalent to the GUI's "Mark Sermon End" button (or typing
-        `mark_end` into `watch`'s stdin) — same caveat as /mark/start."""
-        events_q.put(("manual", time.time(), "mark_end"))
-        return {"status": "queued"}
-
-    @app.get("/state", summary="Current watch state")
-    def get_state():
-        """A snapshot of what watch() currently knows: the state-machine
-        state, whether OBS is actively recording, whether begin/end have
-        been marked, the latest Trim/Stitch status
-        (idle/running/done/failed), and the render-state file's path."""
-        with status_lock:
-            return dict(shared_status)
-
-    return app
-
-
-def start_api_thread(api_cfg: dict, events_q: "queue.Queue", shared_status: dict, status_lock: threading.Lock):
-    """Starts the control API (see _build_api_app()) in its own daemon
-    thread for the lifetime of this watch() run — dies with the process,
-    same as the ProPresenter/stdin threads, no explicit shutdown needed.
-    Only called when api.enabled is true; if fastapi/uvicorn aren't
-    installed, logs why and returns rather than failing watch() outright
-    over what's meant to be an optional convenience."""
-    try:
-        import uvicorn
-    except ImportError:
-        print(
-            "[watcher] api.enabled is on, but fastapi/uvicorn aren't installed — "
-            "the control API won't start this run (pip install fastapi uvicorn)",
-            file=sys.stderr,
-        )
-        return
-
-    app = _build_api_app(events_q, shared_status, status_lock, api_cfg.get("password") or "")
-    host = api_cfg.get("host") or "127.0.0.1"
-    port = api_cfg.get("port") or 8765
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
-    print(f"[watcher] control API listening on http://{host}:{port} — Swagger UI: http://{host}:{port}/swagger")
-
-
-# --------------------------------------------------------------------------
 # Live watch (the state machine tying ProPresenter + OBS together)
 # --------------------------------------------------------------------------
 
@@ -2101,19 +1977,12 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     can do — Stitch and any retried Trim work fine offline, see render());
     if recording stops before Trim is ever triggered, only OBS disconnects
     at that point — the process stays up so Trim (still a pending action)
-    keeps working, now straight off the finalized file with no OBS needed.
-
-    If api.enabled is set, also starts the optional control API (see
-    start_api_thread()) so mark_begin/mark_end and the current state are
-    reachable over HTTP too, not just via stdin/the GUI — it shares this
-    process's lifetime, so it stops right along with everything else
-    above."""
+    keeps working, now straight off the finalized file with no OBS needed."""
     import obsws_python as obs
 
     obs_cfg = cfg["obs"]
     trim_cfg = cfg.get("trim", {})
     stitch_cfg = cfg.get("stitch", {})
-    api_cfg = cfg.get("api", {})
     state_path = _resolve_state_path(trim_cfg)
 
     events_q: "queue.Queue" = queue.Queue()
@@ -2162,20 +2031,11 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
     trim_thread: threading.Thread | None = None
     stitch_thread: threading.Thread | None = None
     trimmed_path: str | None = None
-    trim_status_str = "idle"
-    stitch_status_str = "idle"
-    # Read by the optional control API's GET /state (see
-    # _build_api_app()/start_api_thread()) — kept in sync with the
-    # render-state file at exactly the same points (see sync_state()
-    # below), guarded by a lock since the API serves requests from
-    # uvicorn's own thread(s), not this one.
-    api_status: dict = {}
-    api_status_lock = threading.Lock()
 
     def sync_state():
-        """Rewrites the render-state file at `state_path`, and refreshes
-        api_status, with whatever's currently known — see watch()'s own
-        docstring for when this is called."""
+        """Rewrites the render-state file at `state_path` with whatever's
+        currently known — see watch()'s own docstring for when this is
+        called."""
         recording_path = final_output_path or (find_active_recording_file(record_dir) if record_dir else None)
         _write_render_state(
             state_path, recording_path,
@@ -2183,16 +2043,6 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
             (t_end - t0) if (t_end is not None and t0 is not None) else None,
             trim_cfg, stitch_cfg,
         )
-        with api_status_lock:
-            api_status.update({
-                "state": state,
-                "recording": t0 is not None and final_output_path is None,
-                "begin_marked": t_begin is not None,
-                "end_marked": t_end is not None,
-                "trim_status": trim_status_str,
-                "stitch_status": stitch_status_str,
-                "render_state_path": str(state_path),
-            })
 
     obs_disconnected = False
 
@@ -2224,9 +2074,6 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
 
     print(f"[watcher] state = {state}")
     sync_state()
-
-    if api_cfg.get("enabled"):
-        start_api_thread(api_cfg, events_q, api_status, api_status_lock)
 
     try:
         while True:
@@ -2327,7 +2174,6 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                         if pp_stop_event is not None:
                             pp_stop_event.set()
                         print("[watcher] trim status = RUNNING")
-                        trim_status_str = "running"
                         sync_state()
                         trim_thread = threading.Thread(
                             target=_trim_worker,
@@ -2344,7 +2190,6 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                         print("[watcher] ignoring stitch — one is already running", file=sys.stderr)
                     else:
                         print("[watcher] stitch status = RUNNING")
-                        stitch_status_str = "running"
                         sync_state()
                         stitch_thread = threading.Thread(
                             target=_stitch_worker, args=(events_q, trimmed_path, stitch_cfg), daemon=True,
@@ -2356,10 +2201,8 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
             elif kind == "trim_result":
                 if payload["succeeded"]:
                     trimmed_path = payload["trimmed_path"]
-                    trim_status_str = "done"
                     print("[watcher] trim status = DONE")
                 else:
-                    trim_status_str = "failed"
                     print("[watcher] trim status = FAILED")
                 # Trim is genuinely resolved now (no retry still pending
                 # either way — see _trim_worker()) — nothing live is left
@@ -2367,9 +2210,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                 # covers succeeding while still recording, which no longer
                 # has to wait for a stop event to matter), and Stitch (or a
                 # retried Trim, if this one failed) works fine offline from
-                # here — see render(). Exit rather than sit idle. sync_state()
-                # covers both the render-state file and the control API's
-                # shared status dict, so this one call is enough for both.
+                # here — see render(). Exit rather than sit idle.
                 disconnect_obs()
                 sync_state()
                 print("[watcher] nothing left to watch for — exiting")
@@ -2377,10 +2218,8 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
 
             elif kind == "stitch_result":
                 if payload["succeeded"]:
-                    stitch_status_str = "done"
                     print("[watcher] stitch status = DONE")
                 else:
-                    stitch_status_str = "failed"
                     print("[watcher] stitch status = FAILED")
                 sync_state()
     except KeyboardInterrupt:

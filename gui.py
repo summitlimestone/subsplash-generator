@@ -37,6 +37,7 @@ import ast
 import json
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -558,6 +559,140 @@ class ProcessRunner:
                 pass
 
 
+def _build_api_app(app: "App"):
+    """Builds the FastAPI app backing the control API — see App's own
+    _start_api()/_stop_api()/_sync_api_to_config(). Runs all the time
+    the "Enabled" checkbox (Config > API) is on, independent of any one
+    `watch` subprocess: POST /mark/start, POST /mark/end, and GET /state
+    proxy to whichever `watch` subprocess (if any) is currently running,
+    the same way the GUI's own Mark Sermon Start/End buttons already do.
+    Interactive Swagger docs are served at /swagger.
+
+    Marks are synchronous: each is validated against the GUI's own live-
+    tracked state (App._live_mark_applicable(), the same conditions that
+    already enable/disable the Mark Sermon Start/End buttons themselves)
+    before being sent, and the HTTP response reflects the real outcome —
+    200 once actually applied, 409 if there's no active watch session or
+    the mark doesn't apply in the current state (e.g. end before start)
+    — rather than always succeeding and leaving the caller to separately
+    poll GET /state to find out.
+
+    HTTP Basic Auth, gated on api_password alone (no separate username —
+    only a single shared password was asked for, not real user
+    management): every route requires it via the app-level
+    `dependencies` UNLESS the password is empty, in which case nothing
+    here is protected at all — logged loudly once, since that's a real
+    thing to know about an API with a network listener.
+
+    FastAPI's own auto-generated docs/OpenAPI-schema routes are exempt
+    from app-level `dependencies` (a known FastAPI quirk, confirmed by
+    direct testing — /swagger came back 200 with no credentials even
+    with app-level dependencies set), so both are disabled here
+    (docs_url=None, openapi_url=None) and reimplemented as plain routes
+    of our own below, which aren't exempt."""
+    from fastapi import Depends, FastAPI, HTTPException
+    from fastapi.openapi.docs import get_swagger_ui_html
+    from fastapi.openapi.utils import get_openapi
+    from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+    password = app.vars["api_password"].get()
+    security = HTTPBasic()
+
+    def require_password(credentials: HTTPBasicCredentials = Depends(security)):
+        # secrets.compare_digest(), not ==, so a wrong guess can't be
+        # narrowed down by how long the comparison took to fail.
+        if not secrets.compare_digest(credentials.password, password):
+            raise HTTPException(status_code=401, detail="Incorrect password", headers={"WWW-Authenticate": "Basic"})
+
+    if password:
+        app_dependencies = [Depends(require_password)]
+    else:
+        app_dependencies = []
+        app._log(
+            "[gui] api_password is empty — the control API is running with NO "
+            "authentication; anyone who can reach it can mark start/end. Set "
+            "Config > API > Password to require one."
+        )
+
+    fastapi_app = FastAPI(
+        title="sclc-subsplash-generator control API",
+        description="Mark the sermon's start/end and check the live watch state.",
+        docs_url=None, openapi_url=None, redoc_url=None,
+        dependencies=app_dependencies,
+    )
+
+    @fastapi_app.get("/openapi.json", include_in_schema=False)
+    def openapi_schema():
+        return get_openapi(
+            title=fastapi_app.title, version="1.0.0", description=fastapi_app.description,
+            routes=fastapi_app.routes,
+        )
+
+    @fastapi_app.get("/swagger", include_in_schema=False)
+    def swagger_ui():
+        return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{fastapi_app.title} — Swagger UI")
+
+    def do_mark(which: str) -> dict:
+        """Runs on Tk's main thread (see App._call_on_main_thread()):
+        decides whether this mark applies right now and, if so, actually
+        sends it — the exact same decision _update_live_buttons() makes
+        for the Mark Sermon Start/End buttons themselves."""
+        if not app.runner.running():
+            return {"ok": False, "reason": "no active watch session"}
+        if not app._live_mark_applicable(which):
+            return {"ok": False, "reason": f"mark not valid in the current state ({app._live_raw_state})"}
+        if which == "start":
+            app._mark_sermon_start()
+        else:
+            app._mark_sermon_end()
+        return {"ok": True}
+
+    def handle_mark(which: str):
+        result = app._call_on_main_thread(lambda: do_mark(which))
+        if result is None:
+            raise HTTPException(status_code=503, detail="could not confirm — try GET /state")
+        if not result["ok"]:
+            raise HTTPException(status_code=409, detail=result["reason"])
+        return {"status": "applied"}
+
+    @fastapi_app.post("/mark/start", summary="Mark sermon start")
+    def mark_start():
+        """Equivalent to clicking the GUI's "Mark Sermon Start" button.
+        200 once actually sent; 409 if there's no active watch session,
+        or a start mark doesn't apply right now (e.g. the state has
+        moved past where a re-mark is accepted)."""
+        return handle_mark("start")
+
+    @fastapi_app.post("/mark/end", summary="Mark sermon end")
+    def mark_end():
+        """Equivalent to clicking the GUI's "Mark Sermon End" button —
+        same semantics as /mark/start, including 409 for marking end
+        before a start has ever been marked."""
+        return handle_mark("end")
+
+    @fastapi_app.get("/state", summary="Current watch state")
+    def get_state():
+        """A snapshot of what the GUI currently knows: the state-machine
+        state ("idle" if no watch run is active), whether OBS is
+        actively recording, whether begin/end have been marked, the
+        latest Trim/Stitch status (idle/running/done/failed), and the
+        render-state file's path."""
+        def snapshot():
+            raw_state = app._live_raw_state
+            return {
+                "state": raw_state or "idle",
+                "recording": raw_state not in (None, "WAIT_RECORD_START", "RECORDING_STOPPED"),
+                "begin_marked": app._live_begin_marked,
+                "end_marked": app._live_end_marked,
+                "trim_status": app._live_trim_status,
+                "stitch_status": app._live_stitch_status,
+                "render_state_path": app.render_state_var.get(),
+            }
+        return app._call_on_main_thread(snapshot) or {}
+
+    return fastapi_app
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -580,6 +715,12 @@ class App(tk.Tk):
         # whether the most recent "state = ..." line implies it, since
         # neither should ever become un-true again mid-run once set.
         # Reset at the start of each watch run (_run_watch()).
+        # _live_begin_marked follows the same "true at any point this
+        # run" tracking, for GET /state's begin_marked (see
+        # _build_api_app()) — Mark Start itself has no separate re-mark
+        # state to track like Mark End's WAIT_RECORD_STOP does, so this
+        # is simpler: true once past WAIT_BEGIN_SLIDE.
+        self._live_begin_marked = False
         self._live_end_marked = False
         self._live_trimmed = False
         # Set once this run's live Trim has genuinely resolved (DONE or
@@ -602,6 +743,26 @@ class App(tk.Tk):
         # the Live buttons for this one, the same way _handle_trim_stitch_status()
         # did while watch() itself was still running.
         self._live_handoff_which: str | None = None
+        # The most recently parsed live "state = ..." value (see
+        # _update_live_buttons(), which sets this) — None whenever no
+        # watch run is currently tracking anything (before Start Watch,
+        # or after it's exited/stopped either way). This is the one
+        # source of truth _live_mark_applicable() and the control API's
+        # GET /state read, instead of each re-deriving it.
+        self._live_raw_state: str | None = None
+        # "idle"/"running"/"done"/"failed" — set at the same points
+        # _handle_trim_stitch_status() (while watch() runs) or
+        # _on_process_exit()'s post-exit handoff (once it's exited)
+        # already update the Live buttons/status label, so GET /state has
+        # a real value to report instead of a fourth copy of that logic.
+        self._live_trim_status = "idle"
+        self._live_stitch_status = "idle"
+        # The running control API, if Config > API's "Enabled" is
+        # checked — see _start_api()/_stop_api(). Independent of any
+        # watch run's own lifetime; starts/stops with the checkbox
+        # itself (or the GUI's own open/close), not with Start Watch/Stop.
+        self._api_server = None
+        self._api_thread: threading.Thread | None = None
         # See _handle_progress_line(): whether the most recently parsed
         # line was a "[progress] step N/M" marker (or a progress field
         # following one) — while true, key=value lines get swallowed
@@ -659,6 +820,12 @@ class App(tk.Tk):
         # of whether the user has ever opened it via the Offline tab's
         # "Advanced…" button.
         self.offline_advanced_window = OfflineAdvancedWindow(self)
+
+        # Registered before load_config() below so loading a saved
+        # api.enabled: true actually starts it — trace_add("write", ...)
+        # fires on every .set(), including a programmatic one from
+        # load_config(), not just the user clicking the checkbox by hand.
+        self.vars["api_enabled"].trace_add("write", lambda *_args: self._sync_api_to_config())
 
         if not DEFAULT_CONFIG_PATH.is_file():
             DEFAULT_CONFIG_PATH.write_text(json.dumps(default_config(), indent=2))
@@ -1567,6 +1734,86 @@ class App(tk.Tk):
             self._log(f"[gui] couldn't open log file {expanded}: {e}")
 
     # ------------------------------------------------------------------
+    # Control API — hosted here in the GUI itself (see _build_api_app()),
+    # not inside a `watch` subprocess: it needs to run all the time, not
+    # just while one happens to be active, so it starts/stops with
+    # Config > API's "Enabled" checkbox instead (see the trace_add() in
+    # __init__) and proxies Mark Sermon Start/End to whichever `watch`
+    # subprocess (if any) is currently running the same way its own
+    # buttons already do — see _mark_sermon_start()/_mark_sermon_end().
+    # ------------------------------------------------------------------
+
+    def _sync_api_to_config(self):
+        """Starts, stops, or restarts the control API so it matches
+        Config > API's current fields — called by api_enabled's own
+        trace (so ticking/unticking the checkbox takes effect
+        immediately) and after every config save/autosave (so an edited
+        host/port/password takes effect without needing an explicit
+        untick-retick)."""
+        if self.vars["api_enabled"].get():
+            self._stop_api()  # restart-in-place if already running, picking up new host/port/password
+            self._start_api()
+        else:
+            self._stop_api()
+
+    def _start_api(self):
+        try:
+            import uvicorn
+        except ImportError:
+            self._log(
+                "[gui] Config > API is enabled, but fastapi/uvicorn aren't installed — "
+                "the control API won't start (pip install fastapi uvicorn)"
+            )
+            return
+        app = _build_api_app(self)
+        host = self.vars["api_host"].get().strip() or "127.0.0.1"
+        port = to_int(self.vars["api_port"].get().strip() or "8765", "API port")
+        self._api_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+        self._api_thread = threading.Thread(target=self._api_server.run, daemon=True)
+        self._api_thread.start()
+        self._log(f"[gui] control API listening on http://{host}:{port} — Swagger UI: http://{host}:{port}/swagger")
+
+    def _stop_api(self):
+        if self._api_server is not None:
+            self._api_server.should_exit = True
+        if self._api_thread is not None:
+            self._api_thread.join(timeout=5)
+        self._api_server = None
+        self._api_thread = None
+
+    def _call_on_main_thread(self, fn):
+        """Runs `fn` (no args) on Tk's own main thread and returns its
+        result — the control API's routes run on uvicorn's own thread(s),
+        and Tk state (StringVars, widgets, ProcessRunner) isn't safe to
+        touch from anywhere else. self.after(0, ...) is the standard safe
+        way to hand work to Tk's event loop from another thread; the
+        Event is just this call waiting for that handoff to actually
+        run (near-instant in practice — Tk's next idle turn — the
+        timeout below is only a safety net, not the expected path)."""
+        result: dict = {}
+        done = threading.Event()
+
+        def run():
+            result["value"] = fn()
+            done.set()
+
+        self.after(0, run)
+        if not done.wait(timeout=5):
+            return None
+        return result.get("value")
+
+    def _live_mark_applicable(self, which: str) -> bool:
+        """Whether Mark Sermon Start (which="start") / Mark Sermon End
+        (which="end") would currently be accepted if clicked right now —
+        the exact conditions _update_live_buttons() already uses to
+        enable those buttons, factored out here so the control API's
+        mark validation (see _build_api_app()) shares this one source of
+        truth instead of a second copy of these state sets."""
+        if which == "start":
+            return self._live_raw_state in ("WAIT_BEGIN_SLIDE", "WAIT_END_SLIDE")
+        return self._live_raw_state in ("WAIT_END_SLIDE", "WAIT_RECORD_STOP")
+
+    # ------------------------------------------------------------------
     # Config load/save (widgets live in the main window's Live tab and in
     # ConfigWindow; this state and the load/save logic live here on App).
     # ------------------------------------------------------------------
@@ -1599,10 +1846,15 @@ class App(tk.Tk):
 
         self.vars["log_path"].set(general.get("log_path", DEFAULT_LOG_PATH))
 
-        self.vars["api_enabled"].set(bool(api.get("enabled", False)))
+        # host/port/password set *before* enabled: enabled has a trace
+        # (see _sync_api_to_config()) that starts/restarts the API using
+        # whatever these three currently hold, so they need to already be
+        # this config's values by the time that fires, not the previous
+        # config's (or a fresh window's defaults).
         self.vars["api_host"].set(api.get("host", "127.0.0.1"))
         self.vars["api_port"].set(str(api.get("port", 8765)))
         self.vars["api_password"].set(api.get("password", ""))
+        self.vars["api_enabled"].set(bool(api.get("enabled", False)))
 
         self.vars["pp_host"].set(pp.get("host", ""))
         self.vars["pp_port"].set(str(pp.get("port", "")))
@@ -1770,6 +2022,7 @@ class App(tk.Tk):
         path = Path(self.config_path_var.get().strip() or str(DEFAULT_CONFIG_PATH))
         path.write_text(json.dumps(cfg, indent=2))
         self._sync_log_file()
+        self._sync_api_to_config()
         self._log(f"[gui] saved config -> {path}")
         messagebox.showinfo("Config saved", f"Saved to {path}")
 
@@ -1786,6 +2039,7 @@ class App(tk.Tk):
         path.write_text(json.dumps(cfg, indent=2))
         self.config_path_var.set(str(path))
         self._sync_log_file()
+        self._sync_api_to_config()
         self._log(f"[gui] saved config -> {path}")
         return True
 
@@ -1937,6 +2191,10 @@ class App(tk.Tk):
                 self.live_stitch_btn.configure(state=str(self.offline_stitch_btn["state"]))
                 self.mark_start_btn.configure(state="disabled")
                 self.mark_end_btn.configure(state="disabled")
+                # No live state machine left to speak of — the control
+                # API's mark validation (_live_mark_applicable()) and
+                # GET /state should both now report "no active session".
+                self._live_raw_state = None
             else:
                 # watch() never got to a resolved live Trim this run (e.g.
                 # Stop was clicked early) — a nonzero exit code here is the
@@ -1958,6 +2216,7 @@ class App(tk.Tk):
                 self.watch_state_var.set({"trim": "Trimmed", "stitch": "Stitched"}[label])
                 self.watch_status_label.configure(foreground=PALETTE["success"])
                 if label == "trim":
+                    self._live_trim_status = "done"
                     # Main clip (and therefore offline_stitch_btn's state)
                     # was already updated as the trim's own output line
                     # streamed in — see _handle_offline_trim_line() — so
@@ -1965,9 +2224,15 @@ class App(tk.Tk):
                     # Live tab's own Stitch button, same as right after the
                     # very first live Trim.
                     self.live_stitch_btn.configure(state=str(self.offline_stitch_btn["state"]))
+                else:
+                    self._live_stitch_status = "done"
             else:
                 self.watch_state_var.set({"trim": "Trim failed", "stitch": "Stitch failed"}[label])
                 self.watch_status_label.configure(foreground=PALETTE["danger"])
+                if label == "trim":
+                    self._live_trim_status = "failed"
+                else:
+                    self._live_stitch_status = "failed"
             btn.configure(state="normal")
             self._live_handoff_which = None
         self._current_command = None
@@ -2035,9 +2300,17 @@ class App(tk.Tk):
         is tracked separately rather than computed fresh from raw_state
         each time, and stays enabled through the new RECORDING_STOPPED
         state and beyond. Stitch's own enablement is independent of
-        raw_state entirely — see _handle_trim_stitch_status()."""
-        start_enabled = raw_state in ("WAIT_BEGIN_SLIDE", "WAIT_END_SLIDE")
-        end_enabled = raw_state in ("WAIT_END_SLIDE", "WAIT_RECORD_STOP")
+        raw_state entirely — see _handle_trim_stitch_status().
+
+        Also the one place _live_raw_state is kept current (None means
+        no watch run is currently tracking anything) — see
+        _live_mark_applicable(), which the control API's mark validation
+        reads instead of a second copy of these state sets."""
+        self._live_raw_state = raw_state
+        start_enabled = self._live_mark_applicable("start")
+        end_enabled = self._live_mark_applicable("end")
+        if raw_state in ("WAIT_END_SLIDE", "WAIT_RECORD_STOP", "RECORDING_STOPPED"):
+            self._live_begin_marked = True
         if raw_state in ("WAIT_RECORD_STOP", "RECORDING_STOPPED"):
             self._live_end_marked = True
         self.mark_start_btn.configure(state="normal" if start_enabled else "disabled")
@@ -2051,7 +2324,15 @@ class App(tk.Tk):
         one-shot terminal action — both stay re-clickable once done (or
         failed), so this never permanently locks anything the way
         _handle_prerender_status() used to; it just reflects whatever
-        most recently happened."""
+        most recently happened.
+
+        Also keeps _live_trim_status/_live_stitch_status current (see
+        __init__) — the control API's GET /state reads those rather than
+        a third copy of this RUNNING/DONE/FAILED tracking."""
+        if which == "trim":
+            self._live_trim_status = status.lower()
+        else:
+            self._live_stitch_status = status.lower()
         btn = self.live_trim_btn if which == "trim" else self.live_stitch_btn
         running_label = {"trim": "Trimming…", "stitch": "Stitching…"}[which]
         done_label = {"trim": "Trimmed", "stitch": "Stitched"}[which]
@@ -2104,6 +2385,7 @@ class App(tk.Tk):
             self._run_trim()
             if self.runner.running():
                 self._live_handoff_which = "trim"
+                self._live_trim_status = "running"
                 self.watch_state_var.set("Trimming…")
                 self.watch_status_label.configure(foreground=PALETTE["info"])
                 self.live_trim_btn.configure(state="disabled")
@@ -2116,6 +2398,7 @@ class App(tk.Tk):
             self._run_stitch()
             if self.runner.running():
                 self._live_handoff_which = "stitch"
+                self._live_stitch_status = "running"
                 self.watch_state_var.set("Stitching…")
                 self.watch_status_label.configure(foreground=PALETTE["info"])
                 self.live_stitch_btn.configure(state="disabled")
@@ -2133,11 +2416,14 @@ class App(tk.Tk):
         args = ["watch", "-c", self.config_path_var.get().strip()]
         if self.watch_debug_var.get():
             args.append("--debug")
+        self._live_begin_marked = False
         self._live_end_marked = False
         self._live_trimmed = False
         self._live_trim_resolved = False
         self._live_trimmed_path = None
         self._live_handoff_which = None
+        self._live_trim_status = "idle"
+        self._live_stitch_status = "idle"
         self.watch_state_var.set("starting…")
         self.watch_status_label.configure(foreground=PALETTE["accent"])
         self._update_live_buttons(None)
@@ -2335,6 +2621,7 @@ class App(tk.Tk):
             ):
                 return
             self.runner.stop()
+        self._stop_api()
         if self._log_file:
             try:
                 self._log_file.close()

@@ -16,9 +16,9 @@ is an optional desktop GUI over the same four subcommands.
 - Python 3.10+.
 - `pip install -r requirements.txt`: only needed for `watch`/`learn`.
   `stitch` and `render` only need ffmpeg. `fastapi`/`uvicorn` (also in
-  there) are only needed for the optional control API (`api.enabled`,
-  see "Control API" below); `watch` runs fine without them installed as
-  long as it stays off.
+  there) are only needed for `gui.py`'s optional control API
+  (Config > API's "Enabled" checkbox; see "Control API" below) — nothing
+  in `service_video.py` itself needs them.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
 
@@ -61,6 +61,30 @@ auto-saves both windows' fields to the config path shown here first.
 moment Trim resolves or recording stops (whichever's first), then exits
 once Trim has actually resolved — nothing live is left to do by then.
 Click Stop or press Ctrl+C to end it early instead, before that point.
+
+**Control API** (Config > API's "Enabled" checkbox): an optional HTTP
+API for marking sermon start/end and checking the current state from
+something other than this app itself — a phone or a separate control
+surface. Runs inside the GUI itself, independent of Start Watch/Stop —
+starts the moment the checkbox is ticked (or the GUI loads a config with
+it already on) and keeps running whether or not a watch session is
+currently active, listening on `api.host`/`api.port` (default
+`127.0.0.1:8765`):
+
+| Method | Path | Does |
+|---|---|---|
+| `POST` | `/mark/start` | Same as clicking Mark Sermon Start |
+| `POST` | `/mark/end` | Same as clicking Mark Sermon End |
+| `GET` | `/state` | State ("idle" if no watch is running), recording/begin/end-marked flags, Trim/Stitch status, render-state path |
+
+Marks are synchronous: `POST` returns 200 once actually applied, or 409
+if there's no active watch session or the mark doesn't apply in the
+current state (e.g. marking end before start). Interactive Swagger docs
+are served at `/swagger`. Secured with HTTP Basic Auth against
+`api.password` (any username accepted, only the password checked, since
+this is a single shared secret, not real user management); leave it
+blank to run with no authentication at all, logged loudly in the console
+pane every time the API starts that way.
 
 ## Subcommands
 
@@ -137,26 +161,6 @@ handoff for you automatically — its Trim/Stitch buttons keep working
 after `watch` exits, now driving the same fields/buttons as its Offline
 tab underneath.
 
-**Control API**: an optional HTTP API (`api.enabled`, off by default) for
-marking sermon start/end and checking `watch`'s state from something
-other than this app itself, a phone or a separate control surface.
-Starts and stops with `watch`, listening on `api.host`/`api.port`
-(default `127.0.0.1:8765`):
-
-| Method | Path | Does |
-|---|---|---|
-| `POST` | `/mark/start` | Same as Mark Sermon Start/`mark_begin` |
-| `POST` | `/mark/end` | Same as Mark Sermon End/`mark_end` |
-| `GET` | `/state` | State, recording/begin/end-marked flags, Trim/Stitch status, render-state path |
-
-`POST` requests are fire-and-forget, same as typing into `watch`'s stdin;
-check `GET /state` afterward to see whether one took. Interactive
-Swagger docs are served at `/swagger`. Secured with HTTP Basic Auth
-against `api.password` (any username accepted, only the password
-checked, since this is a single shared secret, not real user
-management); leave it blank to run with no authentication at all, logged
-loudly every time `watch` starts that way.
-
 ### `learn`: find your begin/end slide UIDs
 
 ```
@@ -209,7 +213,7 @@ python service_video.py render render_state_20260823_133005.json
   "general": {                            // GUI-only
     "log_path": "console_%Y%m%d_%H%M%S.log" // optional, default shown; "" turns off file logging
   },
-  "api": {                                // entirely optional; see "Control API" above
+  "api": {                                // GUI-only, entirely optional; see "Control API" above
     "enabled": false,                     // optional, default false
     "host": "127.0.0.1",                  // optional, default shown
     "port": 8765,                         // optional, default shown
