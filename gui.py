@@ -3057,11 +3057,14 @@ class InteractiveTrimWindow(tk.Toplevel):
         # Square, icon-only (drawn icons, same pixel size in both states, so
         # toggling between them doesn't resize the button) — "Play
         # selection" stays a normal labeled button since it's a distinct
-        # action, not a play/pause toggle.
+        # action, not a play/pause toggle, but shares the same play icon
+        # image (compound="left") rather than a separate "▶" text glyph.
         self._play_icon, self._pause_icon = build_play_pause_icons(TRIM_ICON_SIZE, PALETTE["text"])
         self.play_pause_btn = ttk.Button(btn_row, image=self._play_icon, command=self._toggle_play)
         self.play_pause_btn.pack(side="left")
-        self.play_selection_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
+        self.play_selection_btn = ttk.Button(
+            btn_row, text="Play selection", image=self._play_icon, compound="left", command=self._play_selection,
+        )
         self.play_selection_btn.pack(side="left", padx=(8, 0))
         if not self._audio_ok:
             for btn in (self.play_pause_btn, self.play_selection_btn):
