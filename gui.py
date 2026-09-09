@@ -2840,13 +2840,103 @@ TRIM_HANDLE_W = 10
 TRIM_PREVIEW_W = 480
 TRIM_PREVIEW_H = 270
 TRIM_PLAYER_FPS = 15
-# Plain ASCII, not the "⏸"/"▶" pause/play symbols some fonts render with a
-# visible glyph-box border, clipped at this button's deliberately narrow
-# fixed width (see play_pause_btn's width=2) — these render identically
-# everywhere with no such risk. "▶" (U+25B6) is kept for Play; only the
-# pause glyph was the actual problem.
-TRIM_PLAY_ICON = "▶"
-TRIM_PAUSE_ICON = "||"
+TRIM_ICON_SIZE = 16  # the play/pause button's icon, in pixels
+
+# Font Awesome Free 6.7.2 "play"/"pause" (solid) icon path data — real
+# vector icon shapes, not a font glyph like "▶"/"⏸" (some fonts render
+# that as a boxed/missing-glyph fallback — the bug this replaced) and not
+# something that needs a specific font (a Nerd Font or otherwise)
+# installed to look right. This is a tool other volunteers run, not just
+# one developer's own machine, so it can't depend on that. Rasterized at
+# runtime by ffmpeg's own SVG decoder (see build_svg_icon()) into a small
+# transparent PNG, loaded the exact same way every other frame/thumbnail
+# in this window already is — Tk's own PhotoImage, no Pillow.
+#   Font Awesome Free by @fontawesome - https://fontawesome.com
+#   License - https://fontawesome.com/license/free
+#   (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License)
+#   Copyright 2024 Fonticons, Inc.
+TRIM_PLAY_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512">'
+    '<path fill="{color}" d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80L0 432c0 17.4 9.4 33.4 24.5 41.9'
+    's33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg>'
+)
+TRIM_PAUSE_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512">'
+    '<path fill="{color}" d="M48 64C21.5 64 0 85.5 0 112L0 400c0 26.5 21.5 48 48 48l32 0c26.5 0 48-21.5 48-48'
+    'l0-288c0-26.5-21.5-48-48-48L48 64zm192 0c-26.5 0-48 21.5-48 48l0 288c0 26.5 21.5 48 48 48l32 0c26.5 0 48-21.5'
+    '48-48l0-288c0-26.5-21.5-48-48-48l-32 0z"/></svg>'
+)
+
+
+def build_svg_icon(svg_template: str, color: str, size: int) -> tk.PhotoImage | None:
+    """Rasterizes a small inline SVG into a `size` x `size` transparent PNG
+    via ffmpeg's own SVG decoder (needs a build with librsvg — true of
+    every mainstream build this project already tells you to install, but
+    not guaranteed of every possible one), then loads it as a Tk
+    PhotoImage. Returns None — the caller falls back to
+    build_fallback_play_icon()/build_fallback_pause_icon() — if ffmpeg
+    can't do this for any reason, rather than letting a decorative icon
+    take the whole window down."""
+    svg = svg_template.format(color=color)
+    svg_path = out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False, mode="w", encoding="utf-8") as f:
+            f.write(svg)
+            svg_path = f.name
+        out_path = svg_path[:-4] + ".png"
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", svg_path, "-vf", f"scale={size}:{size}",
+                "-frames:v", "1", "-loglevel", "error", out_path,
+            ],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0 or not Path(out_path).exists():
+            return None
+        return tk.PhotoImage(file=out_path)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        for p in (svg_path, out_path):
+            if p:
+                Path(p).unlink(missing_ok=True)
+
+
+def build_fallback_play_icon(size: int, color: str) -> tk.PhotoImage:
+    """A solid right-pointing triangle, drawn pixel-by-pixel — used only
+    if build_svg_icon() can't rasterize the real Font Awesome icon (see
+    its own docstring). Still font-independent, just less polished."""
+    img = tk.PhotoImage(width=size, height=size)
+    half = size / 2
+    for y in range(size):
+        span = y if y <= half else size - y
+        x_right = min(size, round((span / half) * size)) if half else size
+        if x_right > 0:
+            img.put(color, to=(0, y, x_right, y + 1))
+    return img
+
+
+def build_fallback_pause_icon(size: int, color: str) -> tk.PhotoImage:
+    """Two solid vertical bars — see build_fallback_play_icon()'s docstring."""
+    img = tk.PhotoImage(width=size, height=size)
+    bar_w = max(2, round(size * 0.26))
+    gap = max(2, round(size * 0.22))
+    x0 = (size - (bar_w * 2 + gap)) // 2
+    img.put(color, to=(x0, 0, x0 + bar_w, size))
+    img.put(color, to=(x0 + bar_w + gap, 0, x0 + bar_w + gap + bar_w, size))
+    return img
+
+
+def build_play_pause_icons(size: int, color: str) -> tuple[tk.PhotoImage, tk.PhotoImage]:
+    """The play/pause pair, preferring the real Font Awesome SVGs and
+    falling back to the plain drawn shapes if ffmpeg can't rasterize them
+    (see build_svg_icon()) — always both from the same source, never one
+    of each, so they stay visually consistent with each other."""
+    play = build_svg_icon(TRIM_PLAY_ICON_SVG, color, size)
+    pause = build_svg_icon(TRIM_PAUSE_ICON_SVG, color, size)
+    if play is not None and pause is not None:
+        return play, pause
+    return build_fallback_play_icon(size, color), build_fallback_pause_icon(size, color)
 
 
 class InteractiveTrimWindow(tk.Toplevel):
@@ -2964,10 +3054,12 @@ class InteractiveTrimWindow(tk.Toplevel):
 
         btn_row = ttk.Frame(outer)
         btn_row.pack(side="bottom", fill="x")
-        # Square, icon-only (fixed width so toggling the glyph doesn't
-        # resize the button) — "Play selection" stays a normal labeled
-        # button since it's a distinct action, not a play/pause toggle.
-        self.play_pause_btn = ttk.Button(btn_row, text=TRIM_PLAY_ICON, width=2, command=self._toggle_play)
+        # Square, icon-only (drawn icons, same pixel size in both states, so
+        # toggling between them doesn't resize the button) — "Play
+        # selection" stays a normal labeled button since it's a distinct
+        # action, not a play/pause toggle.
+        self._play_icon, self._pause_icon = build_play_pause_icons(TRIM_ICON_SIZE, PALETTE["text"])
+        self.play_pause_btn = ttk.Button(btn_row, image=self._play_icon, command=self._toggle_play)
         self.play_pause_btn.pack(side="left")
         self.play_selection_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
         self.play_selection_btn.pack(side="left", padx=(8, 0))
@@ -3492,7 +3584,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         if self.duration is None or self.playing:
             return
         self.playing = True
-        self.play_pause_btn.configure(text=TRIM_PAUSE_ICON)
+        self.play_pause_btn.configure(image=self._pause_icon)
         self._play_generation += 1
         gen = self._play_generation
         threading.Thread(
@@ -3503,7 +3595,7 @@ class InteractiveTrimWindow(tk.Toplevel):
 
     def _stop_playback(self):
         self.playing = False
-        self.play_pause_btn.configure(text=TRIM_PLAY_ICON)
+        self.play_pause_btn.configure(image=self._play_icon)
         self._play_generation += 1  # invalidates any in-flight worker/queued frame from this run
         self._kill_playback_procs()
 
