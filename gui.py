@@ -251,11 +251,16 @@ def expand_output_path(path: str) -> str:
     as a subprocess, never imports it) so App._sync_log_file() can expand
     general.log_path itself, the same way every other output-path field
     in this GUI is expanded by service_video.py once it's handed the raw
-    string. Only the filename is expanded, not any directory part of the
-    path — see service_video.py's own copy for the full reasoning."""
-    p = Path(path)
-    name = datetime.now().strftime(p.name).replace("/", "-").replace("\\", "-")
-    return str(p.with_name(name)) if p.name else path
+    string. Expands strftime placeholders anywhere in the path —
+    filename and any directory components — and creates any directory
+    component that doesn't exist yet; see service_video.py's own copy
+    for the full reasoning. Unlike that copy, a failure creating the
+    directory doesn't sys.exit() the whole GUI over a log file — it's
+    left to raise a plain OSError, which _sync_log_file() already
+    catches around its own open() call the same way."""
+    expanded = datetime.now().strftime(path)
+    Path(expanded).parent.mkdir(parents=True, exist_ok=True)
+    return expanded
 
 
 def format_elapsed(seconds: float) -> str:
@@ -1857,11 +1862,11 @@ class App(tk.Tk):
         self._log_path_raw = raw
         if not raw:
             return
-        expanded = expand_output_path(raw)
         try:
+            expanded = expand_output_path(raw)
             self._log_file = open(expanded, "a", encoding="utf-8")
         except OSError as e:
-            self._log(f"[gui] couldn't open log file {expanded}: {e}")
+            self._log(f"[gui] couldn't open log file {raw!r}: {e}")
 
     # ------------------------------------------------------------------
     # Control API — hosted here in the GUI itself (see _build_api_app()),
