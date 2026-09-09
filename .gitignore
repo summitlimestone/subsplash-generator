@@ -11,3 +11,7 @@ console_*.log
 
 __pycache__/
 *.pyc
+
+# Test tooling (tests/, run via pytest — see README's "Tests" section)
+.venv/
+.pytest_cache/

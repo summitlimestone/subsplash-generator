@@ -196,6 +196,29 @@ often `pad_start_seconds`/`pad_end_seconds`) and rerun:
 python service_video.py render render_state_20260823_133005.json
 ```
 
+## Tests
+
+```
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Covers `gui.py`'s ffmpeg-facing logic (accurate seeking — see
+`accurate_seek_input_args()` — checked against actual pixel content, not
+just a returned timestamp) and the Offline tab's "Trim visually…" window
+(load/drag/nudge/Apply/Cancel, and a regression test for a real bug this
+project hit once already: the window growing/shrinking on its own with no
+further input). Generates its own small synthetic test videos with ffmpeg
+on the fly rather than committing binary fixtures — needs `ffmpeg`/
+`ffprobe` on PATH, same as the app itself.
+
+The GUI tests create real Tk windows, so they need a real or virtual X11
+display: `xvfb-run -a pytest tests/` in CI or any other headless
+environment (see `.github/workflows/ci.yml`'s `test` job for the exact
+setup on a bare Ubuntu runner); on a normal desktop, no wrapper is needed.
+`service_video.py` has no test suite of its own yet — CI only compile-
+checks and lints it (see `ci.yml`'s `lint` job).
+
 ## Setup
 
 1. `pip install -r requirements.txt`

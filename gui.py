@@ -3334,6 +3334,18 @@ class InteractiveTrimWindow(tk.Toplevel):
         if w < 32 or h < 32 or (abs(w - self.preview_w) < 4 and abs(h - self.preview_h) < 4):
             return
         self.preview_w, self.preview_h = w, h
+        # Pin the label's own declared size to exactly this, right away —
+        # a Label with no explicit width/height instead takes its size
+        # from whatever image is currently on it (its *content*). Without
+        # pinning, swapping in a freshly-generated frame — even one sized
+        # to match this very Configure event — can still nudge the
+        # label's geometry a hair on its own, firing another Configure,
+        # requesting another frame, forever: the window growing (or
+        # shrinking) on its own with no further input. Pinning here makes
+        # the label's size something only a real Configure event (a user
+        # actually resizing the window) can change, never a side effect
+        # of which image happens to be displayed at the moment.
+        self.preview_label.configure(width=w, height=h)
         if self._preview_resize_job:
             self.after_cancel(self._preview_resize_job)
         self._preview_resize_job = self.after(300, self._apply_preview_resize)

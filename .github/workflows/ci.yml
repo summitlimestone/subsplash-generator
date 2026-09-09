@@ -15,3 +15,24 @@ jobs:
         run: python -m py_compile service_video.py gui.py
       - name: Ruff
         uses: astral-sh/ruff-action@v4.1.0
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      # The system python3 (not actions/setup-python's own separate
+      # build) here, since it's what apt's python3-tk actually links
+      # against — matching how the README tells a real Linux contributor
+      # to set this up themselves.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb python3-tk python3-venv
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+      - name: Run tests
+        run: xvfb-run -a .venv/bin/python3 -m pytest tests/ -v
