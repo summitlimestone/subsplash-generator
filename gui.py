@@ -1561,16 +1561,13 @@ class App(tk.Tk):
         self._labeled_entry(frame, 7, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
         self.vars["st_duration"].set("1.0")
 
-        # CRF/Fast copy/Encoder/Encoder preset live in their own "Advanced"
-        # window (see OfflineAdvancedWindow) rather than inline here —
-        # tuning knobs set once and rarely touched, unlike everything
-        # above, which changes per run.
-        ttk.Button(frame, text="Advanced…", command=self._open_offline_advanced_window).grid(
-            row=8, column=0, sticky="w", pady=(6, 0)
-        )
-
+        # Trim/Stitch left-aligned, Advanced… right-aligned, all one row —
+        # a single full-width frame (columnspan matching row 0's own
+        # wraplength'd label above) with plain pack(side=...) inside it,
+        # rather than grid columns, so the two sides can anchor
+        # independently without needing to know how wide the row is.
         offline_btn_row = ttk.Frame(frame)
-        offline_btn_row.grid(row=9, column=0, sticky="w", pady=(10, 0))
+        offline_btn_row.grid(row=8, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
@@ -1579,6 +1576,11 @@ class App(tk.Tk):
         )
         self.offline_stitch_btn.pack(side="left", padx=(8, 0))
         self._start_buttons.append(self.offline_stitch_btn)
+        # CRF/Fast copy/Encoder/Encoder preset live in their own "Advanced"
+        # window (see OfflineAdvancedWindow) rather than inline here —
+        # tuning knobs set once and rarely touched, unlike everything
+        # above, which changes per run.
+        ttk.Button(offline_btn_row, text="Advanced…", command=self._open_offline_advanced_window).pack(side="right")
         # Greyed out whenever Main clip is still the untrimmed raw
         # recording from a loaded render-state file (_offline_use_raw_trim())
         # — Stitch would just crossfade unedited footage in that case; run
