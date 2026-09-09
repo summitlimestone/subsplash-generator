@@ -21,6 +21,10 @@ is an optional desktop GUI over the same four subcommands.
   in `service_video.py` itself needs them.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
+- `ffplay` (ships with the full ffmpeg suite, separate from `ffmpeg`/
+  `ffprobe` in some minimal installs) is optional — only needed for
+  audio in the Offline tab's "Trim visually…" window's embedded player;
+  video-only playback there still works without it.
 
 ## GUI
 
@@ -47,9 +51,17 @@ starter `config.json` next to the script on first run if none exists.
   and Stitch buttons, or "Load from JSON" a render-state file (even one
   still in progress) to redo one; this also enables Sermon start/end
   fields so Trim re-trims the raw recording to those exact points before
-  a follow-up Stitch. "Export to JSON" builds a render-state file from
-  the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio
-  (and its Target LUFS), and Encoder settings.
+  a follow-up Stitch. "Trim visually…" (next to those fields) sets them
+  by dragging a filmstrip instead of typing timestamps, mobile-photo-app
+  style — drag the two handles for a rough cut, Left/Right nudges the
+  last-touched one for precision (Shift for a finer step). Playback (▶
+  Play, or ▶ Play selection to preview just the trim range) is embedded
+  right in the window with a seekbar, starting at an accurate, frame-
+  exact position rather than the nearest keyframe — video plays inline;
+  audio plays too as long as `ffplay` is on PATH (video-only otherwise).
+  "Export to JSON" builds a render-state file from the fields as-is.
+  "Advanced…" holds CRF, Fast copy, Normalize audio (and its Target
+  LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),
@@ -183,6 +195,29 @@ often `pad_start_seconds`/`pad_end_seconds`) and rerun:
 ```
 python service_video.py render render_state_20260823_133005.json
 ```
+
+## Tests
+
+```
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Covers `gui.py`'s ffmpeg-facing logic (accurate seeking — see
+`accurate_seek_input_args()` — checked against actual pixel content, not
+just a returned timestamp) and the Offline tab's "Trim visually…" window
+(load/drag/nudge/Apply/Cancel, and a regression test for a real bug this
+project hit once already: the window growing/shrinking on its own with no
+further input). Generates its own small synthetic test videos with ffmpeg
+on the fly rather than committing binary fixtures — needs `ffmpeg`/
+`ffprobe` on PATH, same as the app itself.
+
+The GUI tests create real Tk windows, so they need a real or virtual X11
+display: `xvfb-run -a pytest tests/` in CI or any other headless
+environment (see `.github/workflows/ci.yml`'s `test` job for the exact
+setup on a bare Ubuntu runner); on a normal desktop, no wrapper is needed.
+`service_video.py` has no test suite of its own yet — CI only compile-
+checks and lints it (see `ci.yml`'s `lint` job).
 
 ## Setup
 

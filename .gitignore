@@ -7,6 +7,11 @@ render_state_*.json
 body_trimmed.mp4
 final.mp4
 output.mp4
+console_*.log
 
 __pycache__/
 *.pyc
+
+# Test tooling (tests/, run via pytest — see README's "Tests" section)
+.venv/
+.pytest_cache/
