@@ -2977,7 +2977,10 @@ class InteractiveTrimWindow(tk.Toplevel):
 
         btn_row = ttk.Frame(outer)
         btn_row.pack(fill="x")
-        self.play_pause_btn = ttk.Button(btn_row, text="▶ Play", command=self._toggle_play)
+        # Square, icon-only (fixed width so toggling the glyph doesn't
+        # resize the button) — "Play selection" stays a normal labeled
+        # button since it's a distinct action, not a play/pause toggle.
+        self.play_pause_btn = ttk.Button(btn_row, text="▶", width=2, command=self._toggle_play)
         self.play_pause_btn.pack(side="left")
         self.play_selection_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
         self.play_selection_btn.pack(side="left", padx=(8, 0))
@@ -3321,7 +3324,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         if self.duration is None or self.playing:
             return
         self.playing = True
-        self.play_pause_btn.configure(text="⏸ Pause")
+        self.play_pause_btn.configure(text="⏸")
         self._play_generation += 1
         gen = self._play_generation
         threading.Thread(target=self._video_playback_worker, args=(gen, self.playhead), daemon=True).start()
@@ -3330,7 +3333,7 @@ class InteractiveTrimWindow(tk.Toplevel):
 
     def _stop_playback(self):
         self.playing = False
-        self.play_pause_btn.configure(text="▶ Play")
+        self.play_pause_btn.configure(text="▶")
         self._play_generation += 1  # invalidates any in-flight worker/queued frame from this run
         self._kill_playback_procs()
 
