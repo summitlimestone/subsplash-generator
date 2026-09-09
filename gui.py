@@ -311,26 +311,36 @@ def accurate_seek_input_args(path: str, timestamp: float) -> list[str]:
 
 
 def extract_frame_png(
-    path: str, timestamp: float, out_path: Path, width: int, height: int | None = None, accurate: bool = False,
+    path: str, timestamp: float, out_path: Path, width: int, height: int | None = None,
+    accurate: bool = False, letterbox: bool = False,
 ) -> bool:
     """Grabs a single frame at `timestamp` as a PNG — Tk's own PhotoImage
     loads PNG natively (Tk 8.6+), so no Pillow dependency is needed to
     show it.
 
-    With `height` given (filmstrip thumbnails), scales to fill and center-
-    crops to an exact width x height tile so the filmstrip lines up evenly.
-    Without it (the single large preview), just scales to `width` wide,
-    keeping the source aspect ratio.
+    With `height` given and `letterbox=False` (filmstrip thumbnails),
+    scales to fill and center-crops to an exact width x height tile so the
+    filmstrip lines up evenly. With `height` and `letterbox=True` (the
+    large preview, which — unlike a filmstrip tile — shouldn't crop any of
+    the frame away), scales to fit *within* width x height and pads the
+    rest with black, matching the letterbox filter chain the video
+    playback pipe itself uses (see InteractiveTrimWindow._video_playback_worker())
+    so a paused static frame and a playing streamed one line up the same
+    way in the same box. With `height=None`, just scales to `width` wide,
+    keeping the source aspect ratio (unused today, kept for callers that
+    don't care what height they get).
 
     `accurate=False` (filmstrip thumbnails) uses a plain fast/approximate
     seek — fine for a coarse scrubber strip, and much quicker across 16 of
     them. `accurate=True` (the single large preview) uses
     accurate_seek_input_args() instead, since that image is what the
     handle-drag readout implicitly claims is "this exact point"."""
-    vf = (
-        f"scale=-2:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
-        if height else f"scale={width}:-2"
-    )
+    if height and letterbox:
+        vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+    elif height:
+        vf = f"scale=-2:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+    else:
+        vf = f"scale={width}:-2"
     input_args = accurate_seek_input_args(path, timestamp) if accurate else ["-ss", f"{max(timestamp, 0):.3f}", "-i", path]
     try:
         result = subprocess.run(
@@ -2888,6 +2898,20 @@ class InteractiveTrimWindow(tk.Toplevel):
         self._thumb_images: dict[int, tk.PhotoImage] = {}  # keep refs alive
         self._tmpdir = tempfile.mkdtemp(prefix="interactive_trim_")
 
+        # Current preview/filmstrip pixel sizes — start at the module
+        # defaults, track the window from there as it's resized (see
+        # _on_preview_configure()/_on_canvas_configure()). Real ffmpeg-
+        # decoded/extracted media, unlike the rest of the layout, so
+        # resizing them means re-extracting at the new size rather than
+        # anything Tk can do to existing PhotoImages on its own.
+        self.preview_w, self.preview_h = TRIM_PREVIEW_W, TRIM_PREVIEW_H
+        self.strip_w = TRIM_STRIP_W
+        self._preview_resize_job = None
+        self._filmstrip_resize_job = None
+        # Bumped every time filmstrip thumbnails are (re)generated — see
+        # _generate_filmstrip()'s own docstring for why.
+        self._filmstrip_generation = 0
+
         # Playback state.
         self.playing = False
         self._play_generation = 0  # bumped on every start/stop so late frames from a just-stopped run are dropped
@@ -2898,12 +2922,9 @@ class InteractiveTrimWindow(tk.Toplevel):
 
         self._queue: "queue.Queue" = queue.Queue()
         self._build_ui()
-        # The preview/filmstrip stay a fixed pixel size (they're real ffmpeg-
-        # decoded media, not something Tk can rescale on the fly without a
-        # new dependency or re-extracting on every resize event) — but nothing
-        # else about the window needs to be, so let it grow for more
-        # breathing room (widening centers the fixed-size content — pack()'s
-        # own default), just never shrink below what the content needs.
+        # A floor, not a fixed size — resizable (see _build_ui()'s packing:
+        # the preview pane expands, everything else docks to the bottom),
+        # just never shrinks below what the initial layout needs.
         self.update_idletasks()
         self.minsize(self.winfo_reqwidth(), self.winfo_reqheight())
         self.after(50, self._drain_queue)
@@ -2913,70 +2934,18 @@ class InteractiveTrimWindow(tk.Toplevel):
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill="both", expand=True)
 
-        # A solid black placeholder PhotoImage, not a bare Label — a Label's
-        # width/height options are character-based until it actually has an
-        # image assigned, so setting pixel dimensions before the first real
-        # frame arrives would size it completely wrong.
-        self._preview_image = tk.PhotoImage(width=TRIM_PREVIEW_W, height=TRIM_PREVIEW_H)
-        self._preview_image.put("black", to=(0, 0, TRIM_PREVIEW_W, TRIM_PREVIEW_H))
-        self.preview_label = tk.Label(outer, image=self._preview_image, bg="black")
-        self.preview_label.pack(pady=(0, 8))
-
-        # Created before the Scale below, not after — .set(0) on it fires
-        # its command= callback (_on_seekbar_change()) synchronously, which
-        # touches this var, so it has to exist first.
-        self.position_var = tk.StringVar(value=format_timestamp(0))
-
-        self.seekbar = ttk.Scale(outer, from_=0, to=100, orient="horizontal", command=self._on_seekbar_change)
-        self.seekbar.set(0)
-        self.seekbar.state(["disabled"])
-        self.seekbar.pack(fill="x", pady=(0, 4))
-        self.seekbar.bind("<ButtonPress-1>", self._seekbar_press)
-        self.seekbar.bind("<ButtonRelease-1>", self._seekbar_release)
-
-        readout = ttk.Frame(outer)
-        readout.pack(fill="x", pady=(0, 6))
-        self.start_var = tk.StringVar()
-        self.end_var = tk.StringVar()
-        self.selected_var = tk.StringVar()
-        ttk.Label(readout, textvariable=self.position_var, style="Header.TLabel").pack(side="left")
-        ttk.Label(readout, textvariable=self.start_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
-        ttk.Label(readout, textvariable=self.end_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
-        ttk.Label(readout, textvariable=self.selected_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
-
-        self.canvas = tk.Canvas(
-            outer, width=TRIM_STRIP_W, height=TRIM_STRIP_H,
-            bg=PALETTE["bg"], highlightthickness=1, highlightbackground=PALETTE["border"],
-        )
-        self.canvas.pack()
-        self.canvas.create_text(
-            TRIM_STRIP_W // 2, TRIM_STRIP_H // 2, text="Loading filmstrip…",
-            fill=PALETTE["muted"], tags="loading_text",
-        )
-        self.canvas.tag_bind("handle_start", "<ButtonPress-1>", lambda e: self._begin_drag("start"))
-        self.canvas.tag_bind("handle_end", "<ButtonPress-1>", lambda e: self._begin_drag("end"))
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
-        self.canvas.bind("<Left>", lambda e: self._nudge(-1, fine=False))
-        self.canvas.bind("<Right>", lambda e: self._nudge(1, fine=False))
-        self.canvas.bind("<Shift-Left>", lambda e: self._nudge(-1, fine=True))
-        self.canvas.bind("<Shift-Right>", lambda e: self._nudge(1, fine=True))
-        self.canvas.focus_set()
-
-        self.status_var = tk.StringVar(value="Loading…")
-        ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
-
-        ttk.Label(
-            outer,
-            text="Drag the handles to set the trim range. Click a handle, then "
-            "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
-            "adjustment than dragging allows. The exact Sermon start/end "
-            "fields stay editable after Apply too.",
-            style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
-        ).pack(anchor="w", pady=(2, 8))
+        # Everything below is packed side="bottom", in reverse of its
+        # visual top-to-bottom order (each new bottom-packed widget claims
+        # space just above the previous one) — a standard pack() trick so
+        # these all stay docked to the bottom, fixed height, while the
+        # preview pane (packed last, side="top", fill="both", expand=True)
+        # claims whatever space is left above them and actually grows/
+        # shrinks with the window. See _on_preview_configure()/
+        # _on_canvas_configure() for how the preview/filmstrip content
+        # itself keeps up with that, not just the widgets holding it.
 
         btn_row = ttk.Frame(outer)
-        btn_row.pack(fill="x")
+        btn_row.pack(side="bottom", fill="x")
         # Square, icon-only (fixed width so toggling the glyph doesn't
         # resize the button) — "Play selection" stays a normal labeled
         # button since it's a distinct action, not a play/pause toggle.
@@ -2994,6 +2963,74 @@ class InteractiveTrimWindow(tk.Toplevel):
                 )
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side="right")
         ttk.Button(btn_row, text="Apply", style="Accent.TButton", command=self._apply).pack(side="right", padx=(0, 8))
+
+        self.hint_label = ttk.Label(
+            outer,
+            text="Drag the handles to set the trim range. Click a handle, then "
+            "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
+            "adjustment than dragging allows. The exact Sermon start/end "
+            "fields stay editable after Apply too.",
+            style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
+        )
+        self.hint_label.pack(side="bottom", anchor="w", pady=(2, 8))
+
+        self.status_var = tk.StringVar(value="Loading…")
+        ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").pack(
+            side="bottom", anchor="w", pady=(4, 0)
+        )
+
+        self.canvas = tk.Canvas(
+            outer, width=TRIM_STRIP_W, height=TRIM_STRIP_H,
+            bg=PALETTE["bg"], highlightthickness=1, highlightbackground=PALETTE["border"],
+        )
+        self.canvas.pack(side="bottom", fill="x")
+        self.canvas.create_text(
+            TRIM_STRIP_W // 2, TRIM_STRIP_H // 2, text="Loading filmstrip…",
+            fill=PALETTE["muted"], tags="loading_text",
+        )
+        self.canvas.tag_bind("handle_start", "<ButtonPress-1>", lambda e: self._begin_drag("start"))
+        self.canvas.tag_bind("handle_end", "<ButtonPress-1>", lambda e: self._begin_drag("end"))
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<Left>", lambda e: self._nudge(-1, fine=False))
+        self.canvas.bind("<Right>", lambda e: self._nudge(1, fine=False))
+        self.canvas.bind("<Shift-Left>", lambda e: self._nudge(-1, fine=True))
+        self.canvas.bind("<Shift-Right>", lambda e: self._nudge(1, fine=True))
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.focus_set()
+
+        readout = ttk.Frame(outer)
+        readout.pack(side="bottom", fill="x", pady=(0, 6))
+        # Created before the Scale below, not after — .set(0) on it fires
+        # its command= callback (_on_seekbar_change()) synchronously, which
+        # touches this var, so it has to exist first.
+        self.position_var = tk.StringVar(value=format_timestamp(0))
+        self.start_var = tk.StringVar()
+        self.end_var = tk.StringVar()
+        self.selected_var = tk.StringVar()
+        ttk.Label(readout, textvariable=self.position_var, style="Header.TLabel").pack(side="left")
+        ttk.Label(readout, textvariable=self.start_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.end_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.selected_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+
+        self.seekbar = ttk.Scale(outer, from_=0, to=100, orient="horizontal", command=self._on_seekbar_change)
+        self.seekbar.set(0)
+        self.seekbar.state(["disabled"])
+        self.seekbar.pack(side="bottom", fill="x", pady=(0, 4))
+        self.seekbar.bind("<ButtonPress-1>", self._seekbar_press)
+        self.seekbar.bind("<ButtonRelease-1>", self._seekbar_release)
+
+        # The preview pane — packed last so it claims all remaining space
+        # (fill="both", expand=True) above the docked rows built above.
+        # A solid black placeholder PhotoImage, not a bare Label — a Label's
+        # width/height options are character-based until it actually has an
+        # image assigned, so setting pixel dimensions before the first real
+        # frame arrives would size it completely wrong.
+        self._preview_image = tk.PhotoImage(width=self.preview_w, height=self.preview_h)
+        self._preview_image.put("black", to=(0, 0, self.preview_w, self.preview_h))
+        self.preview_label = tk.Label(outer, image=self._preview_image, bg="black")
+        self.preview_label.pack(side="top", fill="both", expand=True, pady=(0, 8))
+        self.preview_label.bind("<Configure>", self._on_preview_configure)
 
     # -- background work --------------------------------------------------
 
@@ -3013,16 +3050,39 @@ class InteractiveTrimWindow(tk.Toplevel):
             self._queue.put(("error", "Could not read this file's duration — is ffprobe on PATH?"))
             return
         self._queue.put(("duration", duration))
-        cell_w = TRIM_STRIP_W // TRIM_THUMBS
+        self._generate_filmstrip(duration)
+
+    def _generate_filmstrip(self, duration: float):
+        """(Re)extracts all TRIM_THUMBS filmstrip thumbnails at the current
+        self.strip_w — used both for the initial load and to regenerate
+        after a resize settles (see _on_canvas_configure()/
+        _regenerate_filmstrip()). Stamps every queued result with the
+        generation current when this call started, so _on_thumb() can drop
+        stale results from a run a newer resize has already superseded —
+        same guarded-background-work pattern as _preview_request_id/
+        _play_generation elsewhere in this class."""
+        self._filmstrip_generation += 1
+        gen = self._filmstrip_generation
+        strip_w = self.strip_w
+        cell_w = max(strip_w // TRIM_THUMBS, 1)
         for i in range(TRIM_THUMBS):
-            if self._closed:
+            if self._closed or gen != self._filmstrip_generation:
                 return
             t = self._seek_time(duration * i / max(TRIM_THUMBS - 1, 1))
-            out = Path(self._tmpdir) / f"thumb_{i}.png"
+            out = Path(self._tmpdir) / f"thumb_{gen}_{i}.png"
             ok = extract_frame_png(self.source_path, t, out, width=cell_w, height=TRIM_STRIP_H)
-            self._queue.put(("thumb", i, str(out) if ok else None))
+            self._queue.put(("thumb", gen, i, strip_w, str(out) if ok else None))
             self._queue.put(("status", f"Loading filmstrip… ({i + 1}/{TRIM_THUMBS})"))
-        self._queue.put(("status", ""))
+        if gen == self._filmstrip_generation:
+            self._queue.put(("status", ""))
+
+    def _regenerate_filmstrip(self):
+        self._filmstrip_resize_job = None
+        if self._closed or self.duration is None:
+            return
+        self.canvas.delete("thumb")
+        self._thumb_images.clear()
+        threading.Thread(target=self._generate_filmstrip, args=(self.duration,), daemon=True).start()
 
     def _request_preview(self, label: str, t: float):
         self._preview_job = None
@@ -3035,7 +3095,9 @@ class InteractiveTrimWindow(tk.Toplevel):
         if self._closed:
             return
         out = Path(self._tmpdir) / f"preview_{req_id}.png"
-        ok = extract_frame_png(self.source_path, t, out, width=TRIM_PREVIEW_W, accurate=True)
+        ok = extract_frame_png(
+            self.source_path, t, out, width=self.preview_w, height=self.preview_h, accurate=True, letterbox=True,
+        )
         self._queue.put(("preview", req_id, str(out) if ok else None))
 
     @staticmethod
@@ -3048,8 +3110,12 @@ class InteractiveTrimWindow(tk.Toplevel):
             buf.extend(chunk)
         return bytes(buf)
 
-    def _video_playback_worker(self, gen: int, start_t: float):
-        w, h = TRIM_PREVIEW_W, TRIM_PREVIEW_H
+    def _video_playback_worker(self, gen: int, start_t: float, w: int, h: int):
+        # w/h are passed in (the preview pane's size at the moment
+        # playback started) rather than read from self.preview_w/h here,
+        # so a resize mid-playback can't change them out from under an
+        # already-running pipe — _apply_preview_resize() instead stops and
+        # restarts playback fresh at the new size.
         frame_bytes = w * h * 3
         # Same letterbox-to-a-fixed-size idea service_video.py's own filter
         # chain uses (scale to fit, pad the rest) — needed here because the
@@ -3124,7 +3190,7 @@ class InteractiveTrimWindow(tk.Toplevel):
                 elif kind == "duration":
                     self._on_duration(msg[1])
                 elif kind == "thumb":
-                    self._on_thumb(msg[1], msg[2])
+                    self._on_thumb(msg[1], msg[2], msg[3], msg[4])
                 elif kind == "preview":
                     self._on_preview(msg[1], msg[2])
                 elif kind == "status":
@@ -3156,7 +3222,13 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.seekbar.set(self.playhead)
         self._request_preview("end", self.end)
 
-    def _on_thumb(self, index: int, path: str | None):
+    def _on_thumb(self, gen: int, index: int, strip_w: int, path: str | None):
+        if gen != self._filmstrip_generation:
+            # A resize superseded this run before it finished — see
+            # _generate_filmstrip()'s docstring.
+            if path:
+                Path(path).unlink(missing_ok=True)
+            return
         if path:
             try:
                 img = tk.PhotoImage(file=path)
@@ -3164,7 +3236,7 @@ class InteractiveTrimWindow(tk.Toplevel):
                 img = None
             if img:
                 self._thumb_images[index] = img
-                x = TRIM_STRIP_W * index // TRIM_THUMBS
+                x = strip_w * index // TRIM_THUMBS
                 self.canvas.create_image(x, 0, image=img, anchor="nw", tags="thumb")
                 self.canvas.tag_raise("shade")
                 self.canvas.tag_raise("handle")
@@ -3208,13 +3280,13 @@ class InteractiveTrimWindow(tk.Toplevel):
     def _time_to_x(self, t: float) -> int:
         if not self.duration:
             return 0
-        return int(TRIM_STRIP_W * t / self.duration)
+        return int(self.strip_w * t / self.duration)
 
     def _x_to_time(self, x: float) -> float:
         if not self.duration:
             return 0.0
-        x = max(0, min(TRIM_STRIP_W, x))
-        return self.duration * x / TRIM_STRIP_W
+        x = max(0, min(self.strip_w, x))
+        return self.duration * x / self.strip_w
 
     def _draw_handles(self):
         self.canvas.delete("shade")
@@ -3227,8 +3299,8 @@ class InteractiveTrimWindow(tk.Toplevel):
         # the same visual language mobile trim UIs use.
         if sx > 0:
             self.canvas.create_rectangle(0, 0, sx, h, fill="black", stipple="gray50", width=0, tags="shade")
-        if ex < TRIM_STRIP_W:
-            self.canvas.create_rectangle(ex, 0, TRIM_STRIP_W, h, fill="black", stipple="gray50", width=0, tags="shade")
+        if ex < self.strip_w:
+            self.canvas.create_rectangle(ex, 0, self.strip_w, h, fill="black", stipple="gray50", width=0, tags="shade")
         hw = TRIM_HANDLE_W
         self.canvas.create_rectangle(
             sx - hw // 2, 0, sx + hw // 2, h, fill=PALETTE["accent"], outline="", tags=("handle", "handle_start"),
@@ -3236,6 +3308,50 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.canvas.create_rectangle(
             ex - hw // 2, 0, ex + hw // 2, h, fill=PALETTE["accent"], outline="", tags=("handle", "handle_end"),
         )
+
+    # -- resize handling ---------------------------------------------------
+    # Both the filmstrip and the preview pane are real ffmpeg-extracted
+    # media, not something Tk can rescale on its own the way it can a
+    # plain widget — so "resize with the window" here means re-extracting
+    # at the new size, not just letting existing pixels stretch. Debounced
+    # (a live window-drag fires many Configure events a second) so this
+    # only actually happens once the user stops dragging, not on every
+    # intermediate pixel.
+
+    def _on_canvas_configure(self, event):
+        new_w = event.width
+        if abs(new_w - self.strip_w) < 4:
+            return
+        self.strip_w = new_w
+        self.hint_label.configure(wraplength=max(new_w, 200))
+        self._draw_handles()  # cheap — instant reposition, doesn't wait on the debounce below
+        if self._filmstrip_resize_job:
+            self.after_cancel(self._filmstrip_resize_job)
+        self._filmstrip_resize_job = self.after(300, self._regenerate_filmstrip)
+
+    def _on_preview_configure(self, event):
+        w, h = event.width, event.height
+        if w < 32 or h < 32 or (abs(w - self.preview_w) < 4 and abs(h - self.preview_h) < 4):
+            return
+        self.preview_w, self.preview_h = w, h
+        if self._preview_resize_job:
+            self.after_cancel(self._preview_resize_job)
+        self._preview_resize_job = self.after(300, self._apply_preview_resize)
+
+    def _apply_preview_resize(self):
+        self._preview_resize_job = None
+        if self._closed:
+            return
+        if self.playing:
+            # Mid-playback resize: the running video pipe was already
+            # handed its frame size as fixed args at start time (see
+            # _video_playback_worker()), so the clean way to pick up a new
+            # size is a fresh start at the same position, not trying to
+            # resize a pipe that's already running.
+            self._stop_playback()
+            self._start_playback()
+        elif self.duration is not None:
+            self._request_preview("resize", self.playhead)
 
     def _update_readout(self):
         self.start_var.set(f"Start  {format_timestamp(self.start)}")
@@ -3327,7 +3443,9 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.play_pause_btn.configure(text="⏸")
         self._play_generation += 1
         gen = self._play_generation
-        threading.Thread(target=self._video_playback_worker, args=(gen, self.playhead), daemon=True).start()
+        threading.Thread(
+            target=self._video_playback_worker, args=(gen, self.playhead, self.preview_w, self.preview_h), daemon=True,
+        ).start()
         if self._audio_ok:
             self._audio_proc = self._start_audio(self.playhead)
 
@@ -3361,9 +3479,11 @@ class InteractiveTrimWindow(tk.Toplevel):
     def _close(self):
         self._closed = True
         self._play_generation += 1
+        self._filmstrip_generation += 1
         self._kill_playback_procs()
-        if self._preview_job:
-            self.after_cancel(self._preview_job)
+        for job in (self._preview_job, self._filmstrip_resize_job, self._preview_resize_job):
+            if job:
+                self.after_cancel(job)
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         self.destroy()
 
