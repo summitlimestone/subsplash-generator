@@ -2840,6 +2840,13 @@ TRIM_HANDLE_W = 10
 TRIM_PREVIEW_W = 480
 TRIM_PREVIEW_H = 270
 TRIM_PLAYER_FPS = 15
+# Plain ASCII, not the "⏸"/"▶" pause/play symbols some fonts render with a
+# visible glyph-box border, clipped at this button's deliberately narrow
+# fixed width (see play_pause_btn's width=2) — these render identically
+# everywhere with no such risk. "▶" (U+25B6) is kept for Play; only the
+# pause glyph was the actual problem.
+TRIM_PLAY_ICON = "▶"
+TRIM_PAUSE_ICON = "||"
 
 
 class InteractiveTrimWindow(tk.Toplevel):
@@ -2960,7 +2967,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         # Square, icon-only (fixed width so toggling the glyph doesn't
         # resize the button) — "Play selection" stays a normal labeled
         # button since it's a distinct action, not a play/pause toggle.
-        self.play_pause_btn = ttk.Button(btn_row, text="▶", width=2, command=self._toggle_play)
+        self.play_pause_btn = ttk.Button(btn_row, text=TRIM_PLAY_ICON, width=2, command=self._toggle_play)
         self.play_pause_btn.pack(side="left")
         self.play_selection_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
         self.play_selection_btn.pack(side="left", padx=(8, 0))
@@ -3485,7 +3492,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         if self.duration is None or self.playing:
             return
         self.playing = True
-        self.play_pause_btn.configure(text="⏸")
+        self.play_pause_btn.configure(text=TRIM_PAUSE_ICON)
         self._play_generation += 1
         gen = self._play_generation
         threading.Thread(
@@ -3496,7 +3503,7 @@ class InteractiveTrimWindow(tk.Toplevel):
 
     def _stop_playback(self):
         self.playing = False
-        self.play_pause_btn.configure(text="▶")
+        self.play_pause_btn.configure(text=TRIM_PLAY_ICON)
         self._play_generation += 1  # invalidates any in-flight worker/queued frame from this run
         self._kill_playback_procs()
 
