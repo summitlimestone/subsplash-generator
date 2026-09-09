@@ -2873,7 +2873,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.source_path = source_path
         self.title(f"Trim visually — {Path(source_path).name}")
         self.configure(bg=PALETTE["bg"])
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         self.duration: float | None = None
@@ -2898,6 +2898,14 @@ class InteractiveTrimWindow(tk.Toplevel):
 
         self._queue: "queue.Queue" = queue.Queue()
         self._build_ui()
+        # The preview/filmstrip stay a fixed pixel size (they're real ffmpeg-
+        # decoded media, not something Tk can rescale on the fly without a
+        # new dependency or re-extracting on every resize event) — but nothing
+        # else about the window needs to be, so let it grow for more
+        # breathing room (widening centers the fixed-size content — pack()'s
+        # own default), just never shrink below what the content needs.
+        self.update_idletasks()
+        self.minsize(self.winfo_reqwidth(), self.winfo_reqheight())
         self.after(50, self._drain_queue)
         threading.Thread(target=self._load_worker, daemon=True).start()
 
