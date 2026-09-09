@@ -289,25 +289,53 @@ def probe_duration(path: str) -> float | None:
         return None
 
 
-def extract_frame_png(path: str, timestamp: float, out_path: Path, width: int, height: int | None = None) -> bool:
+def accurate_seek_input_args(path: str, timestamp: float) -> list[str]:
+    """ffmpeg input args that seek to `timestamp` both fast and frame-
+    accurately — ffmpeg's own documented "fast + accurate seeking" recipe.
+    A single -ss before -i is a fast demuxer-level seek that only lands
+    at or near the nearest keyframe *before* the target, which is fine
+    for a filmstrip thumbnail but not for something claiming to start
+    "at the right time" (playback, or a precise single-frame preview): a
+    keyframe interval of a few seconds means being off by up to that much.
+
+    Splitting it into a coarse -ss before -i (fast, jumps to just shy of
+    the target) plus a small residual -ss right after -i (which then
+    decodes and discards only that short remaining gap to reach the exact
+    frame) gets both — the "discard" phase stays bounded to a couple of
+    seconds no matter how far into a two-hour recording the target is,
+    unlike putting the whole seek after -i, which would decode from the
+    very start of the file instead."""
+    timestamp = max(timestamp, 0.0)
+    margin = min(timestamp, 5.0)
+    return ["-ss", f"{timestamp - margin:.3f}", "-i", path, "-ss", f"{margin:.3f}"]
+
+
+def extract_frame_png(
+    path: str, timestamp: float, out_path: Path, width: int, height: int | None = None, accurate: bool = False,
+) -> bool:
     """Grabs a single frame at `timestamp` as a PNG — Tk's own PhotoImage
     loads PNG natively (Tk 8.6+), so no Pillow dependency is needed to
-    show it. -ss before -i is a fast, approximate keyframe seek rather
-    than a frame-accurate one, which is fine for a scrubber thumbnail/
-    preview — nothing here is what actually gets trimmed.
+    show it.
 
     With `height` given (filmstrip thumbnails), scales to fill and center-
     crops to an exact width x height tile so the filmstrip lines up evenly.
     Without it (the single large preview), just scales to `width` wide,
-    keeping the source aspect ratio."""
+    keeping the source aspect ratio.
+
+    `accurate=False` (filmstrip thumbnails) uses a plain fast/approximate
+    seek — fine for a coarse scrubber strip, and much quicker across 16 of
+    them. `accurate=True` (the single large preview) uses
+    accurate_seek_input_args() instead, since that image is what the
+    handle-drag readout implicitly claims is "this exact point"."""
     vf = (
         f"scale=-2:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
         if height else f"scale={width}:-2"
     )
+    input_args = accurate_seek_input_args(path, timestamp) if accurate else ["-ss", f"{max(timestamp, 0):.3f}", "-i", path]
     try:
         result = subprocess.run(
             [
-                "ffmpeg", "-y", "-ss", f"{max(timestamp, 0):.3f}", "-i", path,
+                "ffmpeg", "-y", *input_args,
                 "-frames:v", "1", "-vf", vf, "-loglevel", "error", str(out_path),
             ],
             capture_output=True, timeout=20,
@@ -2780,21 +2808,24 @@ class OfflineAdvancedWindow(tk.Toplevel):
 
 
 # InteractiveTrimWindow layout constants — a fixed-size filmstrip made of
-# this many square-ish tiles, plus the large single-frame preview above it.
+# this many square-ish tiles, plus the large preview above it (used both
+# for a single scrubbed frame and for streamed playback).
 TRIM_THUMBS = 16
 TRIM_STRIP_W = 720
 TRIM_STRIP_H = 60
 TRIM_HANDLE_W = 10
 TRIM_PREVIEW_W = 480
 TRIM_PREVIEW_H = 270
+TRIM_PLAYER_FPS = 15
 
 
 class InteractiveTrimWindow(tk.Toplevel):
     """A mobile-photo-app-style visual trimmer for the Offline tab's Sermon
     start/Sermon end fields — a filmstrip of thumbnails spanning Main
     clip's full length, with two draggable handles marking the selected
-    range, a live single-frame preview of whichever handle last moved, and
-    an optional real-playback preview of the selection via ffplay.
+    range, a seekbar with real embedded video playback (in this window,
+    not a separate player window) plus audio, and a live single-frame
+    preview of whichever handle last moved while paused.
 
     A fresh instance every time (see App._open_interactive_trim()), unlike
     OfflineAdvancedWindow/ConfigWindow's build-once-and-withdraw pattern —
@@ -2802,18 +2833,37 @@ class InteractiveTrimWindow(tk.Toplevel):
     there's nothing worth keeping alive between opens.
 
     All the actual frame-grabbing (ffprobe for duration, ffmpeg for
-    thumbnails/preview frames) happens in background threads and is handed
-    back via a queue drained on a Tk after() loop, the same cross-thread-
-    to-Tk pattern App itself uses for streaming a subprocess's output (see
-    App._drain_queue()) — necessary because Tk widgets can only safely be
-    touched from the main thread, and generating ~16 thumbnails plus every
-    preview frame while dragging would otherwise freeze the window.
+    thumbnails/preview frames/playback) happens in background threads and
+    is handed back via a queue drained on a Tk after() loop, the same
+    cross-thread-to-Tk pattern App itself uses for streaming a subprocess's
+    output (see App._drain_queue()) — necessary because Tk widgets can
+    only safely be touched from the main thread.
 
-    Deliberately coarse — dragging picks an approximate point on a strip
-    that might span a two-hour service, not a specific frame. Left/Right
-    (Shift for a finer step) nudges the last-touched handle for precision,
-    and the exact Sermon start/end text fields on the Offline tab stay
-    editable after Apply for anything finer than that."""
+    Video is a hand-rolled embedded player: an ffmpeg process pipes raw
+    frames (rawvideo/rgb24) from the source/position, read in their own
+    thread and paced against wall-clock so it doesn't just blast frames
+    onto the canvas as fast as ffmpeg can decode them. Audio is
+    deliberately NOT the same trick — it's an invisible `ffplay -nodisp`
+    subprocess instead (see _start_audio()) rather than raw PCM piped into
+    a Python audio library (sounddevice/PortAudio) from a thread in this
+    same process: an earlier version did exactly that, and it reliably
+    segfaulted the whole app a few seconds into playback whenever the
+    video pipe was also running — a native crash no amount of Python-level
+    try/except can catch, since it doesn't happen in Python at all. A
+    subprocess crashing just means silent playback; it can't take the
+    rest of the app down. The trade-off: video and audio aren't frame-
+    locked to each other, just both started at the same position and each
+    paced against real time on its own, which is close enough for a short
+    preview clip (this is a trim tool, not a video editor).
+
+    The filmstrip's own thumbnails stay deliberately coarse/approximate
+    (fine for a scrubber strip spanning a two-hour service, and much
+    faster to generate 16 of) — but *playback* start position and the
+    single large preview frame both use accurate_seek_input_args() so
+    "starts at the right time" is actually true, not just approximately
+    so. Left/Right (Shift for a finer step) nudges the last-touched trim
+    handle for precision beyond dragging; the exact Sermon start/end text
+    fields on the Offline tab stay editable after Apply too."""
 
     def __init__(self, app: App, source_path: str, start_seconds: float, end_seconds: float):
         super().__init__(app)
@@ -2828,13 +2878,21 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.start = max(0.0, start_seconds)
         self.end = max(0.0, end_seconds)
         self.active_handle = "end"  # which handle Left/Right/preview follows
+        self.playhead = self.end  # seekbar/playback position, independent of the trim handles
         self._drag: str | None = None
         self._closed = False
         self._preview_job = None
         self._preview_request_id = 0
         self._thumb_images: dict[int, tk.PhotoImage] = {}  # keep refs alive
         self._tmpdir = tempfile.mkdtemp(prefix="interactive_trim_")
-        self._ffplay_proc: subprocess.Popen | None = None
+
+        # Playback state.
+        self.playing = False
+        self._play_generation = 0  # bumped on every start/stop so late frames from a just-stopped run are dropped
+        self._play_stop_at: float | None = None  # set by "Play selection" to auto-pause at the trim end
+        self._video_proc: subprocess.Popen | None = None
+        self._audio_proc: subprocess.Popen | None = None  # an invisible `ffplay -nodisp`, see _start_playback()
+        self._audio_ok = shutil.which("ffplay") is not None
 
         self._queue: "queue.Queue" = queue.Queue()
         self._build_ui()
@@ -2854,13 +2912,26 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.preview_label = tk.Label(outer, image=self._preview_image, bg="black")
         self.preview_label.pack(pady=(0, 8))
 
+        # Created before the Scale below, not after — .set(0) on it fires
+        # its command= callback (_on_seekbar_change()) synchronously, which
+        # touches this var, so it has to exist first.
+        self.position_var = tk.StringVar(value=format_timestamp(0))
+
+        self.seekbar = ttk.Scale(outer, from_=0, to=100, orient="horizontal", command=self._on_seekbar_change)
+        self.seekbar.set(0)
+        self.seekbar.state(["disabled"])
+        self.seekbar.pack(fill="x", pady=(0, 4))
+        self.seekbar.bind("<ButtonPress-1>", self._seekbar_press)
+        self.seekbar.bind("<ButtonRelease-1>", self._seekbar_release)
+
         readout = ttk.Frame(outer)
         readout.pack(fill="x", pady=(0, 6))
         self.start_var = tk.StringVar()
         self.end_var = tk.StringVar()
         self.selected_var = tk.StringVar()
-        ttk.Label(readout, textvariable=self.start_var, style="Header.TLabel").pack(side="left")
-        ttk.Label(readout, textvariable=self.end_var, style="Header.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.position_var, style="Header.TLabel").pack(side="left")
+        ttk.Label(readout, textvariable=self.start_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.end_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
         ttk.Label(readout, textvariable=self.selected_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
 
         self.canvas = tk.Canvas(
@@ -2889,23 +2960,25 @@ class InteractiveTrimWindow(tk.Toplevel):
             outer,
             text="Drag the handles to set the trim range. Click a handle, then "
             "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
-            "adjustment than dragging allows. This is approximate — the exact "
-            "Sermon start/end fields stay editable after Apply.",
+            "adjustment than dragging allows. The exact Sermon start/end "
+            "fields stay editable after Apply too.",
             style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
         ).pack(anchor="w", pady=(2, 8))
 
         btn_row = ttk.Frame(outer)
         btn_row.pack(fill="x")
-        self.play_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
-        self.play_btn.pack(side="left")
-        if shutil.which("ffplay") is None:
-            self.play_btn.configure(state="disabled")
-            Tooltip(
-                self.play_btn,
-                "ffplay wasn't found on PATH — it ships with the full ffmpeg suite "
-                "(not just ffmpeg/ffprobe) but isn't required for anything else here.",
-                font=self.app.ui_font,
-            )
+        self.play_pause_btn = ttk.Button(btn_row, text="▶ Play", command=self._toggle_play)
+        self.play_pause_btn.pack(side="left")
+        self.play_selection_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
+        self.play_selection_btn.pack(side="left", padx=(8, 0))
+        if not self._audio_ok:
+            for btn in (self.play_pause_btn, self.play_selection_btn):
+                Tooltip(
+                    btn,
+                    "Playing video only, no sound — ffplay wasn't found on PATH "
+                    "(it ships with the full ffmpeg suite) to play audio.",
+                    font=self.app.ui_font,
+                )
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side="right")
         ttk.Button(btn_row, text="Apply", style="Accent.TButton", command=self._apply).pack(side="right", padx=(0, 8))
 
@@ -2916,7 +2989,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         clamped just shy of self.duration, since seeking to (or past) exact
         EOF reliably yields zero frames. self.start/self.end themselves
         (the real trim points) are never touched by this, only what's used
-        to render a thumbnail/preview *of* them."""
+        to render a thumbnail/preview/playback *of* them."""
         if self.duration:
             return max(0.0, min(t, self.duration - 0.05))
         return max(0.0, t)
@@ -2938,18 +3011,91 @@ class InteractiveTrimWindow(tk.Toplevel):
             self._queue.put(("status", f"Loading filmstrip… ({i + 1}/{TRIM_THUMBS})"))
         self._queue.put(("status", ""))
 
-    def _request_preview(self, handle: str, t: float):
+    def _request_preview(self, label: str, t: float):
         self._preview_job = None
         self._preview_request_id += 1
         req_id = self._preview_request_id
-        threading.Thread(target=self._preview_worker, args=(req_id, handle, self._seek_time(t)), daemon=True).start()
+        t = self._seek_time(t)
+        threading.Thread(target=self._preview_worker, args=(req_id, label, t), daemon=True).start()
 
-    def _preview_worker(self, req_id: int, handle: str, t: float):
+    def _preview_worker(self, req_id: int, label: str, t: float):
         if self._closed:
             return
         out = Path(self._tmpdir) / f"preview_{req_id}.png"
-        ok = extract_frame_png(self.source_path, t, out, width=TRIM_PREVIEW_W)
+        ok = extract_frame_png(self.source_path, t, out, width=TRIM_PREVIEW_W, accurate=True)
         self._queue.put(("preview", req_id, str(out) if ok else None))
+
+    @staticmethod
+    def _read_exact(stream, n: int) -> bytes | None:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = stream.read(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _video_playback_worker(self, gen: int, start_t: float):
+        w, h = TRIM_PREVIEW_W, TRIM_PREVIEW_H
+        frame_bytes = w * h * 3
+        # Same letterbox-to-a-fixed-size idea service_video.py's own filter
+        # chain uses (scale to fit, pad the rest) — needed here because the
+        # raw pipe has to be a known, fixed frame size to parse back out.
+        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={TRIM_PLAYER_FPS}"
+        cmd = [
+            "ffmpeg", *accurate_seek_input_args(self.source_path, start_t),
+            "-map", "0:v:0", "-vf", vf, "-pix_fmt", "rgb24",
+            "-f", "rawvideo", "-loglevel", "error", "-",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        if gen != self._play_generation:
+            proc.terminate()
+            return
+        self._video_proc = proc
+        frame_interval = 1.0 / TRIM_PLAYER_FPS
+        wall_start = time.monotonic()
+        i = 0
+        try:
+            while gen == self._play_generation:
+                buf = self._read_exact(proc.stdout, frame_bytes)
+                if buf is None:
+                    break
+                target_wall = wall_start + i * frame_interval
+                now = time.monotonic()
+                if now < target_wall:
+                    time.sleep(target_wall - now)
+                self._queue.put(("frame", gen, buf, w, h, start_t + i / TRIM_PLAYER_FPS))
+                i += 1
+        finally:
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.terminate()
+        if gen == self._play_generation:
+            self._queue.put(("playback_ended", gen))
+
+    def _start_audio(self, start_t: float) -> subprocess.Popen | None:
+        """Launches audio-only playback as an invisible ffplay subprocess —
+        `-nodisp` skips opening any window at all, so this can't reproduce
+        the original bug report's separate/fullscreen player window, and
+        it paces itself against real time on its own (no manual pacing
+        loop needed the way the video pipe below needs one).
+
+        Deliberately a real OS process, not (say) piping raw audio into a
+        Python audio library from a thread in this same process the way
+        the video side pipes raw frames: an early version of this feature
+        did exactly that (sounddevice/PortAudio), and it reliably
+        segfaulted the whole app a few seconds into playback when a
+        second ffmpeg pipe (video) was also running — a native crash below
+        Python, out of reach of any try/except. A crashed ffplay just
+        means silent playback; it can't take the rest of the app down."""
+        cmd = ["ffplay", "-nodisp", "-loglevel", "error", *accurate_seek_input_args(self.source_path, start_t)]
+        try:
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return None
 
     # -- queue drain (main thread only) ------------------------------------
 
@@ -2970,6 +3116,10 @@ class InteractiveTrimWindow(tk.Toplevel):
                     self._on_preview(msg[1], msg[2])
                 elif kind == "status":
                     self.status_var.set(msg[1])
+                elif kind == "frame":
+                    self._on_frame(msg[1], msg[2], msg[3], msg[4], msg[5])
+                elif kind == "playback_ended":
+                    self._on_playback_ended(msg[1])
         except queue.Empty:
             pass
         if not self._closed:
@@ -2984,9 +3134,13 @@ class InteractiveTrimWindow(tk.Toplevel):
             self.start, self.end = 0.0, duration
         self.start = max(0.0, min(self.start, duration))
         self.end = max(self.start, min(self.end, duration))
+        self.playhead = self.end
         self.canvas.delete("loading_text")
         self._draw_handles()
         self._update_readout()
+        self.seekbar.configure(to=duration)
+        self.seekbar.state(["!disabled"])
+        self.seekbar.set(self.playhead)
         self._request_preview("end", self.end)
 
     def _on_thumb(self, index: int, path: str | None):
@@ -3003,9 +3157,11 @@ class InteractiveTrimWindow(tk.Toplevel):
                 self.canvas.tag_raise("handle")
 
     def _on_preview(self, req_id: int, path: str | None):
-        if req_id != self._preview_request_id:
-            # Superseded by a newer drag/nudge before this one finished —
-            # discard it (and its file; nothing else will ever read it).
+        if req_id != self._preview_request_id or self.playing:
+            # Superseded by a newer drag/nudge/seek before this one
+            # finished, or playback started in the meantime — discard it
+            # (and its file; nothing else will ever read it) rather than
+            # stomp on a newer static frame or interrupt live playback.
             if path:
                 Path(path).unlink(missing_ok=True)
             return
@@ -3017,6 +3173,22 @@ class InteractiveTrimWindow(tk.Toplevel):
             self._preview_image = img
             self.preview_label.configure(image=img)
             Path(path).unlink(missing_ok=True)
+
+    def _on_frame(self, gen: int, raw: bytes, w: int, h: int, t: float):
+        if gen != self._play_generation or not self.playing:
+            return
+        header = f"P6\n{w} {h}\n255\n".encode("ascii")
+        self._preview_image = tk.PhotoImage(data=header + raw)
+        self.preview_label.configure(image=self._preview_image)
+        self.playhead = t
+        self.seekbar.set(t)
+        self.position_var.set(format_timestamp(t))
+        if self._play_stop_at is not None and t >= self._play_stop_at:
+            self._stop_playback()
+
+    def _on_playback_ended(self, gen: int):
+        if gen == self._play_generation:
+            self._stop_playback()
 
     # -- filmstrip / handle geometry --------------------------------------
 
@@ -3060,6 +3232,8 @@ class InteractiveTrimWindow(tk.Toplevel):
     # -- interaction --------------------------------------------------------
 
     def _begin_drag(self, handle: str):
+        if self.playing:
+            self._stop_playback()
         self._drag = handle
         self.active_handle = handle
         self.canvas.focus_set()
@@ -3095,23 +3269,70 @@ class InteractiveTrimWindow(tk.Toplevel):
         t = self.start if handle == "start" else self.end
         self._preview_job = self.after(120, lambda: self._request_preview(handle, t))
 
-    # -- actions --------------------------------------------------------
+    def _on_seekbar_change(self, value):
+        # Fires on every value change, including programmatic ones (e.g.
+        # every frame during playback — see _on_frame()) — just a cheap
+        # label update, safe either way. Actually *seeking* only happens
+        # from _seekbar_release(), keyed off a real mouse release.
+        self.position_var.set(format_timestamp(float(value)))
+
+    def _seekbar_press(self, _event):
+        self._seekbar_was_playing = self.playing
+        if self.playing:
+            self._stop_playback()
+
+    def _seekbar_release(self, _event):
+        if self.duration is None:
+            return
+        self.playhead = max(0.0, min(float(self.seekbar.get()), self.duration))
+        self._play_stop_at = None  # free scrubbing clears any pending "stop at selection end"
+        if getattr(self, "_seekbar_was_playing", False):
+            self._start_playback()
+        else:
+            self._request_preview("playhead", self.playhead)
+
+    # -- playback transport -------------------------------------------------
+
+    def _toggle_play(self):
+        if self.playing:
+            self._stop_playback()
+        else:
+            self._play_stop_at = None
+            self._start_playback()
 
     def _play_selection(self):
         if self.duration is None:
             return
-        # Close any previous preview still open rather than letting repeated
-        # clicks pile up separate ffplay windows.
-        if self._ffplay_proc and self._ffplay_proc.poll() is None:
-            self._ffplay_proc.terminate()
-        dur = max(self.end - self.start, 0.05)
-        try:
-            self._ffplay_proc = subprocess.Popen([
-                "ffplay", "-ss", f"{self.start:.3f}", "-t", f"{dur:.3f}",
-                "-autoexit", "-window_title", "Trim preview", self.source_path,
-            ])
-        except OSError as e:
-            messagebox.showerror("Play selection", f"Could not launch ffplay: {e}")
+        self.playhead = self.start
+        self._play_stop_at = self.end
+        self._start_playback()
+
+    def _start_playback(self):
+        if self.duration is None or self.playing:
+            return
+        self.playing = True
+        self.play_pause_btn.configure(text="⏸ Pause")
+        self._play_generation += 1
+        gen = self._play_generation
+        threading.Thread(target=self._video_playback_worker, args=(gen, self.playhead), daemon=True).start()
+        if self._audio_ok:
+            self._audio_proc = self._start_audio(self.playhead)
+
+    def _stop_playback(self):
+        self.playing = False
+        self.play_pause_btn.configure(text="▶ Play")
+        self._play_generation += 1  # invalidates any in-flight worker/queued frame from this run
+        self._kill_playback_procs()
+
+    def _kill_playback_procs(self):
+        if self._video_proc and self._video_proc.poll() is None:
+            self._video_proc.terminate()
+        self._video_proc = None
+        if self._audio_proc and self._audio_proc.poll() is None:
+            self._audio_proc.terminate()
+        self._audio_proc = None
+
+    # -- actions --------------------------------------------------------
 
     def _apply(self):
         if self.duration is None:
@@ -3126,10 +3347,10 @@ class InteractiveTrimWindow(tk.Toplevel):
 
     def _close(self):
         self._closed = True
+        self._play_generation += 1
+        self._kill_playback_procs()
         if self._preview_job:
             self.after_cancel(self._preview_job)
-        if self._ffplay_proc and self._ffplay_proc.poll() is None:
-            self._ffplay_proc.terminate()
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         self.destroy()
 

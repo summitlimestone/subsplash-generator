@@ -22,9 +22,9 @@ is an optional desktop GUI over the same four subcommands.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
 - `ffplay` (ships with the full ffmpeg suite, separate from `ffmpeg`/
-  `ffprobe` in some minimal installs) is optional — only needed for the
-  Offline tab's "Trim visually…" window's "▶ Play selection" button,
-  which just disables itself if it's missing.
+  `ffprobe` in some minimal installs) is optional — only needed for
+  audio in the Offline tab's "Trim visually…" window's embedded player;
+  video-only playback there still works without it.
 
 ## GUI
 
@@ -54,12 +54,14 @@ starter `config.json` next to the script on first run if none exists.
   a follow-up Stitch. "Trim visually…" (next to those fields) sets them
   by dragging a filmstrip instead of typing timestamps, mobile-photo-app
   style — drag the two handles for a rough cut, Left/Right nudges the
-  last-touched one for precision (Shift for a finer step), "▶ Play
-  selection" previews the selection with real playback via `ffplay`
-  (part of the ffmpeg suite; disabled if it's not on PATH). "Export to
-  JSON" builds a render-state file from the fields as-is. "Advanced…"
-  holds CRF, Fast copy, Normalize audio (and its Target LUFS), and
-  Encoder settings.
+  last-touched one for precision (Shift for a finer step). Playback (▶
+  Play, or ▶ Play selection to preview just the trim range) is embedded
+  right in the window with a seekbar, starting at an accurate, frame-
+  exact position rather than the nearest keyframe — video plays inline;
+  audio plays too as long as `ffplay` is on PATH (video-only otherwise).
+  "Export to JSON" builds a render-state file from the fields as-is.
+  "Advanced…" holds CRF, Fast copy, Normalize audio (and its Target
+  LUFS), and Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),
