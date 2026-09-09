@@ -21,6 +21,10 @@ is an optional desktop GUI over the same four subcommands.
   in `service_video.py` itself needs them.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
+- `ffplay` (ships with the full ffmpeg suite, separate from `ffmpeg`/
+  `ffprobe` in some minimal installs) is optional — only needed for the
+  Offline tab's "Trim visually…" window's "▶ Play selection" button,
+  which just disables itself if it's missing.
 
 ## GUI
 
@@ -47,9 +51,15 @@ starter `config.json` next to the script on first run if none exists.
   and Stitch buttons, or "Load from JSON" a render-state file (even one
   still in progress) to redo one; this also enables Sermon start/end
   fields so Trim re-trims the raw recording to those exact points before
-  a follow-up Stitch. "Export to JSON" builds a render-state file from
-  the fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio
-  (and its Target LUFS), and Encoder settings.
+  a follow-up Stitch. "Trim visually…" (next to those fields) sets them
+  by dragging a filmstrip instead of typing timestamps, mobile-photo-app
+  style — drag the two handles for a rough cut, Left/Right nudges the
+  last-touched one for precision (Shift for a finer step), "▶ Play
+  selection" previews the selection with real playback via `ffplay`
+  (part of the ffmpeg suite; disabled if it's not on PATH). "Export to
+  JSON" builds a render-state file from the fields as-is. "Advanced…"
+  holds CRF, Fast copy, Normalize audio (and its Target LUFS), and
+  Encoder settings.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),

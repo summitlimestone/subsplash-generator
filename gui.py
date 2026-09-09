@@ -38,6 +38,7 @@ import json
 import queue
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -270,6 +271,50 @@ def format_elapsed(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def probe_duration(path: str) -> float | None:
+    """A file's duration in seconds via ffprobe, or None if it can't be
+    read — used only by InteractiveTrimWindow to lay out its filmstrip.
+    Called directly rather than through service_video.py: this is a
+    quick, UI-only probe with nothing to trim/stitch, not worth spawning
+    that whole script for."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+
+def extract_frame_png(path: str, timestamp: float, out_path: Path, width: int, height: int | None = None) -> bool:
+    """Grabs a single frame at `timestamp` as a PNG — Tk's own PhotoImage
+    loads PNG natively (Tk 8.6+), so no Pillow dependency is needed to
+    show it. -ss before -i is a fast, approximate keyframe seek rather
+    than a frame-accurate one, which is fine for a scrubber thumbnail/
+    preview — nothing here is what actually gets trimmed.
+
+    With `height` given (filmstrip thumbnails), scales to fill and center-
+    crops to an exact width x height tile so the filmstrip lines up evenly.
+    Without it (the single large preview), just scales to `width` wide,
+    keeping the source aspect ratio."""
+    vf = (
+        f"scale=-2:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+        if height else f"scale={width}:-2"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", f"{max(timestamp, 0):.3f}", "-i", path,
+                "-frames:v", "1", "-vf", vf, "-loglevel", "error", str(out_path),
+            ],
+            capture_output=True, timeout=20,
+        )
+        return result.returncode == 0 and out_path.exists()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 # ffmpeg's xfade filter transition names (video-filters.html#xfade-1), for
@@ -1471,6 +1516,15 @@ class App(tk.Tk):
         self.vars["st_start"].set("00:00:00.000")
         self._labeled_entry(frame, 6, "Sermon end", "st_end", width=13, col=2, pad_left=16)
         self.vars["st_end"].set("00:00:00.000")
+        trim_visually_btn = ttk.Button(frame, text="Trim visually…", command=self._open_interactive_trim)
+        trim_visually_btn.grid(row=6, column=4, sticky="w", padx=(16, 0))
+        Tooltip(
+            trim_visually_btn,
+            "Pick Sermon start/end by dragging a filmstrip instead of typing "
+            "timestamps — like a mobile photo app's trim tool. Needs Main clip "
+            "set to a real file first.",
+            font=self.ui_font,
+        )
 
         self._labeled_combobox(
             frame, 7, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
@@ -1517,6 +1571,27 @@ class App(tk.Tk):
         self.offline_advanced_window.deiconify()
         self.offline_advanced_window.lift()
         self.offline_advanced_window.focus_set()
+
+    def _open_interactive_trim(self):
+        main_clip = self.vars["st_main"].get().strip()
+        if not main_clip:
+            messagebox.showerror("Trim visually", "Set Main clip first.")
+            return
+        if not Path(main_clip).exists():
+            messagebox.showerror("Trim visually", f"Main clip not found: {main_clip}")
+            return
+        try:
+            start = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
+        except ValueError:
+            start = 0.0
+        try:
+            end = to_timestamp(self.vars["st_end"].get().strip() or "00:00:00.000", "Sermon end")
+        except ValueError:
+            end = 0.0
+        # A fresh window every time (not built-once/withdrawn like
+        # OfflineAdvancedWindow/ConfigWindow) since it's tied to whichever
+        # file Main clip points at right now, which can change between opens.
+        InteractiveTrimWindow(self, main_clip, start, end)
 
     def _browse_render_state(self):
         path = filedialog.askopenfilename(
@@ -2702,6 +2777,361 @@ class OfflineAdvancedWindow(tk.Toplevel):
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
 
         self.withdraw()
+
+
+# InteractiveTrimWindow layout constants — a fixed-size filmstrip made of
+# this many square-ish tiles, plus the large single-frame preview above it.
+TRIM_THUMBS = 16
+TRIM_STRIP_W = 720
+TRIM_STRIP_H = 60
+TRIM_HANDLE_W = 10
+TRIM_PREVIEW_W = 480
+TRIM_PREVIEW_H = 270
+
+
+class InteractiveTrimWindow(tk.Toplevel):
+    """A mobile-photo-app-style visual trimmer for the Offline tab's Sermon
+    start/Sermon end fields — a filmstrip of thumbnails spanning Main
+    clip's full length, with two draggable handles marking the selected
+    range, a live single-frame preview of whichever handle last moved, and
+    an optional real-playback preview of the selection via ffplay.
+
+    A fresh instance every time (see App._open_interactive_trim()), unlike
+    OfflineAdvancedWindow/ConfigWindow's build-once-and-withdraw pattern —
+    this one is tied to a specific source file and starting range, so
+    there's nothing worth keeping alive between opens.
+
+    All the actual frame-grabbing (ffprobe for duration, ffmpeg for
+    thumbnails/preview frames) happens in background threads and is handed
+    back via a queue drained on a Tk after() loop, the same cross-thread-
+    to-Tk pattern App itself uses for streaming a subprocess's output (see
+    App._drain_queue()) — necessary because Tk widgets can only safely be
+    touched from the main thread, and generating ~16 thumbnails plus every
+    preview frame while dragging would otherwise freeze the window.
+
+    Deliberately coarse — dragging picks an approximate point on a strip
+    that might span a two-hour service, not a specific frame. Left/Right
+    (Shift for a finer step) nudges the last-touched handle for precision,
+    and the exact Sermon start/end text fields on the Offline tab stay
+    editable after Apply for anything finer than that."""
+
+    def __init__(self, app: App, source_path: str, start_seconds: float, end_seconds: float):
+        super().__init__(app)
+        self.app = app
+        self.source_path = source_path
+        self.title(f"Trim visually — {Path(source_path).name}")
+        self.configure(bg=PALETTE["bg"])
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self.duration: float | None = None
+        self.start = max(0.0, start_seconds)
+        self.end = max(0.0, end_seconds)
+        self.active_handle = "end"  # which handle Left/Right/preview follows
+        self._drag: str | None = None
+        self._closed = False
+        self._preview_job = None
+        self._preview_request_id = 0
+        self._thumb_images: dict[int, tk.PhotoImage] = {}  # keep refs alive
+        self._tmpdir = tempfile.mkdtemp(prefix="interactive_trim_")
+        self._ffplay_proc: subprocess.Popen | None = None
+
+        self._queue: "queue.Queue" = queue.Queue()
+        self._build_ui()
+        self.after(50, self._drain_queue)
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _build_ui(self):
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        # A solid black placeholder PhotoImage, not a bare Label — a Label's
+        # width/height options are character-based until it actually has an
+        # image assigned, so setting pixel dimensions before the first real
+        # frame arrives would size it completely wrong.
+        self._preview_image = tk.PhotoImage(width=TRIM_PREVIEW_W, height=TRIM_PREVIEW_H)
+        self._preview_image.put("black", to=(0, 0, TRIM_PREVIEW_W, TRIM_PREVIEW_H))
+        self.preview_label = tk.Label(outer, image=self._preview_image, bg="black")
+        self.preview_label.pack(pady=(0, 8))
+
+        readout = ttk.Frame(outer)
+        readout.pack(fill="x", pady=(0, 6))
+        self.start_var = tk.StringVar()
+        self.end_var = tk.StringVar()
+        self.selected_var = tk.StringVar()
+        ttk.Label(readout, textvariable=self.start_var, style="Header.TLabel").pack(side="left")
+        ttk.Label(readout, textvariable=self.end_var, style="Header.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.selected_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+
+        self.canvas = tk.Canvas(
+            outer, width=TRIM_STRIP_W, height=TRIM_STRIP_H,
+            bg=PALETTE["bg"], highlightthickness=1, highlightbackground=PALETTE["border"],
+        )
+        self.canvas.pack()
+        self.canvas.create_text(
+            TRIM_STRIP_W // 2, TRIM_STRIP_H // 2, text="Loading filmstrip…",
+            fill=PALETTE["muted"], tags="loading_text",
+        )
+        self.canvas.tag_bind("handle_start", "<ButtonPress-1>", lambda e: self._begin_drag("start"))
+        self.canvas.tag_bind("handle_end", "<ButtonPress-1>", lambda e: self._begin_drag("end"))
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<Left>", lambda e: self._nudge(-1, fine=False))
+        self.canvas.bind("<Right>", lambda e: self._nudge(1, fine=False))
+        self.canvas.bind("<Shift-Left>", lambda e: self._nudge(-1, fine=True))
+        self.canvas.bind("<Shift-Right>", lambda e: self._nudge(1, fine=True))
+        self.canvas.focus_set()
+
+        self.status_var = tk.StringVar(value="Loading…")
+        ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(
+            outer,
+            text="Drag the handles to set the trim range. Click a handle, then "
+            "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
+            "adjustment than dragging allows. This is approximate — the exact "
+            "Sermon start/end fields stay editable after Apply.",
+            style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
+        ).pack(anchor="w", pady=(2, 8))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill="x")
+        self.play_btn = ttk.Button(btn_row, text="▶ Play selection", command=self._play_selection)
+        self.play_btn.pack(side="left")
+        if shutil.which("ffplay") is None:
+            self.play_btn.configure(state="disabled")
+            Tooltip(
+                self.play_btn,
+                "ffplay wasn't found on PATH — it ships with the full ffmpeg suite "
+                "(not just ffmpeg/ffprobe) but isn't required for anything else here.",
+                font=self.app.ui_font,
+            )
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side="right")
+        ttk.Button(btn_row, text="Apply", style="Accent.TButton", command=self._apply).pack(side="right", padx=(0, 8))
+
+    # -- background work --------------------------------------------------
+
+    def _seek_time(self, t: float) -> float:
+        """The timestamp actually handed to ffmpeg for a frame grab —
+        clamped just shy of self.duration, since seeking to (or past) exact
+        EOF reliably yields zero frames. self.start/self.end themselves
+        (the real trim points) are never touched by this, only what's used
+        to render a thumbnail/preview *of* them."""
+        if self.duration:
+            return max(0.0, min(t, self.duration - 0.05))
+        return max(0.0, t)
+
+    def _load_worker(self):
+        duration = probe_duration(self.source_path)
+        if not duration:
+            self._queue.put(("error", "Could not read this file's duration — is ffprobe on PATH?"))
+            return
+        self._queue.put(("duration", duration))
+        cell_w = TRIM_STRIP_W // TRIM_THUMBS
+        for i in range(TRIM_THUMBS):
+            if self._closed:
+                return
+            t = self._seek_time(duration * i / max(TRIM_THUMBS - 1, 1))
+            out = Path(self._tmpdir) / f"thumb_{i}.png"
+            ok = extract_frame_png(self.source_path, t, out, width=cell_w, height=TRIM_STRIP_H)
+            self._queue.put(("thumb", i, str(out) if ok else None))
+            self._queue.put(("status", f"Loading filmstrip… ({i + 1}/{TRIM_THUMBS})"))
+        self._queue.put(("status", ""))
+
+    def _request_preview(self, handle: str, t: float):
+        self._preview_job = None
+        self._preview_request_id += 1
+        req_id = self._preview_request_id
+        threading.Thread(target=self._preview_worker, args=(req_id, handle, self._seek_time(t)), daemon=True).start()
+
+    def _preview_worker(self, req_id: int, handle: str, t: float):
+        if self._closed:
+            return
+        out = Path(self._tmpdir) / f"preview_{req_id}.png"
+        ok = extract_frame_png(self.source_path, t, out, width=TRIM_PREVIEW_W)
+        self._queue.put(("preview", req_id, str(out) if ok else None))
+
+    # -- queue drain (main thread only) ------------------------------------
+
+    def _drain_queue(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                kind = msg[0]
+                if kind == "error":
+                    self.status_var.set(msg[1])
+                elif kind == "duration":
+                    self._on_duration(msg[1])
+                elif kind == "thumb":
+                    self._on_thumb(msg[1], msg[2])
+                elif kind == "preview":
+                    self._on_preview(msg[1], msg[2])
+                elif kind == "status":
+                    self.status_var.set(msg[1])
+        except queue.Empty:
+            pass
+        if not self._closed:
+            self.after(50, self._drain_queue)
+
+    def _on_duration(self, duration: float):
+        self.duration = duration
+        # Unset/stale timestamps from the text fields (e.g. still the
+        # "00:00:00.000" default, or left over from a different file)
+        # collapse to the full clip rather than a zero-length selection.
+        if self.end <= self.start or self.end > duration + 0.01:
+            self.start, self.end = 0.0, duration
+        self.start = max(0.0, min(self.start, duration))
+        self.end = max(self.start, min(self.end, duration))
+        self.canvas.delete("loading_text")
+        self._draw_handles()
+        self._update_readout()
+        self._request_preview("end", self.end)
+
+    def _on_thumb(self, index: int, path: str | None):
+        if path:
+            try:
+                img = tk.PhotoImage(file=path)
+            except tk.TclError:
+                img = None
+            if img:
+                self._thumb_images[index] = img
+                x = TRIM_STRIP_W * index // TRIM_THUMBS
+                self.canvas.create_image(x, 0, image=img, anchor="nw", tags="thumb")
+                self.canvas.tag_raise("shade")
+                self.canvas.tag_raise("handle")
+
+    def _on_preview(self, req_id: int, path: str | None):
+        if req_id != self._preview_request_id:
+            # Superseded by a newer drag/nudge before this one finished —
+            # discard it (and its file; nothing else will ever read it).
+            if path:
+                Path(path).unlink(missing_ok=True)
+            return
+        if path:
+            try:
+                img = tk.PhotoImage(file=path)
+            except tk.TclError:
+                return
+            self._preview_image = img
+            self.preview_label.configure(image=img)
+            Path(path).unlink(missing_ok=True)
+
+    # -- filmstrip / handle geometry --------------------------------------
+
+    def _time_to_x(self, t: float) -> int:
+        if not self.duration:
+            return 0
+        return int(TRIM_STRIP_W * t / self.duration)
+
+    def _x_to_time(self, x: float) -> float:
+        if not self.duration:
+            return 0.0
+        x = max(0, min(TRIM_STRIP_W, x))
+        return self.duration * x / TRIM_STRIP_W
+
+    def _draw_handles(self):
+        self.canvas.delete("shade")
+        self.canvas.delete("handle")
+        if self.duration is None:
+            return
+        sx, ex = self._time_to_x(self.start), self._time_to_x(self.end)
+        h = TRIM_STRIP_H
+        # Grey out the trimmed-away regions on either side of the selection,
+        # the same visual language mobile trim UIs use.
+        if sx > 0:
+            self.canvas.create_rectangle(0, 0, sx, h, fill="black", stipple="gray50", width=0, tags="shade")
+        if ex < TRIM_STRIP_W:
+            self.canvas.create_rectangle(ex, 0, TRIM_STRIP_W, h, fill="black", stipple="gray50", width=0, tags="shade")
+        hw = TRIM_HANDLE_W
+        self.canvas.create_rectangle(
+            sx - hw // 2, 0, sx + hw // 2, h, fill=PALETTE["accent"], outline="", tags=("handle", "handle_start"),
+        )
+        self.canvas.create_rectangle(
+            ex - hw // 2, 0, ex + hw // 2, h, fill=PALETTE["accent"], outline="", tags=("handle", "handle_end"),
+        )
+
+    def _update_readout(self):
+        self.start_var.set(f"Start  {format_timestamp(self.start)}")
+        self.end_var.set(f"End  {format_timestamp(self.end)}")
+        self.selected_var.set(f"({format_timestamp(max(0.0, self.end - self.start))} selected)")
+
+    # -- interaction --------------------------------------------------------
+
+    def _begin_drag(self, handle: str):
+        self._drag = handle
+        self.active_handle = handle
+        self.canvas.focus_set()
+
+    def _on_drag(self, event):
+        if self._drag is None or self.duration is None:
+            return
+        t = self._x_to_time(event.x)
+        if self._drag == "start":
+            self.start = min(t, self.end)
+        else:
+            self.end = max(t, self.start)
+        self._draw_handles()
+        self._update_readout()
+        self._schedule_preview(self._drag)
+
+    def _nudge(self, direction: int, fine: bool):
+        if self.duration is None:
+            return "break"
+        step = (0.05 if fine else 0.5) * direction
+        if self.active_handle == "start":
+            self.start = max(0.0, min(self.start + step, self.end))
+        else:
+            self.end = max(self.start, min(self.end + step, self.duration))
+        self._draw_handles()
+        self._update_readout()
+        self._schedule_preview(self.active_handle)
+        return "break"  # keep Tk from also treating this as focus traversal
+
+    def _schedule_preview(self, handle: str):
+        if self._preview_job:
+            self.after_cancel(self._preview_job)
+        t = self.start if handle == "start" else self.end
+        self._preview_job = self.after(120, lambda: self._request_preview(handle, t))
+
+    # -- actions --------------------------------------------------------
+
+    def _play_selection(self):
+        if self.duration is None:
+            return
+        # Close any previous preview still open rather than letting repeated
+        # clicks pile up separate ffplay windows.
+        if self._ffplay_proc and self._ffplay_proc.poll() is None:
+            self._ffplay_proc.terminate()
+        dur = max(self.end - self.start, 0.05)
+        try:
+            self._ffplay_proc = subprocess.Popen([
+                "ffplay", "-ss", f"{self.start:.3f}", "-t", f"{dur:.3f}",
+                "-autoexit", "-window_title", "Trim preview", self.source_path,
+            ])
+        except OSError as e:
+            messagebox.showerror("Play selection", f"Could not launch ffplay: {e}")
+
+    def _apply(self):
+        if self.duration is None:
+            messagebox.showwarning("Trim visually", "Still loading — wait for the filmstrip before applying.")
+            return
+        self.app.vars["st_start"].set(format_timestamp(self.start))
+        self.app.vars["st_end"].set(format_timestamp(self.end))
+        self._close()
+
+    def _cancel(self):
+        self._close()
+
+    def _close(self):
+        self._closed = True
+        if self._preview_job:
+            self.after_cancel(self._preview_job)
+        if self._ffplay_proc and self._ffplay_proc.poll() is None:
+            self._ffplay_proc.terminate()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        self.destroy()
 
 
 class ConfigWindow(tk.Toplevel):
