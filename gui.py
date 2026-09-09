@@ -338,7 +338,18 @@ def extract_frame_png(
     if height and letterbox:
         vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
     elif height:
-        vf = f"scale=-2:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+        # Both dimensions have to be given explicitly here, not -2 for
+        # width — force_original_aspect_ratio=increase needs an actual W:H
+        # box to "increase" against to guarantee the scaled frame covers
+        # it in both dimensions. scale=-2:{height} alone (auto width,
+        # exact aspect match) makes "increase" a no-op — the scaled width
+        # then only happens to be >= the requested crop width by luck of
+        # the source's own aspect ratio, and crop hard-fails once it
+        # isn't: a *real* bug this shipped with (a wide enough window/
+        # filmstrip cell against a source aspect ratio that didn't happen
+        # to cover it left every thumbnail blank above some window width,
+        # confirmed by reproducing the exact ffmpeg crop failure directly).
+        vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
     else:
         vf = f"scale={width}:-2"
     input_args = accurate_seek_input_args(path, timestamp) if accurate else ["-ss", f"{max(timestamp, 0):.3f}", "-i", path]
@@ -3065,16 +3076,28 @@ class InteractiveTrimWindow(tk.Toplevel):
         gen = self._filmstrip_generation
         strip_w = self.strip_w
         cell_w = max(strip_w // TRIM_THUMBS, 1)
+        failures = 0
         for i in range(TRIM_THUMBS):
             if self._closed or gen != self._filmstrip_generation:
                 return
             t = self._seek_time(duration * i / max(TRIM_THUMBS - 1, 1))
             out = Path(self._tmpdir) / f"thumb_{gen}_{i}.png"
             ok = extract_frame_png(self.source_path, t, out, width=cell_w, height=TRIM_STRIP_H)
+            failures += not ok
             self._queue.put(("thumb", gen, i, strip_w, str(out) if ok else None))
             self._queue.put(("status", f"Loading filmstrip… ({i + 1}/{TRIM_THUMBS})"))
         if gen == self._filmstrip_generation:
-            self._queue.put(("status", ""))
+            # Failures used to go unreported — the loop still "finished" and
+            # cleared the status line to blank even if every single
+            # extraction had failed, leaving a silently, permanently blank
+            # filmstrip with no indication anything was wrong (this is
+            # exactly how a real ffmpeg filter bug here once shipped
+            # undetected). Surfacing a count here doesn't fix a bad filter
+            # graph on its own, but at least it's visible when one exists.
+            self._queue.put((
+                "status",
+                f"{failures}/{TRIM_THUMBS} filmstrip thumbnails failed to load" if failures else "",
+            ))
 
     def _regenerate_filmstrip(self):
         self._filmstrip_resize_job = None
@@ -3320,7 +3343,16 @@ class InteractiveTrimWindow(tk.Toplevel):
 
     def _on_canvas_configure(self, event):
         new_w = event.width
-        if abs(new_w - self.strip_w) < 4:
+        # A deliberately generous "did this really change" threshold — far
+        # smaller than any real user resize, but big enough to absorb the
+        # handful of few-pixel geometry-settling passes Tk itself can take
+        # right after a window first opens (worse, and apparently more
+        # numerous, on Windows than this project's own Linux dev/CI
+        # environment — see this method's sibling _on_preview_configure()
+        # for the same threshold on the preview pane). Each such pass this
+        # absorbs is one fewer regeneration cycle, and thus one fewer
+        # chance for that cycle's own geometry side effects to compound.
+        if abs(new_w - self.strip_w) < 16:
             return
         self.strip_w = new_w
         self.hint_label.configure(wraplength=max(new_w, 200))
@@ -3331,7 +3363,8 @@ class InteractiveTrimWindow(tk.Toplevel):
 
     def _on_preview_configure(self, event):
         w, h = event.width, event.height
-        if w < 32 or h < 32 or (abs(w - self.preview_w) < 4 and abs(h - self.preview_h) < 4):
+        # See _on_canvas_configure()'s comment on this threshold.
+        if w < 32 or h < 32 or (abs(w - self.preview_w) < 16 and abs(h - self.preview_h) < 16):
             return
         self.preview_w, self.preview_h = w, h
         # Pin the label's own declared size to exactly this, right away —

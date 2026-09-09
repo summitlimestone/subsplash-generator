@@ -45,6 +45,35 @@ def test_shrinking_window_also_regenerates_down(trim_window, app, pump):
     assert trim_window.strip_w < grown_strip_w - 50
 
 
+def test_wide_window_filmstrip_still_renders(trim_window, app, pump):
+    """Regression test for a real (Windows-reported) bug: ffmpeg's crop-
+    mode filter used for filmstrip thumbnails could fail outright once a
+    thumbnail cell got wide enough relative to the source's own aspect
+    ratio — the extraction loop still "finished" normally (status cleared
+    to blank) even though every single thumbnail had silently failed,
+    leaving a permanently blank filmstrip above some window width. See
+    extract_frame_png()'s own comment for the exact ffmpeg mechanics."""
+    # sample_video is 320x180 (16:9) — scaling it to TRIM_STRIP_H tall
+    # gives a natural width around 106px; a cell wider than that used to
+    # break every single thumbnail in the row.
+    initial_gen = trim_window._filmstrip_generation
+    trim_window.geometry("2200x900")
+    pump(lambda: trim_window._filmstrip_generation > initial_gen, timeout=5)
+    # Wait for the real outcome directly (all thumbnails in) rather than
+    # for the status text to stop reading "Loading…" — that text is blank
+    # both before a regeneration's first status message has landed *and*
+    # after it genuinely finishes, so checking for its absence is a race
+    # that can pass before regeneration has done any real work at all.
+    pump(
+        lambda: len(trim_window._thumb_images) == gui.TRIM_THUMBS or "failed to load" in trim_window.status_var.get(),
+        timeout=15,
+    )
+
+    assert trim_window.strip_w // gui.TRIM_THUMBS > 106, "test didn't actually exceed the old failure threshold"
+    assert trim_window.status_var.get() == "", f"filmstrip reported failures: {trim_window.status_var.get()!r}"
+    assert len(trim_window._thumb_images) == gui.TRIM_THUMBS
+
+
 def test_shrinking_cannot_go_below_minsize(trim_window):
     min_w, min_h = trim_window.minsize()
     trim_window.geometry(f"{min_w // 2}x{min_h // 2}")
