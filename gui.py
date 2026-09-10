@@ -1595,7 +1595,7 @@ class App(tk.Tk):
         # rather than grid columns, so the two sides can anchor
         # independently without needing to know how wide the row is.
         offline_btn_row = ttk.Frame(frame)
-        offline_btn_row.grid(row=8, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        offline_btn_row.grid(row=9, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
