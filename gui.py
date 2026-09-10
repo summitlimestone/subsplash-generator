@@ -2870,7 +2870,15 @@ TRIM_STRIP_H = 60
 TRIM_HANDLE_W = 10
 TRIM_PREVIEW_W = 480
 TRIM_PREVIEW_H = 270
-TRIM_PLAYER_FPS = 15
+TRIM_PLAYER_FPS = 30
+# How often the main thread checks its inbound queue (thumbnails, preview
+# frames, playback frames, status) — was 50ms, which is coarser than one
+# frame at 30fps (33.3ms) and made playback look choppy independent of
+# TRIM_PLAYER_FPS itself: frames would sit queued a little longer than
+# necessary, land in uneven bursts across drain cycles instead of a
+# steady one-per-tick cadence. Cheap to poll this often — draining an
+# empty queue is just one get_nowait() raising immediately.
+TRIM_QUEUE_POLL_MS = 10
 TRIM_ICON_SIZE = 16  # the play/pause button's icon, in pixels
 
 # Font Awesome Free 6.7.2 "play"/"pause" (solid) icon path data — real
@@ -3066,7 +3074,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         # just never shrinks below what the initial layout needs.
         self.update_idletasks()
         self.minsize(self.winfo_reqwidth(), self.winfo_reqheight())
-        self.after(50, self._drain_queue)
+        self.after(TRIM_QUEUE_POLL_MS, self._drain_queue)
         threading.Thread(target=self._load_worker, daemon=True).start()
 
     def _build_ui(self):
@@ -3355,7 +3363,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         except queue.Empty:
             pass
         if not self._closed:
-            self.after(50, self._drain_queue)
+            self.after(TRIM_QUEUE_POLL_MS, self._drain_queue)
 
     def _on_duration(self, duration: float):
         self.duration = duration
