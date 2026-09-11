@@ -38,6 +38,7 @@
   },
   "stitch": {
     "auto": true,
+    "series": "",
     "intro": "intro.mp4",
     "outro": "outro.mp4",
     "intro_duration": 5.0,

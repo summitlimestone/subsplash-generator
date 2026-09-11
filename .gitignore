@@ -2,6 +2,10 @@
 # GUI or by hand — config.example.json is the template to commit instead.
 config.json
 
+# Local intro/outro series (see gui.py's Series Manager tab) — real local
+# file paths specific to one setup, auto-created empty on first run.
+series.json
+
 # Generated per-run, not source
 render_state_*.json
 body_trimmed.mp4

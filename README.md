@@ -37,8 +37,9 @@ console pane shows its output (also mirrored to a log file, see Config >
 General), with a progress bar tracking ffmpeg's own steps. Creates a
 starter `config.json` next to the script on first run if none exists.
 
-**Main window**: Live/Offline tabs plus the console.
-- **Live**: intro/outro/output fields, Start Watch, Mark Sermon
+**Main window**: Live/Offline/Series Manager tabs plus the console.
+- **Live**: a Series dropdown in place of typing intro/outro paths (see
+  Series Manager below), output field, Start Watch, Mark Sermon
   Start/Mark Sermon End (the only way to run without ProPresenter, or to
   override it live), Trim once an end is marked (works even before
   recording stops; nothing renders automatically), and the render-state
@@ -47,21 +48,34 @@ starter `config.json` next to the script on first run if none exists.
   it resolves, disconnects OBS and ends the Watch run — from there Stitch
   (and a retried Trim, if it failed) work the same way the Offline tab's
   own buttons do, straight off the render-state file this run wrote.
-- **Offline**: crossfade an intro/main/outro by hand via separate Trim
-  and Stitch buttons, or "Load from JSON" a render-state file (even one
-  still in progress) to redo one; this also enables Sermon start/end
-  fields so Trim re-trims the raw recording to those exact points before
-  a follow-up Stitch. "Trim visually…" (next to those fields) sets them
-  by dragging a filmstrip instead of typing timestamps, mobile-photo-app
-  style — drag the two handles for a rough cut, Left/Right nudges the
-  last-touched one for precision (Shift for a finer step). Playback (▶
-  Play, or ▶ Play selection to preview just the trim range) is embedded
-  right in the window with a seekbar, starting at an accurate, frame-
-  exact position rather than the nearest keyframe — video plays inline;
-  audio plays too as long as `ffplay` is on PATH (video-only otherwise).
-  "Export to JSON" builds a render-state file from the fields as-is.
-  "Advanced…" holds CRF, Fast copy, Normalize audio (and its Target
-  LUFS), and Encoder settings.
+- **Offline**: crossfade a Series' intro/outro with a main clip by hand
+  via separate Trim and Stitch buttons, or "Load from JSON" a render-state
+  file (even one still in progress) to redo one; this also enables Sermon
+  start/end fields so Trim re-trims the raw recording to those exact
+  points before a follow-up Stitch. "Trim visually…" (next to those
+  fields) sets them by dragging a filmstrip instead of typing timestamps,
+  mobile-photo-app style — drag the two handles for a rough cut, Left/
+  Right nudges the last-touched one for precision (Shift for a finer
+  step). Playback (▶ Play, or ▶ Play selection to preview just the trim
+  range) is embedded right in the window with a seekbar, starting at an
+  accurate, frame-exact position rather than the nearest keyframe — video
+  plays inline; audio plays too as long as `ffplay` is on PATH (video-only
+  otherwise). "Export to JSON" builds a render-state file from the fields
+  as-is. "Advanced…" holds CRF, Fast copy, Normalize audio (and its
+  Target LUFS), and Encoder settings.
+- **Series Manager**: named intro/outro bundles (a name, an intro clip +
+  duration, an outro clip + duration) — set one up once per sermon
+  series, then just pick it from the Series dropdown on the Live/Offline
+  tabs instead of setting intro/outro paths by hand every run. New…/
+  Edit…/Duplicate/Delete manage the list; double-click a row to edit it.
+  Saved to `series.json` next to the script (auto-created empty on first
+  run, not committed — these are real local file paths specific to one
+  setup). Editing a series that's currently selected on the Live/Offline
+  tab updates that tab's own intro/outro immediately; deleting one that's
+  currently selected clears the selection instead of leaving it pointed
+  at something gone. Purely a GUI convenience layer — `service_video.py`'s
+  CLI has no concept of a "series", only the literal intro/outro paths
+  the GUI resolves a selection to before ever running anything.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),
@@ -238,7 +252,9 @@ checks and lints it (see `ci.yml`'s `lint` job).
    python service_video.py learn -c config.json
    ```
    Copy the two UIDs into `begin_slide.uid` / `end_slide.uid`.
-6. Fill in `stitch.intro` / `stitch.outro` with your intro/outro paths.
+6. Fill in `stitch.intro` / `stitch.outro` with your intro/outro paths (or,
+   in the GUI, set up a series on the Series Manager tab and pick it from
+   the Live tab's Series dropdown instead).
 7. Before a real service, dry-run `watch -c config.json --debug` and
    confirm begin/end are detected correctly (or that manual marking
    works, if not using ProPresenter).
@@ -283,6 +299,7 @@ checks and lints it (see `ci.yml`'s `lint` job).
   },
   "stitch": {
     "auto": true,
+    "series": "",                         // optional, GUI-only (see "Series Manager" above) — service_video.py ignores it
     "intro": "intro.mp4",                 // video, or a still image (jpg/png/bmp/tif/tiff/webp)
     "outro": "outro.mp4",                 // same
     "intro_duration": 5.0,                // optional, default 5.0; only used if intro is a still image
