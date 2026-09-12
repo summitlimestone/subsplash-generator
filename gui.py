@@ -516,11 +516,12 @@ REGEX_HELP = (
 )
 
 TIMESTAMP_HELP = (
-    "Supports strftime date/time placeholders in the filename, filled in "
-    "when the file is written. E.g. final_%Y-%m-%d_%H-%M-%S.mp4 → "
-    "final_2026-09-01_14-30-05.mp4. Common codes: %Y year, %m month, %d "
-    "day, %H hour (24h), %M minute, %S second. Only the filename itself "
-    "is expanded, not any folder in the path."
+    "Supports strftime date/time placeholders anywhere in the path, "
+    "directory names included, filled in when the file is written. E.g. "
+    "recordings/%Y-%m-%d/final_%H-%M-%S.mp4 → "
+    "recordings/2026-09-01/final_14-30-05.mp4. Common codes: %Y year, %m "
+    "month, %d day, %H hour (24h), %M minute, %S second. Any directory "
+    "that doesn't already exist yet is created automatically."
 )
 
 LOG_PATH_HELP = (
