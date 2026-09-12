@@ -296,6 +296,15 @@ def to_timestamp(text: str, field: str) -> float:
         raise ValueError(f"{field} must be HH:MM:SS.mmm (got {text!r})")
 
 
+# Kept identical to service_video.py's own _STRFTIME_CODES — see that
+# module's expand_output_path() for why this is a fixed whitelist
+# (substituted directive-by-directive) rather than handing the whole
+# path to the platform's own strftime(), which is what actually broke
+# on Windows (ValueError: Invalid format string) over an unrelated '%'
+# in a directory name.
+_STRFTIME_CODES = re.compile(r"%[YymdHIMSpBbAaj%]")
+
+
 def expand_output_path(path: str) -> str:
     """Duplicated from service_video.py's function of the same name
     (rather than imported — this script only ever runs service_video.py
@@ -305,11 +314,13 @@ def expand_output_path(path: str) -> str:
     string. Expands strftime placeholders anywhere in the path —
     filename and any directory components — and creates any directory
     component that doesn't exist yet; see service_video.py's own copy
-    for the full reasoning. Unlike that copy, a failure creating the
-    directory doesn't sys.exit() the whole GUI over a log file — it's
-    left to raise a plain OSError, which _sync_log_file() already
-    catches around its own open() call the same way."""
-    expanded = datetime.now().strftime(path)
+    for the full reasoning, _STRFTIME_CODES included. Unlike that copy, a
+    failure creating the directory doesn't sys.exit() the whole GUI over
+    a log file — it's left to raise a plain OSError, which
+    _sync_log_file() already catches around its own open() call the same
+    way."""
+    now = datetime.now()
+    expanded = _STRFTIME_CODES.sub(lambda m: now.strftime(m.group()), path)
     Path(expanded).parent.mkdir(parents=True, exist_ok=True)
     return expanded
 
@@ -516,11 +527,12 @@ REGEX_HELP = (
 )
 
 TIMESTAMP_HELP = (
-    "Supports strftime date/time placeholders in the filename, filled in "
-    "when the file is written. E.g. final_%Y-%m-%d_%H-%M-%S.mp4 → "
-    "final_2026-09-01_14-30-05.mp4. Common codes: %Y year, %m month, %d "
-    "day, %H hour (24h), %M minute, %S second. Only the filename itself "
-    "is expanded, not any folder in the path."
+    "Supports strftime date/time placeholders anywhere in the path, "
+    "directory names included, filled in when the file is written. E.g. "
+    "recordings/%Y-%m-%d/final_%H-%M-%S.mp4 → "
+    "recordings/2026-09-01/final_14-30-05.mp4. Common codes: %Y year, %m "
+    "month, %d day, %H hour (24h), %M minute, %S second. Any directory "
+    "that doesn't already exist yet is created automatically."
 )
 
 LOG_PATH_HELP = (
@@ -994,6 +1006,11 @@ class App(tk.Tk):
         # of whether the user has ever opened it via the Offline tab's
         # "Advanced…" button.
         self.offline_advanced_window = OfflineAdvancedWindow(self)
+        # Built eagerly (but hidden) too — needs start_watch_btn/mark_start_btn/
+        # mark_end_btn/live_trim_btn/live_stitch_btn to already exist, which
+        # they do by this point (built in _build_live_tab() via _build_body()
+        # above).
+        self.mini_live_window = MiniLiveControlsWindow(self)
 
         # Registered before load_config() below so loading a saved
         # api.enabled: true actually starts it — trace_add("write", ...)
@@ -1800,6 +1817,7 @@ class App(tk.Tk):
         start_btn = ttk.Button(btn_row, text="Start Watch", style="Accent.TButton", command=self._run_watch)
         start_btn.pack(side="left")
         self._start_buttons.append(start_btn)
+        self.start_watch_btn = start_btn
         self.mark_start_btn = ttk.Button(
             btn_row, text="Mark Sermon Start", command=self._mark_sermon_start, state="disabled",
         )
@@ -1818,9 +1836,16 @@ class App(tk.Tk):
         )
         self.live_stitch_btn.pack(side="left", padx=(8, 0))
         Tooltip(self.live_stitch_btn, LIVE_STITCH_HELP, font=self.ui_font)
-        self.watch_debug_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn_row, text="Debug", variable=self.watch_debug_var).pack(
-            side="left", padx=(10, 0)
+        mini_controls_btn = ttk.Button(
+            btn_row, text="Mini controls…", command=self._open_mini_live_controls,
+        )
+        mini_controls_btn.pack(side="left", padx=(8, 0))
+        Tooltip(
+            mini_controls_btn,
+            "Opens a small window with just these five buttons and the status "
+            "above, stacked vertically — handy for keeping the live workflow "
+            "in view without the full main window.",
+            font=self.ui_font,
         )
 
         status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
@@ -1843,6 +1868,26 @@ class App(tk.Tk):
             state_path_frame, text="Open in Offline tab",
             command=self._open_last_state_in_offline_tab,
         ).pack(side="left")
+
+    def _open_mini_live_controls(self):
+        self.mini_live_window.deiconify()
+        self.mini_live_window.lift()
+        self.mini_live_window.focus_set()
+
+    def _sync_mini_live_controls(self):
+        """Keeps MiniLiveControlsWindow's own buttons/status matching the
+        Live tab's real ones — called every _drain_queue() tick (see
+        __init__) rather than from each of the many call sites that
+        change those buttons' state, since there's no single choke point
+        for all of them. Skipped while the window is withdrawn (the
+        normal case) since there's nothing to keep in sync with no one
+        looking at it."""
+        win = self.mini_live_window
+        if not win.winfo_viewable():
+            return
+        win.status_label.configure(foreground=self.watch_status_label.cget("foreground"))
+        for main_btn, mini_btn in win.button_pairs:
+            mini_btn.configure(state=str(main_btn["state"]))
 
     # -- Offline tab (crossfade intro/main/outro; can autofill from a saved
     #    render-state file, but always runs a plain stitch) -----------------
@@ -2140,6 +2185,10 @@ class App(tk.Tk):
             header, text="Stop", style="Danger.TButton", command=self._stop, state="disabled"
         )
         self.stop_button.pack(side="right", padx=(0, 6))
+        self.watch_debug_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Debug", variable=self.watch_debug_var).pack(
+            side="right", padx=(0, 6)
+        )
 
         text_frame = ttk.Frame(parent)
         text_frame.pack(fill="both", expand=True, pady=(4, 0))
@@ -2646,6 +2695,7 @@ class App(tk.Tk):
                     self._on_process_exit(payload)
         except queue.Empty:
             pass
+        self._sync_mini_live_controls()
         self.after(50, self._drain_queue)
 
     def _on_process_exit(self, code: int):
@@ -3234,6 +3284,57 @@ class OfflineAdvancedWindow(tk.Toplevel):
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("st_encoder", preset_combo, "st_encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
+
+        self.withdraw()
+
+
+class MiniLiveControlsWindow(tk.Toplevel):
+    """The Live tab's own five buttons (Start Watch/Mark Sermon Start/
+    Mark Sermon End/Trim/Stitch) and status, stacked vertically in a
+    small window instead of the full main window — opened via the Live
+    tab's "Mini controls…" button, for keeping the live workflow in view
+    (e.g. off to the side of ProPresenter/OBS) without needing the whole
+    app. Built once at App startup and hidden with withdraw()/deiconify()
+    rather than destroyed on close, same pattern as OfflineAdvancedWindow/
+    ConfigWindow. Every button here calls the exact same command callable
+    the matching Live tab button does — never a separate code path — and
+    each one's enabled/disabled state (plus the status text/color) is
+    kept in sync with the real one by App._sync_mini_live_controls(),
+    not tracked independently here."""
+
+    def __init__(self, app: App):
+        super().__init__(app)
+        self.app = app
+        self.title("Service Video — Live Controls")
+        self.configure(bg=PALETTE["bg"])
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        self.status_label = ttk.Label(
+            frame, textvariable=app.watch_state_var,
+            font=(app.ui_font[0], 18, "bold"), foreground=PALETTE["muted"],
+        )
+        self.status_label.pack(anchor="w", pady=(0, 10))
+
+        # (main tab's button, this window's own button) pairs — read by
+        # App._sync_mini_live_controls() to mirror state; the mini button
+        # never reads/writes app state directly itself.
+        self.button_pairs: list[tuple[ttk.Button, ttk.Button]] = []
+
+        def add_button(main_btn, text, command, accent=False):
+            kwargs = {"style": "Accent.TButton"} if accent else {}
+            mini_btn = ttk.Button(frame, text=text, command=command, **kwargs)
+            mini_btn.pack(fill="x", pady=(0, 6))
+            self.button_pairs.append((main_btn, mini_btn))
+
+        add_button(app.start_watch_btn, "Start Watch", app._run_watch, accent=True)
+        add_button(app.mark_start_btn, "Mark Sermon Start", app._mark_sermon_start)
+        add_button(app.mark_end_btn, "Mark Sermon End", app._mark_sermon_end)
+        add_button(app.live_trim_btn, "Trim", app._trim_live)
+        add_button(app.live_stitch_btn, "Stitch", app._stitch_live)
 
         self.withdraw()
 
