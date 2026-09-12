@@ -442,6 +442,15 @@ CRF_HELP = (
     "own default."
 )
 
+SUBSPLASH_PRESET_HELP = (
+    "Matches Subsplash's own recommended On-Demand 1080p HandBrake preset "
+    "instead: profile High, level 4.0, 1920x1080 at 30fps (upscaling/"
+    "letterboxing as needed), ~2400kbps video (single-pass — not HandBrake's "
+    "own more precise 2-pass), AAC 160kbps audio, no +faststart. Overrides "
+    "CRF and the output resolution/framerate for Stitch only; Encoder still "
+    "picks the actual encode backend."
+)
+
 OFFSET_HELP = (
     "Shifts this cut point from the ProPresenter-detected slide time. "
     "Positive pushes it later (further into the clip); negative pushes it "
@@ -2038,6 +2047,7 @@ class App(tk.Tk):
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
         self.vars["stitch_transition_duration"].set(str(stitch.get("transition_duration", 1.0)))
         self.vars["stitch_transition"].set(stitch.get("transition", "fade"))
+        self.vars["stitch_subsplash_preset"].set(bool(stitch.get("subsplash_preset", False)))
 
         self.config_path_var.set(str(path))
         self._sync_log_file()
@@ -2147,6 +2157,7 @@ class App(tk.Tk):
                     v["stitch_transition_duration"].get().strip() or "1.0", "Transition duration"
                 ),
                 "transition": v["stitch_transition"].get().strip() or "fade",
+                "subsplash_preset": bool(v["stitch_subsplash_preset"].get()),
                 # Not GUI-exposed (see FAST_COPY_HELP / stitch()'s own
                 # docstring in service_video.py for why) — always off here;
                 # still settable by hand if that ever changes.
@@ -2597,6 +2608,7 @@ class App(tk.Tk):
                 self.vars["st_outro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
             )
             crf = self.vars["st_crf"].get()
+            subsplash_preset = bool(self.vars["st_subsplash_preset"].get())
             trim_fast_copy = bool(self.vars["st_trim_fast_copy"].get())
             normalize_audio = bool(self.vars["st_normalize_audio"].get())
             normalize_target_lufs = to_float(
@@ -2613,7 +2625,7 @@ class App(tk.Tk):
         return {
             "intro": intro, "main_clip": main_clip, "trimmed_clip": trimmed_clip, "outro": outro, "output": output,
             "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
-            "crf": crf, "trim_fast_copy": trim_fast_copy,
+            "crf": crf, "subsplash_preset": subsplash_preset, "trim_fast_copy": trim_fast_copy,
             "normalize_audio": normalize_audio, "normalize_target_lufs": normalize_target_lufs,
             "encoder": encoder, "encoder_preset": encoder_preset,
             "start_ts": start_ts, "end_ts": end_ts, "transition": transition,
@@ -2660,6 +2672,7 @@ class App(tk.Tk):
                 "transition_duration": f["duration"],
                 "transition": f["transition"],
                 "crf": f["crf"],
+                "subsplash_preset": f["subsplash_preset"],
                 # Not GUI-exposed (see FAST_COPY_HELP) — always off here.
                 "fast_copy": False,
                 "encoder": f["encoder"],
@@ -2741,6 +2754,8 @@ class App(tk.Tk):
         ]
         if f["encoder_preset"]:
             args += ["--encoder-preset", f["encoder_preset"]]
+        if f["subsplash_preset"]:
+            args.append("--subsplash-preset")
         self._start("stitch", args)
 
     def _export_render_state(self):
@@ -2807,7 +2822,7 @@ class OfflineAdvancedWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.title("Service Video — Advanced Render Settings")
-        self.geometry("420x380")
+        self.geometry("420x410")
         self.configure(bg=PALETTE["bg"])
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
 
@@ -2824,13 +2839,30 @@ class OfflineAdvancedWindow(tk.Toplevel):
             style="Muted.TLabel", wraplength=380, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
-        app._crf_slider(frame, 1, "CRF (quality)", "st_crf", col=0, colspan=3)
+        crf_scale = app._crf_slider(frame, 1, "CRF (quality)", "st_crf", col=0, colspan=3)
+
+        app.vars["st_subsplash_preset"] = tk.BooleanVar(value=False)
+        subsplash_cb = ttk.Checkbutton(
+            frame, text="Subsplash On-Demand (1080p) preset", variable=app.vars["st_subsplash_preset"],
+        )
+        subsplash_cb.grid(row=2, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(subsplash_cb, SUBSPLASH_PRESET_HELP, font=app.ui_font)
+        # CRF is ignored once this is on (see stitch()'s subsplash_preset) —
+        # grey the slider out so that's visible, not just documented in the
+        # tooltip. Only touches Stitch's step; Trim's own CRF (a separate
+        # field entirely) is unaffected.
+        app.vars["st_subsplash_preset"].trace_add(
+            "write",
+            lambda *_args: crf_scale.configure(
+                state="disabled" if app.vars["st_subsplash_preset"].get() else "normal"
+            ),
+        )
 
         app.vars["st_trim_fast_copy"] = tk.BooleanVar(value=True)
         trim_fast_cb = ttk.Checkbutton(
             frame, text="Fast copy (recommended)", variable=app.vars["st_trim_fast_copy"],
         )
-        trim_fast_cb.grid(row=2, column=0, columnspan=3, sticky="w", pady=3)
+        trim_fast_cb.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(trim_fast_cb, FAST_COPY_HELP + " Only applies when re-trimming from a raw "
                 "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
                 "is then assumed to already be trimmed.", font=app.ui_font)
@@ -2839,21 +2871,21 @@ class OfflineAdvancedWindow(tk.Toplevel):
         normalize_cb = ttk.Checkbutton(
             frame, text="Normalize audio (recommended)", variable=app.vars["st_normalize_audio"],
         )
-        normalize_cb.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
+        normalize_cb.grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP + " Only applies when re-trimming from a raw "
                 "recording (right after \"Load from JSON\") — ignored otherwise, since Main clip "
                 "is then assumed to already be trimmed.", font=app.ui_font)
 
-        lufs_entry = app._labeled_entry(frame, 4, "Target LUFS", "st_normalize_target_lufs", width=8, col=0)
+        lufs_entry = app._labeled_entry(frame, 5, "Target LUFS", "st_normalize_target_lufs", width=8, col=0)
         app.vars["st_normalize_target_lufs"].set("-16.0")
         Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
 
-        encoder_combo = app._labeled_combobox(frame, 5, "Encoder", "st_encoder", ENCODER_CHOICES, width=14, col=0)
+        encoder_combo = app._labeled_combobox(frame, 6, "Encoder", "st_encoder", ENCODER_CHOICES, width=14, col=0)
         encoder_combo.configure(state="readonly")
         app.vars["st_encoder"].set("nvenc")
         Tooltip(encoder_combo, ENCODER_HELP, font=app.ui_font)
 
-        preset_combo = app._labeled_combobox(frame, 6, "Encoder preset", "st_encoder_preset", [], width=14, col=0)
+        preset_combo = app._labeled_combobox(frame, 7, "Encoder preset", "st_encoder_preset", [], width=14, col=0)
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("st_encoder", preset_combo, "st_encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
@@ -3916,43 +3948,61 @@ class ConfigWindow(tk.Toplevel):
         app._labeled_entry(frame, 5, "Transition duration (s)", "stitch_transition_duration", width=8, col=2, pad_left=16)
         app.vars["stitch_transition_duration"].set("1.0")
 
-        app._crf_slider(frame, 6, "CRF (quality)", "trim_crf", col=0, colspan=3)
+        crf_scale = app._crf_slider(frame, 6, "CRF (quality)", "trim_crf", col=0, colspan=3)
+
+        app.vars["stitch_subsplash_preset"] = tk.BooleanVar(value=False)
+        subsplash_cb = ttk.Checkbutton(
+            frame, text="Subsplash On-Demand (1080p) preset (stitch only)",
+            variable=app.vars["stitch_subsplash_preset"],
+        )
+        subsplash_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(subsplash_cb, SUBSPLASH_PRESET_HELP, font=app.ui_font)
+        # CRF is ignored for the auto-stitch step once this is on (see
+        # stitch()'s subsplash_preset) — grey the slider out so that's
+        # visible, not just documented in the tooltip. Trim's own encode
+        # (a separate step entirely) still uses it.
+        app.vars["stitch_subsplash_preset"].trace_add(
+            "write",
+            lambda *_args: crf_scale.configure(
+                state="disabled" if app.vars["stitch_subsplash_preset"].get() else "normal"
+            ),
+        )
 
         app.vars["trim_fast_copy"] = tk.BooleanVar(value=True)
         fast_trim_cb = ttk.Checkbutton(
             frame, text="Fast copy (recommended)", variable=app.vars["trim_fast_copy"],
         )
-        fast_trim_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        fast_trim_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(fast_trim_cb, FAST_COPY_HELP, font=app.ui_font)
 
         app.vars["trim_normalize_audio"] = tk.BooleanVar(value=True)
         normalize_cb = ttk.Checkbutton(
             frame, text="Normalize audio (recommended)", variable=app.vars["trim_normalize_audio"],
         )
-        normalize_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
+        normalize_cb.grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP, font=app.ui_font)
 
-        lufs_entry = app._labeled_entry(frame, 9, "Target LUFS", "trim_normalize_target_lufs", width=8, col=0)
+        lufs_entry = app._labeled_entry(frame, 10, "Target LUFS", "trim_normalize_target_lufs", width=8, col=0)
         app.vars["trim_normalize_target_lufs"].set("-16.0")
         Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
 
-        encoder_combo = app._labeled_combobox(frame, 10, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
+        encoder_combo = app._labeled_combobox(frame, 11, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
         encoder_combo.configure(state="readonly")
         app.vars["encoder"].set("nvenc")
         Tooltip(encoder_combo, ENCODER_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
-        preset_combo = app._labeled_combobox(frame, 11, "Encoder preset", "encoder_preset", [], width=14, col=0)
+        preset_combo = app._labeled_combobox(frame, 12, "Encoder preset", "encoder_preset", [], width=14, col=0)
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("encoder", preset_combo, "encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=12, column=0, columnspan=5, sticky="ew", pady=(12, 8)
+            row=13, column=0, columnspan=5, sticky="ew", pady=(12, 8)
         )
         app.vars["stitch_auto"] = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame, text="Auto-stitch after trim", variable=app.vars["stitch_auto"],
-        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
+        ).grid(row=14, column=0, columnspan=3, sticky="w", pady=3)
 
 
 if __name__ == "__main__":
