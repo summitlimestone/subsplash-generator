@@ -1773,7 +1773,7 @@ def _resolve_state_path(trim_cfg: dict) -> Path:
 
 def _write_render_state(
     state_path: Path, recording_path: str | None, raw_begin_offset: float | None,
-    raw_end_offset: float | None, trim_cfg: dict, stitch_cfg: dict,
+    raw_end_offset: float | None, trim_cfg: dict, stitch_cfg: dict, trimmed_path: str | None = None,
 ) -> dict:
     """Builds the render-state dict and (over)writes it to `state_path`
     (see _resolve_state_path()) — the same self-contained record
@@ -1783,11 +1783,16 @@ def _write_render_state(
     the moment it starts, then rewrites it in place every time a mark (or
     the recording itself) actually happens, so what's on disk always
     reflects the best information available so far rather than only ever
-    appearing once, fully formed, at the very end."""
+    appearing once, fully formed, at the very end. trimmed_path is None
+    until a trim has actually produced one this run (see watch()'s
+    'trim_result' handling) — the GUI's Offline tab uses it (once
+    present) to prefill its own "Trimmed clip" field on Load from JSON,
+    the same path Trim itself wrote."""
     render_state = {
         "recording_path": recording_path,
         "raw_begin_offset": format_timestamp(raw_begin_offset) if raw_begin_offset is not None else None,
         "raw_end_offset": format_timestamp(raw_end_offset) if raw_end_offset is not None else None,
+        "trimmed_path": trimmed_path,
         "trim": trim_cfg,
         "stitch": stitch_cfg,
     }
@@ -2047,7 +2052,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
             state_path, recording_path,
             (t_begin - t0) if (t_begin is not None and t0 is not None) else None,
             (t_end - t0) if (t_end is not None and t0 is not None) else None,
-            trim_cfg, stitch_cfg,
+            trim_cfg, stitch_cfg, trimmed_path,
         )
 
     obs_disconnected = False
