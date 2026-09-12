@@ -46,6 +46,7 @@
     "output": "final.mp4",
     "transition_duration": 1.0,
     "transition": "fade",
+    "subsplash_preset": false,
     "fast_copy": false,
     "encoder": "nvenc",
     "encoder_preset": null
