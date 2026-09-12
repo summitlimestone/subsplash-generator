@@ -221,6 +221,44 @@ def to_float(text: str, field: str) -> float:
         raise ValueError(f"{field} must be a number (got {text!r})")
 
 
+def _fuzzy_subsequence_score(query: str, text: str) -> float | None:
+    """None if `query`'s characters don't all appear in `text`, in order
+    (case already normalized by the caller) — not necessarily contiguous,
+    same idea as fzf/VS Code's command-palette search, not spelling-
+    correction. Otherwise a lower-is-better score: the length of the
+    shortest span of `text` containing `query` as a subsequence, with how
+    early that span starts as a tiebreak — so "fa26" scores better
+    against "Fall 2026 Series" (tight match right at the start) than
+    against "See Fall Foliage 2026" (same subsequence, but scattered)."""
+    positions = []
+    start = 0
+    for ch in query:
+        idx = text.find(ch, start)
+        if idx == -1:
+            return None
+        positions.append(idx)
+        start = idx + 1
+    span = positions[-1] - positions[0] + 1
+    return span + positions[0] / 1000
+
+
+def fuzzy_match_series(query: str, names: list[str]) -> list[str]:
+    """Fuzzy-filters `names` by `query` (see _fuzzy_subsequence_score()),
+    best match first. A blank query matches everything, in its original
+    order — what a Series combobox shows before you've typed anything to
+    narrow it down."""
+    query = query.strip().lower()
+    if not query:
+        return list(names)
+    scored = []
+    for name in names:
+        score = _fuzzy_subsequence_score(query, name.lower())
+        if score is not None:
+            scored.append((score, name))
+    scored.sort(key=lambda pair: pair[0])
+    return [name for _score, name in scored]
+
+
 # Mirrors service_video.py's format_timestamp()/parse_timestamp() exactly —
 # duplicated rather than imported, since this GUI only ever talks to that
 # script as a subprocess (see ProcessRunner), never as a library.
@@ -933,6 +971,11 @@ class App(tk.Tk):
         self.series: list[dict] = []
         self._series_comboboxes: list[ttk.Combobox] = []
         self._series_bindings: list[tuple[str, str, str, str, str]] = []
+        # The last real series name each selector successfully resolved —
+        # what a Series combobox's search text snaps back to if the user
+        # types something that never matches a real, visible series (see
+        # _make_series_combobox_searchable()). Keyed by selector_key.
+        self._series_last_valid: dict[str, str] = {}
         self._load_series()
 
         self._build_header()
@@ -1474,10 +1517,19 @@ class App(tk.Tk):
     def _save_series(self):
         SERIES_PATH.write_text(json.dumps(self.series, indent=2))
 
-    def _series_names(self) -> list[str]:
-        return [s["name"] for s in self.series]
+    def _series_names(self, include_hidden: bool = False) -> list[str]:
+        """Visible (non-hidden) series names by default — what a Series
+        dropdown offers. Series Manager's own tree iterates self.series
+        directly instead of calling this, since hiding a series from the
+        *dropdowns* shouldn't also hide it from the one place that can
+        un-hide it again."""
+        return [s["name"] for s in self.series if include_hidden or not s.get("hidden", False)]
 
     def _find_series(self, name: str) -> dict | None:
+        # Not filtered by hidden — resolving a name to its intro/outro (or
+        # carrying a rename forward, or a Series Manager row edit) has to
+        # keep working for a hidden series too, only *offering* it in a
+        # dropdown's own list is what "hidden" actually means.
         for s in self.series:
             if s["name"] == name:
                 return s
@@ -1489,6 +1541,7 @@ class App(tk.Tk):
         series = self._find_series(self.vars[selector_key].get())
         if series is None:
             return
+        self._series_last_valid[selector_key] = series["name"]
         self.vars[intro_key].set(series["intro"])
         self.vars[intro_duration_key].set(str(series["intro_duration"]))
         self.vars[outro_key].set(series["outro"])
@@ -1509,6 +1562,64 @@ class App(tk.Tk):
         binding = (selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key)
         self._series_bindings.append(binding)
         self.vars[selector_key].trace_add("write", lambda *_a, b=binding: self._apply_series_to_vars(*b))
+
+    def _make_series_combobox_searchable(self, combo: ttk.Combobox, selector_key: str):
+        """Turns a plain Series combobox into a fuzzy-searchable one:
+        typing filters its dropdown list (subsequence fuzzy match — see
+        fuzzy_match_series()) instead of ttk's own default combobox
+        behavior (jumping to the first item starting with the typed
+        letter). Selecting an item — click, Down-arrow then Enter (ttk's
+        own normal way to post/navigate the dropdown, unaffected by any
+        of this), or typing enough to narrow to one and pressing Enter —
+        sets `selector_key`'s var exactly like before, so
+        _wire_series_selector()'s own trace still does all the actual
+        intro/outro resolution; this only changes how a name gets
+        *picked*. Deliberately does NOT force the popdown open on every
+        keystroke (e.g. via ttk::combobox::Post): that steals focus onto
+        the popdown listbox, which fires a spurious <FocusOut> on the
+        entry and commits the in-progress text early — confirmed by
+        testing. Typing something that never resolves to a real, visible
+        series snaps back to the last one that did once focus genuinely
+        leaves the field, rather than leaving invalid text sitting there
+        and silently going nowhere."""
+        combo.configure(state="normal")  # not readonly — typing has to work
+        # Keys that navigate/commit rather than edit the text — refiltering
+        # on these would fight the very interaction they're performing
+        # (e.g. re-opening the list out from under an Escape/Tab-out).
+        non_editing_keys = {
+            "Up", "Down", "Left", "Right", "Home", "End", "Return", "KP_Enter",
+            "Escape", "Tab", "ISO_Left_Tab", "Shift_L", "Shift_R",
+            "Control_L", "Control_R", "Alt_L", "Alt_R",
+        }
+
+        def on_keyrelease(event):
+            if event.keysym in non_editing_keys:
+                return
+            query = combo.get()
+            combo.configure(values=fuzzy_match_series(query, self._series_names()))
+
+        def on_focus_in(_event):
+            combo.configure(values=self._series_names())
+
+        def commit(_event=None):
+            current = combo.get()
+            if self._find_series(current) is None:
+                options = combo.cget("values")
+                # Typed enough to narrow it to exactly one real match but
+                # didn't type the full name — Enter still picks it, the
+                # same fzf-style convenience a plain click would give.
+                current = options[0] if len(options) == 1 else self._series_last_valid.get(selector_key, "")
+            combo.set(current)
+            combo.configure(values=self._series_names())
+
+        def on_return(_event):
+            commit()
+            return "break"  # otherwise ttk's own default Return handling can re-fire selection oddly
+
+        combo.bind("<KeyRelease>", on_keyrelease)
+        combo.bind("<FocusIn>", on_focus_in)
+        combo.bind("<FocusOut>", commit)
+        combo.bind("<Return>", on_return)
 
     def _resync_series_selectors(self):
         """Re-applies whichever series is currently selected in each
@@ -1540,20 +1651,27 @@ class App(tk.Tk):
             frame,
             text="Named intro/outro bundles — pick one from the Series dropdown on "
             "the Live and Offline tabs instead of setting intro/outro paths by hand "
-            "every time. Double-click a row (or select it and click Edit…) to "
-            "change it; Duplicate makes a copy to start a new one from.",
+            "every time (type to fuzzy-search it, like Ctrl+P in an editor). "
+            "Double-click a row (or select it and click Edit…) to change it; "
+            "Duplicate makes a copy to start a new one from. Hide/Show keeps a "
+            "series around (e.g. one you don't run anymore, but earlier render-state "
+            "files still reference) without it cluttering the dropdowns — hidden "
+            "series still show here, greyed out, so they can be un-hidden later.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
         self.series_tree = ttk.Treeview(
-            frame, columns=("name", "intro", "outro"), show="headings", height=10, selectmode="browse",
+            frame, columns=("name", "intro", "outro", "hidden"), show="headings", height=10, selectmode="browse",
         )
         self.series_tree.heading("name", text="Name")
         self.series_tree.heading("intro", text="Intro clip")
         self.series_tree.heading("outro", text="Outro clip")
+        self.series_tree.heading("hidden", text="Hidden")
         self.series_tree.column("name", width=180, anchor="w")
-        self.series_tree.column("intro", width=280, anchor="w")
-        self.series_tree.column("outro", width=280, anchor="w")
+        self.series_tree.column("intro", width=260, anchor="w")
+        self.series_tree.column("outro", width=260, anchor="w")
+        self.series_tree.column("hidden", width=60, anchor="center")
+        self.series_tree.tag_configure("hidden", foreground=PALETTE["muted"])
         self.series_tree.grid(row=1, column=0, sticky="ew")
         self.series_tree.bind("<Double-1>", lambda _e: self._edit_series())
 
@@ -1562,6 +1680,7 @@ class App(tk.Tk):
         ttk.Button(btn_row, text="New…", command=self._new_series).pack(side="left")
         ttk.Button(btn_row, text="Edit…", command=self._edit_series).pack(side="left", padx=(8, 0))
         ttk.Button(btn_row, text="Duplicate", command=self._duplicate_series).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Hide/Show", command=self._toggle_series_hidden).pack(side="left", padx=(8, 0))
         ttk.Button(btn_row, text="Delete", command=self._delete_series).pack(side="left", padx=(8, 0))
 
         self._refresh_series_tree()
@@ -1569,7 +1688,11 @@ class App(tk.Tk):
     def _refresh_series_tree(self):
         self.series_tree.delete(*self.series_tree.get_children())
         for s in self.series:
-            self.series_tree.insert("", "end", iid=s["name"], values=(s["name"], s["intro"], s["outro"]))
+            hidden = bool(s.get("hidden", False))
+            self.series_tree.insert(
+                "", "end", iid=s["name"], values=(s["name"], s["intro"], s["outro"], "Yes" if hidden else ""),
+                tags=("hidden",) if hidden else (),
+            )
 
     def _selected_series_name(self) -> str | None:
         selection = self.series_tree.selection()
@@ -1611,6 +1734,18 @@ class App(tk.Tk):
         # at least a rename.
         SeriesEditWindow(self, series=copy)
 
+    def _toggle_series_hidden(self):
+        name = self._selected_series_name()
+        if not name:
+            messagebox.showinfo("Hide/Show series", "Select a series first.")
+            return
+        series = self._find_series(name)
+        if not series:
+            return
+        series["hidden"] = not series.get("hidden", False)
+        self._save_series()
+        self._refresh_series_choices()
+
     def _delete_series(self):
         name = self._selected_series_name()
         if not name:
@@ -1631,6 +1766,7 @@ class App(tk.Tk):
                 self.vars[intro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
                 self.vars[outro_key].set("")
                 self.vars[outro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
+                self._series_last_valid.pop(selector_key, None)
         self._refresh_series_choices()
 
     # -- Live tab (the watch pipeline; only the fields that change week to
@@ -1651,11 +1787,11 @@ class App(tk.Tk):
         ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
 
         series_combo = self._labeled_combobox(frame, 1, "Series", "stitch_series", self._series_names(), width=26)
-        series_combo.configure(state="readonly")
         self._series_comboboxes.append(series_combo)
         self._wire_series_selector(
             "stitch_series", "stitch_intro", "stitch_intro_duration", "stitch_outro", "stitch_outro_duration",
         )
+        self._make_series_combobox_searchable(series_combo, "stitch_series")
         ttk.Button(frame, text="Manage series…", command=lambda: self.mode_notebook.select(self.series_tab)).grid(
             row=1, column=2, sticky="w", padx=(8, 0)
         )
@@ -1748,11 +1884,11 @@ class App(tk.Tk):
         )
 
         series_combo = self._labeled_combobox(frame, 2, "Series", "st_series", self._series_names(), colspan=3)
-        series_combo.configure(state="readonly")
         self._series_comboboxes.append(series_combo)
         self._wire_series_selector(
             "st_series", "st_intro", "st_intro_duration", "st_outro", "st_outro_duration",
         )
+        self._make_series_combobox_searchable(series_combo, "st_series")
         ttk.Button(frame, text="Manage series…", command=lambda: self.mode_notebook.select(self.series_tab)).grid(
             row=2, column=5, sticky="w", padx=(8, 0)
         )
@@ -3141,8 +3277,13 @@ class SeriesEditWindow(tk.Toplevel):
         Tooltip(outro_dur_label, IMAGE_DURATION_HELP, font=app.ui_font)
         Tooltip(outro_dur_spin, IMAGE_DURATION_HELP, font=app.ui_font)
 
+        self.hidden_var = tk.BooleanVar(value=bool(series.get("hidden", False)) if series else False)
+        ttk.Checkbutton(
+            frame, text="Hidden (excluded from Live/Offline Series dropdowns)", variable=self.hidden_var,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=5, column=0, columnspan=4, sticky="e", pady=(10, 0))
+        btn_row.grid(row=6, column=0, columnspan=4, sticky="e", pady=(10, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(btn_row, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=(0, 8))
 
@@ -3184,7 +3325,7 @@ class SeriesEditWindow(tk.Toplevel):
 
         record = {
             "name": name, "intro": intro, "intro_duration": intro_duration,
-            "outro": outro, "outro_duration": outro_duration,
+            "outro": outro, "outro_duration": outro_duration, "hidden": bool(self.hidden_var.get()),
         }
         if self.original_name is None:
             self.app.series.append(record)

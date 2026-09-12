@@ -67,15 +67,25 @@ starter `config.json` next to the script on first run if none exists.
   duration, an outro clip + duration) — set one up once per sermon
   series, then just pick it from the Series dropdown on the Live/Offline
   tabs instead of setting intro/outro paths by hand every run. New…/
-  Edit…/Duplicate/Delete manage the list; double-click a row to edit it.
-  Saved to `series.json` next to the script (auto-created empty on first
-  run, not committed — these are real local file paths specific to one
-  setup). Editing a series that's currently selected on the Live/Offline
-  tab updates that tab's own intro/outro immediately; deleting one that's
-  currently selected clears the selection instead of leaving it pointed
-  at something gone. Purely a GUI convenience layer — `service_video.py`'s
-  CLI has no concept of a "series", only the literal intro/outro paths
-  the GUI resolves a selection to before ever running anything.
+  Edit…/Duplicate/Hide-Show/Delete manage the list; double-click a row
+  to edit it. Both Series dropdowns are type-ahead: typing fuzzy-matches
+  against the series names (subsequence match, like a command palette —
+  "f26s" finds "Fall 2026 Series"), narrowing the dropdown as you type;
+  leaving the field with text that doesn't resolve to a real series
+  snaps back to whatever was last selected. A series can be marked
+  Hidden (in its Edit dialog, or via the Hide/Show button) to keep it
+  out of the Live/Offline dropdowns — e.g. one you don't run anymore but
+  an old render-state file still references — without deleting it; it
+  still shows (greyed out) in the Series Manager list so it can be
+  un-hidden or edited later. Saved to `series.json` next to the script
+  (auto-created empty on first run, not committed — these are real
+  local file paths specific to one setup). Editing a series that's
+  currently selected on the Live/Offline tab updates that tab's own
+  intro/outro immediately; deleting one that's currently selected clears
+  the selection instead of leaving it pointed at something gone. Purely
+  a GUI convenience layer — `service_video.py`'s CLI has no concept of a
+  "series", only the literal intro/outro paths the GUI resolves a
+  selection to before ever running anything.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),

@@ -9,13 +9,15 @@ import json
 import gui
 
 
-def _make_series(app, name, intro="/a_intro.mp4", outro="/a_outro.mp4", intro_duration=5.0, outro_duration=5.0):
+def _make_series(app, name, intro="/a_intro.mp4", outro="/a_outro.mp4", intro_duration=5.0, outro_duration=5.0,
+                  hidden=False):
     win = gui.SeriesEditWindow(app, series=None)
     win.name_var.set(name)
     win.intro_var.set(intro)
     win.intro_duration_var.set(str(intro_duration))
     win.outro_var.set(outro)
     win.outro_duration_var.set(str(outro_duration))
+    win.hidden_var.set(hidden)
     win._save()
     return win
 
@@ -29,7 +31,7 @@ def test_new_series_persists_to_disk(app):
     _make_series(app, "Fall 2026", intro="/videos/fall_intro.mp4", outro="/videos/fall_outro.mp4")
     assert app.series == [{
         "name": "Fall 2026", "intro": "/videos/fall_intro.mp4", "intro_duration": 5.0,
-        "outro": "/videos/fall_outro.mp4", "outro_duration": 5.0,
+        "outro": "/videos/fall_outro.mp4", "outro_duration": 5.0, "hidden": False,
     }]
     assert gui.SERIES_PATH.is_file()
     assert json.loads(gui.SERIES_PATH.read_text()) == app.series
@@ -254,3 +256,130 @@ def test_run_stitch_uses_the_selected_series(app, monkeypatch):
     assert args[0:4] == ["stitch", "/videos/fall_intro.mp4", "/videos/body_trimmed.mp4", "/videos/fall_outro.mp4"]
     assert args[args.index("--intro-duration") + 1] == "3.0"
     assert args[args.index("--outro-duration") + 1] == "4.0"
+
+
+# -- Fuzzy search -------------------------------------------------------
+
+def test_fuzzy_match_is_subsequence_not_substring():
+    names = ["Fall 2026 Series", "Winter Youth Camp", "Spring Retreat"]
+    # "f26s" only appears as an in-order subsequence of "Fall 2026 Series",
+    # never as one contiguous substring of any of them.
+    assert gui.fuzzy_match_series("f26s", names) == ["Fall 2026 Series"]
+
+
+def test_fuzzy_match_ranks_tighter_earlier_matches_first():
+    names = ["Winter Youth Camp", "Fall Youth Camp"]
+    # Both contain "youth camp" as a contiguous run, but "Fall Youth Camp"'s
+    # match starts earlier in the string, so it should sort first.
+    assert gui.fuzzy_match_series("youth camp", names) == ["Fall Youth Camp", "Winter Youth Camp"]
+
+
+def test_fuzzy_match_blank_query_returns_everything_unfiltered():
+    names = ["B", "A", "C"]
+    assert gui.fuzzy_match_series("", names) == names
+    assert gui.fuzzy_match_series("   ", names) == names
+
+
+def test_fuzzy_match_excludes_names_missing_a_query_character():
+    assert gui.fuzzy_match_series("xyz", ["Fall 2026 Series"]) == []
+
+
+def test_fuzzy_match_is_case_insensitive():
+    assert gui.fuzzy_match_series("FALL", ["Fall 2026 Series"]) == ["Fall 2026 Series"]
+
+
+def _focus_and_type(combo, text):
+    """Synthetic KeyRelease events only actually dispatch to a widget's
+    instance bindings once its toplevel is deiconified (the `app` fixture
+    withdraws it) and real-focused, with the event loop run at least
+    once (confirmed directly: without all three, event_generate silently
+    reaches nothing) — so every test that drives the searchable
+    combobox through simulated typing needs this, not just insert()."""
+    combo.winfo_toplevel().deiconify()
+    combo.focus_force()
+    combo.update()
+    combo.delete(0, "end")
+    combo.insert(0, text)
+    combo.event_generate("<KeyRelease>", keysym=text[-1] if text else "BackSpace")
+    combo.update()
+
+
+def test_typing_in_series_combobox_filters_its_values(app):
+    _make_series(app, "Fall 2026 Series")
+    _make_series(app, "Winter Youth Camp")
+    combo = app._series_comboboxes[0]  # Live tab's "stitch_series" combobox
+    _focus_and_type(combo, "f26s")
+    assert combo.cget("values") == ("Fall 2026 Series",)
+
+
+def test_committing_unmatched_text_snaps_back_to_last_valid_selection(app):
+    _make_series(app, "Fall 2026 Series")
+    app.vars["stitch_series"].set("Fall 2026 Series")
+    combo = app._series_comboboxes[0]
+    _focus_and_type(combo, "not a real series")
+    combo.event_generate("<FocusOut>")
+    combo.update()
+    assert app.vars["stitch_series"].get() == "Fall 2026 Series"
+
+
+def test_committing_text_narrowed_to_one_match_selects_it(app):
+    _make_series(app, "Fall 2026 Series")
+    _make_series(app, "Winter Youth Camp")
+    combo = app._series_comboboxes[0]
+    _focus_and_type(combo, "f26s")
+    combo.event_generate("<FocusOut>")
+    combo.update()
+    assert app.vars["stitch_series"].get() == "Fall 2026 Series"
+    assert app.vars["stitch_intro"].get() == "/a_intro.mp4"
+
+
+# -- Hide from dropdowns -------------------------------------------------
+
+def test_hidden_series_excluded_from_series_names_by_default(app):
+    _make_series(app, "Visible")
+    _make_series(app, "Hidden One", hidden=True)
+    assert app._series_names() == ["Visible"]
+    assert app._series_names(include_hidden=True) == ["Visible", "Hidden One"]
+
+
+def test_hidden_series_excluded_from_combobox_values(app):
+    _make_series(app, "Visible")
+    _make_series(app, "Hidden One", hidden=True)
+    combo = app._series_comboboxes[0]
+    assert combo.cget("values") == ("Visible",)
+
+
+def test_hidden_series_still_resolvable_and_editable(app):
+    _make_series(app, "Hidden One", intro="/h.mp4", hidden=True)
+    assert app._find_series("Hidden One")["intro"] == "/h.mp4"
+    edit = gui.SeriesEditWindow(app, series=app._find_series("Hidden One"))
+    assert edit.hidden_var.get() is True
+    edit.intro_var.set("/h2.mp4")
+    edit._save()
+    assert app._find_series("Hidden One")["intro"] == "/h2.mp4"
+    assert app._find_series("Hidden One")["hidden"] is True
+
+
+def test_toggle_series_hidden(app):
+    _make_series(app, "A")
+    app.series_tree.selection_set("A")
+    app._toggle_series_hidden()
+    assert app._find_series("A")["hidden"] is True
+    assert app._series_names() == []
+    app.series_tree.selection_set("A")
+    app._toggle_series_hidden()
+    assert app._find_series("A")["hidden"] is False
+    assert app._series_names() == ["A"]
+
+
+def test_hiding_the_currently_selected_series_does_not_clear_its_selection(app):
+    """Hiding only affects what future dropdown picks *offer* — a tab
+    that already has the now-hidden series selected should keep using it
+    (e.g. an old render-state file that named it), not silently lose its
+    resolved intro/outro."""
+    _make_series(app, "A", intro="/a.mp4")
+    app.vars["stitch_series"].set("A")
+    app.series_tree.selection_set("A")
+    app._toggle_series_hidden()
+    assert app.vars["stitch_series"].get() == "A"
+    assert app.vars["stitch_intro"].get() == "/a.mp4"
