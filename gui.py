@@ -1796,9 +1796,6 @@ class App(tk.Tk):
             "stitch_series", "stitch_intro", "stitch_intro_duration", "stitch_outro", "stitch_outro_duration",
         )
         self._make_series_combobox_searchable(series_combo, "stitch_series")
-        ttk.Button(frame, text="Manage series…", command=lambda: self.mode_notebook.select(self.series_tab)).grid(
-            row=1, column=2, sticky="w", padx=(8, 0)
-        )
 
         self._labeled_entry(frame, 2, "Output path", "stitch_output", help_text=TIMESTAMP_HELP)
         self._add_browse(frame, 2, "stitch_output", save=True, filetypes=VIDEO_FILETYPES)
@@ -1893,9 +1890,6 @@ class App(tk.Tk):
             "st_series", "st_intro", "st_intro_duration", "st_outro", "st_outro_duration",
         )
         self._make_series_combobox_searchable(series_combo, "st_series")
-        ttk.Button(frame, text="Manage series…", command=lambda: self.mode_notebook.select(self.series_tab)).grid(
-            row=2, column=5, sticky="w", padx=(8, 0)
-        )
 
         self._labeled_entry(frame, 3, "Main clip", "st_main", colspan=3)
         self._add_browse(frame, 3, "st_main", filetypes=VIDEO_FILETYPES, col=3)
