@@ -48,6 +48,9 @@ starter `config.json` next to the script on first run if none exists.
   it resolves, disconnects OBS and ends the Watch run — from there Stitch
   (and a retried Trim, if it failed) work the same way the Offline tab's
   own buttons do, straight off the render-state file this run wrote.
+  "Mini controls…" opens a small window with just these five buttons and
+  the status, stacked vertically, for keeping the live workflow in view
+  without the full main window.
 - **Offline**: crossfade a Series' intro/outro with a trimmed clip by
   hand via separate Trim and Stitch buttons, or "Load from JSON" a
   render-state file (even one still in progress) to redo one; this also

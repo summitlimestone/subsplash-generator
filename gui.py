@@ -994,6 +994,11 @@ class App(tk.Tk):
         # of whether the user has ever opened it via the Offline tab's
         # "Advanced…" button.
         self.offline_advanced_window = OfflineAdvancedWindow(self)
+        # Built eagerly (but hidden) too — needs start_watch_btn/mark_start_btn/
+        # mark_end_btn/live_trim_btn/live_stitch_btn to already exist, which
+        # they do by this point (built in _build_live_tab() via _build_body()
+        # above).
+        self.mini_live_window = MiniLiveControlsWindow(self)
 
         # Registered before load_config() below so loading a saved
         # api.enabled: true actually starts it — trace_add("write", ...)
@@ -1800,6 +1805,7 @@ class App(tk.Tk):
         start_btn = ttk.Button(btn_row, text="Start Watch", style="Accent.TButton", command=self._run_watch)
         start_btn.pack(side="left")
         self._start_buttons.append(start_btn)
+        self.start_watch_btn = start_btn
         self.mark_start_btn = ttk.Button(
             btn_row, text="Mark Sermon Start", command=self._mark_sermon_start, state="disabled",
         )
@@ -1813,6 +1819,17 @@ class App(tk.Tk):
         )
         self.live_trim_btn.pack(side="left", padx=(8, 0))
         Tooltip(self.live_trim_btn, LIVE_TRIM_HELP, font=self.ui_font)
+        mini_controls_btn = ttk.Button(
+            btn_row, text="Mini controls…", command=self._open_mini_live_controls,
+        )
+        mini_controls_btn.pack(side="left", padx=(8, 0))
+        Tooltip(
+            mini_controls_btn,
+            "Opens a small window with just these five buttons and the status "
+            "above, stacked vertically — handy for keeping the live workflow "
+            "in view without the full main window.",
+            font=self.ui_font,
+        )
         self.live_stitch_btn = ttk.Button(
             btn_row, text="Stitch", command=self._stitch_live, state="disabled",
         )
@@ -1839,6 +1856,26 @@ class App(tk.Tk):
             state_path_frame, text="Open in Offline tab",
             command=self._open_last_state_in_offline_tab,
         ).pack(side="left")
+
+    def _open_mini_live_controls(self):
+        self.mini_live_window.deiconify()
+        self.mini_live_window.lift()
+        self.mini_live_window.focus_set()
+
+    def _sync_mini_live_controls(self):
+        """Keeps MiniLiveControlsWindow's own buttons/status matching the
+        Live tab's real ones — called every _drain_queue() tick (see
+        __init__) rather than from each of the many call sites that
+        change those buttons' state, since there's no single choke point
+        for all of them. Skipped while the window is withdrawn (the
+        normal case) since there's nothing to keep in sync with no one
+        looking at it."""
+        win = self.mini_live_window
+        if not win.winfo_viewable():
+            return
+        win.status_label.configure(foreground=self.watch_status_label.cget("foreground"))
+        for main_btn, mini_btn in win.button_pairs:
+            mini_btn.configure(state=str(main_btn["state"]))
 
     # -- Offline tab (crossfade intro/main/outro; can autofill from a saved
     #    render-state file, but always runs a plain stitch) -----------------
@@ -2646,6 +2683,7 @@ class App(tk.Tk):
                     self._on_process_exit(payload)
         except queue.Empty:
             pass
+        self._sync_mini_live_controls()
         self.after(50, self._drain_queue)
 
     def _on_process_exit(self, code: int):
@@ -3234,6 +3272,57 @@ class OfflineAdvancedWindow(tk.Toplevel):
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("st_encoder", preset_combo, "st_encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
+
+        self.withdraw()
+
+
+class MiniLiveControlsWindow(tk.Toplevel):
+    """The Live tab's own five buttons (Start Watch/Mark Sermon Start/
+    Mark Sermon End/Trim/Stitch) and status, stacked vertically in a
+    small window instead of the full main window — opened via the Live
+    tab's "Mini controls…" button, for keeping the live workflow in view
+    (e.g. off to the side of ProPresenter/OBS) without needing the whole
+    app. Built once at App startup and hidden with withdraw()/deiconify()
+    rather than destroyed on close, same pattern as OfflineAdvancedWindow/
+    ConfigWindow. Every button here calls the exact same command callable
+    the matching Live tab button does — never a separate code path — and
+    each one's enabled/disabled state (plus the status text/color) is
+    kept in sync with the real one by App._sync_mini_live_controls(),
+    not tracked independently here."""
+
+    def __init__(self, app: App):
+        super().__init__(app)
+        self.app = app
+        self.title("Service Video — Live Controls")
+        self.configure(bg=PALETTE["bg"])
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        self.status_label = ttk.Label(
+            frame, textvariable=app.watch_state_var,
+            font=(app.ui_font[0], 18, "bold"), foreground=PALETTE["muted"],
+        )
+        self.status_label.pack(anchor="w", pady=(0, 10))
+
+        # (main tab's button, this window's own button) pairs — read by
+        # App._sync_mini_live_controls() to mirror state; the mini button
+        # never reads/writes app state directly itself.
+        self.button_pairs: list[tuple[ttk.Button, ttk.Button]] = []
+
+        def add_button(main_btn, text, command, accent=False):
+            kwargs = {"style": "Accent.TButton"} if accent else {}
+            mini_btn = ttk.Button(frame, text=text, command=command, **kwargs)
+            mini_btn.pack(fill="x", pady=(0, 6))
+            self.button_pairs.append((main_btn, mini_btn))
+
+        add_button(app.start_watch_btn, "Start Watch", app._run_watch, accent=True)
+        add_button(app.mark_start_btn, "Mark Sermon Start", app._mark_sermon_start)
+        add_button(app.mark_end_btn, "Mark Sermon End", app._mark_sermon_end)
+        add_button(app.live_trim_btn, "Trim", app._trim_live)
+        add_button(app.live_stitch_btn, "Stitch", app._stitch_live)
 
         self.withdraw()
 
