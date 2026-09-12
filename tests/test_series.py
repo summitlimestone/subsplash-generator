@@ -245,7 +245,8 @@ def test_run_stitch_uses_the_selected_series(app, monkeypatch):
     _make_series(app, "Fall 2026 Series", intro="/videos/fall_intro.mp4", intro_duration=3.0,
                  outro="/videos/fall_outro.mp4", outro_duration=4.0)
     app.vars["st_series"].set("Fall 2026 Series")
-    app.vars["st_main"].set("/videos/body_trimmed.mp4")
+    # Stitch always reads Trimmed clip (see #8), never Main clip directly.
+    app.vars["st_trimmed"].set("/videos/body_trimmed.mp4")
     app.vars["st_output"].set("final.mp4")
 
     captured = {}
