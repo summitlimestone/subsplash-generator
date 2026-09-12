@@ -92,11 +92,13 @@ def sample_video(tmp_path_factory) -> str:
 @pytest.fixture
 def app(monkeypatch, tmp_path):
     """A real App() instance, withdrawn (never shown). Redirects
-    DEFAULT_CONFIG_PATH into a throwaway tmp_path first — App() writes a
-    starter config.json next to gui.py on first run if none exists, and
-    tests have no business touching (or depending on) whatever a real
-    contributor's own actual config.json contains."""
+    DEFAULT_CONFIG_PATH/SERIES_PATH into a throwaway tmp_path first —
+    App() writes a starter config.json/series.json next to gui.py on
+    first run if neither exists, and tests have no business touching (or
+    depending on) whatever a real contributor's own actual config.json/
+    series.json contains."""
     monkeypatch.setattr(gui, "DEFAULT_CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(gui, "SERIES_PATH", tmp_path / "series.json")
     application = gui.App()
     application.withdraw()
     yield application

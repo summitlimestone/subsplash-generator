@@ -52,6 +52,14 @@ from tkinter import filedialog, messagebox, ttk
 SCRIPT_DIR = Path(__file__).resolve().parent
 SERVICE_SCRIPT = SCRIPT_DIR / "service_video.py"
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
+# Named intro/outro bundles ("series" — see issue #12) — a separate file
+# from config.json since they're reusable across configs/instances, not
+# connection settings for one. Purely a GUI convenience layer:
+# service_video.py's CLI has no concept of a "series", only literal
+# intro/outro paths — the GUI resolves a selected series to those before
+# ever building a command line or render-state file (see
+# App._wire_series_selector()).
+SERIES_PATH = SCRIPT_DIR / "series.json"
 
 
 def default_config() -> dict:
@@ -97,6 +105,11 @@ def default_config() -> dict:
         },
         "stitch": {
             "auto": True,
+            # Which saved series (see SERIES_PATH) intro/outro below came
+            # from, purely so the GUI's own Series dropdown can restore
+            # its selection on load — service_video.py itself never reads
+            # this key, only intro/outro/*_duration below.
+            "series": "",
             "intro": "",
             "outro": "",
             "intro_duration": DEFAULT_IMAGE_DURATION,
@@ -206,6 +219,44 @@ def to_float(text: str, field: str) -> float:
         return float(text)
     except ValueError:
         raise ValueError(f"{field} must be a number (got {text!r})")
+
+
+def _fuzzy_subsequence_score(query: str, text: str) -> float | None:
+    """None if `query`'s characters don't all appear in `text`, in order
+    (case already normalized by the caller) — not necessarily contiguous,
+    same idea as fzf/VS Code's command-palette search, not spelling-
+    correction. Otherwise a lower-is-better score: the length of the
+    shortest span of `text` containing `query` as a subsequence, with how
+    early that span starts as a tiebreak — so "fa26" scores better
+    against "Fall 2026 Series" (tight match right at the start) than
+    against "See Fall Foliage 2026" (same subsequence, but scattered)."""
+    positions = []
+    start = 0
+    for ch in query:
+        idx = text.find(ch, start)
+        if idx == -1:
+            return None
+        positions.append(idx)
+        start = idx + 1
+    span = positions[-1] - positions[0] + 1
+    return span + positions[0] / 1000
+
+
+def fuzzy_match_series(query: str, names: list[str]) -> list[str]:
+    """Fuzzy-filters `names` by `query` (see _fuzzy_subsequence_score()),
+    best match first. A blank query matches everything, in its original
+    order — what a Series combobox shows before you've typed anything to
+    narrow it down."""
+    query = query.strip().lower()
+    if not query:
+        return list(names)
+    scored = []
+    for name in names:
+        score = _fuzzy_subsequence_score(query, name.lower())
+        if score is not None:
+            scored.append((score, name))
+    scored.sort(key=lambda pair: pair[0])
+    return [name for _score, name in scored]
 
 
 # Mirrors service_video.py's format_timestamp()/parse_timestamp() exactly —
@@ -481,14 +532,8 @@ LOG_PATH_HELP = (
 )
 
 API_HELP = (
-    "An optional HTTP API for marking sermon start/end and checking the "
-    "current watch state from something other than this app — a phone, "
-    "a separate control surface, etc. Only runs during a live Watch "
-    "session (it starts/stops with Watch, same as the ProPresenter/manual-"
-    "mark connections). Interactive docs are served at /swagger once it's "
-    "running. Requires fastapi and uvicorn to be installed "
-    "(pip install fastapi uvicorn) — if they're not, Watch still runs "
-    "fine, it just logs why the API didn't start."
+    "Optional HTTP API for marking start/end remotely. Runs only during Watch; "
+    "docs at /swagger. Requires pip install fastapi uvicorn."
 )
 
 API_PASSWORD_HELP = (
@@ -919,6 +964,23 @@ class App(tk.Tk):
 
         self.config_path_var = tk.StringVar(value=str(DEFAULT_CONFIG_PATH))
 
+        # Series (see SERIES_PATH/issue #12) — loaded before _build_body()
+        # since the Live/Offline tabs' own Series dropdowns need
+        # self.series populated at construction time. _series_comboboxes
+        # (every Series dropdown built so far) and _series_bindings (which
+        # selector var feeds which intro/outro/duration vars — see
+        # _wire_series_selector()) both get appended to as those tabs
+        # build their own widgets, below.
+        self.series: list[dict] = []
+        self._series_comboboxes: list[ttk.Combobox] = []
+        self._series_bindings: list[tuple[str, str, str, str, str]] = []
+        # The last real series name each selector successfully resolved —
+        # what a Series combobox's search text snaps back to if the user
+        # types something that never matches a real, visible series (see
+        # _make_series_combobox_searchable()). Keyed by selector_key.
+        self._series_last_valid: dict[str, str] = {}
+        self._load_series()
+
         self._build_header()
         self._build_body()
 
@@ -1176,6 +1238,7 @@ class App(tk.Tk):
 
         self._build_live_tab()
         self._build_offline_tab()
+        self._build_series_tab()
 
         console_frame = ttk.Frame(paned, padding=(0, 6, 0, 0))
         paned.add(console_frame, weight=2)
@@ -1442,6 +1505,272 @@ class App(tk.Tk):
 
         refresh()
 
+    # -- Series (named intro/outro bundles — see SERIES_PATH/issue #12) ----
+
+    def _load_series(self):
+        if not SERIES_PATH.is_file():
+            SERIES_PATH.write_text(json.dumps([], indent=2))
+        try:
+            data = json.loads(SERIES_PATH.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Series", f"Could not read {SERIES_PATH}: {e}")
+            data = []
+        self.series = data if isinstance(data, list) else []
+
+    def _save_series(self):
+        SERIES_PATH.write_text(json.dumps(self.series, indent=2))
+
+    def _series_names(self, include_hidden: bool = False) -> list[str]:
+        """Visible (non-hidden) series names by default — what a Series
+        dropdown offers. Series Manager's own tree iterates self.series
+        directly instead of calling this, since hiding a series from the
+        *dropdowns* shouldn't also hide it from the one place that can
+        un-hide it again."""
+        return [s["name"] for s in self.series if include_hidden or not s.get("hidden", False)]
+
+    def _find_series(self, name: str) -> dict | None:
+        # Not filtered by hidden — resolving a name to its intro/outro (or
+        # carrying a rename forward, or a Series Manager row edit) has to
+        # keep working for a hidden series too, only *offering* it in a
+        # dropdown's own list is what "hidden" actually means.
+        for s in self.series:
+            if s["name"] == name:
+                return s
+        return None
+
+    def _apply_series_to_vars(
+        self, selector_key: str, intro_key: str, intro_duration_key: str, outro_key: str, outro_duration_key: str,
+    ):
+        series = self._find_series(self.vars[selector_key].get())
+        if series is None:
+            return
+        self._series_last_valid[selector_key] = series["name"]
+        self.vars[intro_key].set(series["intro"])
+        self.vars[intro_duration_key].set(str(series["intro_duration"]))
+        self.vars[outro_key].set(series["outro"])
+        self.vars[outro_duration_key].set(str(series["outro_duration"]))
+
+    def _wire_series_selector(
+        self, selector_key: str, intro_key: str, intro_duration_key: str, outro_key: str, outro_duration_key: str,
+    ):
+        """Selecting a series in `selector_key`'s combobox fills in the
+        given intro/outro/duration var keys from the matching record (see
+        self.series/_find_series()) — this (not a direct Entry) is now
+        the normal way the Live/Offline tabs set intro/outro, per issue
+        #12. Those 4 target vars are created here too (StringVars),
+        since nothing else builds them anymore now that they're not
+        directly-editable fields."""
+        for key in (intro_key, intro_duration_key, outro_key, outro_duration_key):
+            self.vars.setdefault(key, tk.StringVar())
+        binding = (selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key)
+        self._series_bindings.append(binding)
+        self.vars[selector_key].trace_add("write", lambda *_a, b=binding: self._apply_series_to_vars(*b))
+
+    def _make_series_combobox_searchable(self, combo: ttk.Combobox, selector_key: str):
+        """Turns a plain Series combobox into a fuzzy-searchable one:
+        typing filters its dropdown list (subsequence fuzzy match — see
+        fuzzy_match_series()) instead of ttk's own default combobox
+        behavior (jumping to the first item starting with the typed
+        letter). Selecting an item — click, Down-arrow then Enter (ttk's
+        own normal way to post/navigate the dropdown, unaffected by any
+        of this), or typing enough to narrow to one and pressing Enter —
+        sets `selector_key`'s var exactly like before, so
+        _wire_series_selector()'s own trace still does all the actual
+        intro/outro resolution; this only changes how a name gets
+        *picked*. Deliberately does NOT force the popdown open on every
+        keystroke (e.g. via ttk::combobox::Post): that steals focus onto
+        the popdown listbox, which fires a spurious <FocusOut> on the
+        entry and commits the in-progress text early — confirmed by
+        testing. Typing something that never resolves to a real, visible
+        series snaps back to the last one that did once focus genuinely
+        leaves the field, rather than leaving invalid text sitting there
+        and silently going nowhere."""
+        combo.configure(state="normal")  # not readonly — typing has to work
+        # Keys that navigate/commit rather than edit the text — refiltering
+        # on these would fight the very interaction they're performing
+        # (e.g. re-opening the list out from under an Escape/Tab-out).
+        non_editing_keys = {
+            "Up", "Down", "Left", "Right", "Home", "End", "Return", "KP_Enter",
+            "Escape", "Tab", "ISO_Left_Tab", "Shift_L", "Shift_R",
+            "Control_L", "Control_R", "Alt_L", "Alt_R",
+        }
+
+        def on_keyrelease(event):
+            if event.keysym in non_editing_keys:
+                return
+            query = combo.get()
+            combo.configure(values=fuzzy_match_series(query, self._series_names()))
+
+        def on_focus_in(_event):
+            combo.configure(values=self._series_names())
+
+        def commit(_event=None):
+            current = combo.get()
+            if self._find_series(current) is None:
+                options = combo.cget("values")
+                # Typed enough to narrow it to exactly one real match but
+                # didn't type the full name — Enter still picks it, the
+                # same fzf-style convenience a plain click would give.
+                current = options[0] if len(options) == 1 else self._series_last_valid.get(selector_key, "")
+            combo.set(current)
+            combo.configure(values=self._series_names())
+
+        def on_return(_event):
+            commit()
+            return "break"  # otherwise ttk's own default Return handling can re-fire selection oddly
+
+        combo.bind("<KeyRelease>", on_keyrelease)
+        combo.bind("<FocusIn>", on_focus_in)
+        combo.bind("<FocusOut>", commit)
+        combo.bind("<Return>", on_return)
+
+    def _resync_series_selectors(self):
+        """Re-applies whichever series is currently selected in each
+        Series dropdown to its own intro/outro/duration vars — needed
+        after saving an *edit* to an existing series: a plain reselect
+        wouldn't otherwise notice, since the dropdown's own value didn't
+        change, only what that series now points at."""
+        for binding in self._series_bindings:
+            self._apply_series_to_vars(*binding)
+
+    def _refresh_series_choices(self):
+        """Keeps every Series dropdown's option list, and the Series
+        Manager tab's own list, in sync with self.series — call after
+        any add/edit/duplicate/delete."""
+        names = self._series_names()
+        for combo in self._series_comboboxes:
+            combo.configure(values=names)
+        self._resync_series_selectors()
+        if hasattr(self, "series_tree"):
+            self._refresh_series_tree()
+
+    # -- Series Manager tab --------------------------------------------------
+
+    def _build_series_tab(self):
+        self.series_tab, frame = self._make_scrollable_tab(self.mode_notebook, "Series Manager")
+        frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Named intro/outro bundles for the Series dropdowns on Live/Offline. "
+            "Double-click a row to edit; Hide keeps one out of the dropdowns without "
+            "deleting it.",
+            style="Muted.TLabel", wraplength=760, justify="left",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        self.series_tree = ttk.Treeview(
+            frame, columns=("name", "intro", "outro", "hidden"), show="headings", height=10, selectmode="browse",
+        )
+        self.series_tree.heading("name", text="Name")
+        self.series_tree.heading("intro", text="Intro clip")
+        self.series_tree.heading("outro", text="Outro clip")
+        self.series_tree.heading("hidden", text="Hidden")
+        self.series_tree.column("name", width=180, anchor="w")
+        self.series_tree.column("intro", width=260, anchor="w")
+        self.series_tree.column("outro", width=260, anchor="w")
+        self.series_tree.column("hidden", width=60, anchor="center")
+        self.series_tree.tag_configure("hidden", foreground=PALETTE["muted"])
+        self.series_tree.grid(row=1, column=0, sticky="ew")
+        self.series_tree.bind("<Double-1>", lambda _e: self._edit_series())
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(btn_row, text="New…", command=self._new_series).pack(side="left")
+        ttk.Button(btn_row, text="Edit…", command=self._edit_series).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Duplicate", command=self._duplicate_series).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Hide/Show", command=self._toggle_series_hidden).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Delete", command=self._delete_series).pack(side="left", padx=(8, 0))
+
+        self._refresh_series_tree()
+
+    def _refresh_series_tree(self):
+        self.series_tree.delete(*self.series_tree.get_children())
+        # Visible series first (the ones actually usable from a dropdown
+        # right now), then alphabetically within each group — not insertion
+        # order, so the list stays predictable as entries pile up.
+        ordered = sorted(self.series, key=lambda s: (bool(s.get("hidden", False)), s["name"].lower()))
+        for s in ordered:
+            hidden = bool(s.get("hidden", False))
+            self.series_tree.insert(
+                "", "end", iid=s["name"], values=(s["name"], s["intro"], s["outro"], "Yes" if hidden else ""),
+                tags=("hidden",) if hidden else (),
+            )
+
+    def _selected_series_name(self) -> str | None:
+        selection = self.series_tree.selection()
+        return selection[0] if selection else None
+
+    def _new_series(self):
+        SeriesEditWindow(self, series=None)
+
+    def _edit_series(self):
+        name = self._selected_series_name()
+        if not name:
+            messagebox.showinfo("Edit series", "Select a series first.")
+            return
+        series = self._find_series(name)
+        if series:
+            SeriesEditWindow(self, series=series)
+
+    def _duplicate_series(self):
+        name = self._selected_series_name()
+        if not name:
+            messagebox.showinfo("Duplicate series", "Select a series first.")
+            return
+        series = self._find_series(name)
+        if not series:
+            return
+        copy = dict(series)
+        base = f"{series['name']} (copy)"
+        new_name = base
+        i = 2
+        while self._find_series(new_name):
+            new_name = f"{base} {i}"
+            i += 1
+        copy["name"] = new_name
+        self.series.append(copy)
+        self._save_series()
+        self._refresh_series_choices()
+        # Straight into editing the copy — duplicating with no other
+        # change would be pointless, so this is almost always followed by
+        # at least a rename.
+        SeriesEditWindow(self, series=copy)
+
+    def _toggle_series_hidden(self):
+        name = self._selected_series_name()
+        if not name:
+            messagebox.showinfo("Hide/Show series", "Select a series first.")
+            return
+        series = self._find_series(name)
+        if not series:
+            return
+        series["hidden"] = not series.get("hidden", False)
+        self._save_series()
+        self._refresh_series_choices()
+
+    def _delete_series(self):
+        name = self._selected_series_name()
+        if not name:
+            messagebox.showinfo("Delete series", "Select a series first.")
+            return
+        if not messagebox.askyesno("Delete series", f"Delete series {name!r}? This can't be undone."):
+            return
+        self.series = [s for s in self.series if s["name"] != name]
+        self._save_series()
+        # A dropdown that had the now-deleted series selected shouldn't
+        # keep showing it (or keep whatever intro/outro it last resolved
+        # to) — clear both back to blank rather than leave a dangling
+        # reference nothing else knows is now stale.
+        for selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key in self._series_bindings:
+            if self.vars[selector_key].get() == name:
+                self.vars[selector_key].set("")
+                self.vars[intro_key].set("")
+                self.vars[intro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
+                self.vars[outro_key].set("")
+                self.vars[outro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
+                self._series_last_valid.pop(selector_key, None)
+        self._refresh_series_choices()
+
     # -- Live tab (the watch pipeline; only the fields that change week to
     #    week — everything else lives in the Config window) ----------------
 
@@ -1451,31 +1780,23 @@ class App(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Tracks the whole service live: waits for OBS to start recording, then "
-            "the begin slide, then the end slide — keeping a render-state file up to "
-            "date as it goes. Nothing renders automatically: click Trim (works even "
-            "before recording stops) and then Stitch whenever you're ready. Connection, "
-            "slide-matching, and trim settings live in Config.",
+            text="Waits for OBS and the begin/end slides, then Trim and Stitch when "
+            "you're ready. Connections and trim settings live in Config.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
 
-        self._labeled_entry(frame, 1, "Intro clip", "stitch_intro")
-        self._add_browse(frame, 1, "stitch_intro", filetypes=INTRO_OUTRO_FILETYPES)
-        self._labeled_spinbox(
-            frame, 1, "Duration (s)", "stitch_intro_duration", from_=0.1, to=120.0,
-            default=str(DEFAULT_IMAGE_DURATION), width=6, col=4, help_text=IMAGE_DURATION_HELP,
+        series_combo = self._labeled_combobox(frame, 1, "Series", "stitch_series", self._series_names(), width=26)
+        self._series_comboboxes.append(series_combo)
+        self._wire_series_selector(
+            "stitch_series", "stitch_intro", "stitch_intro_duration", "stitch_outro", "stitch_outro_duration",
         )
-        self._labeled_entry(frame, 2, "Outro clip", "stitch_outro")
-        self._add_browse(frame, 2, "stitch_outro", filetypes=INTRO_OUTRO_FILETYPES)
-        self._labeled_spinbox(
-            frame, 2, "Duration (s)", "stitch_outro_duration", from_=0.1, to=120.0,
-            default=str(DEFAULT_IMAGE_DURATION), width=6, col=4, help_text=IMAGE_DURATION_HELP,
-        )
-        self._labeled_entry(frame, 3, "Output path", "stitch_output", help_text=TIMESTAMP_HELP)
-        self._add_browse(frame, 3, "stitch_output", save=True, filetypes=VIDEO_FILETYPES)
+        self._make_series_combobox_searchable(series_combo, "stitch_series")
+
+        self._labeled_entry(frame, 2, "Output path", "stitch_output", help_text=TIMESTAMP_HELP)
+        self._add_browse(frame, 2, "stitch_output", save=True, filetypes=VIDEO_FILETYPES)
 
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=4, column=0, columnspan=6, sticky="w", pady=(10, 10))
+        btn_row.grid(row=3, column=0, columnspan=6, sticky="w", pady=(10, 10))
         start_btn = ttk.Button(btn_row, text="Start Watch", style="Accent.TButton", command=self._run_watch)
         start_btn.pack(side="left")
         self._start_buttons.append(start_btn)
@@ -1503,7 +1824,7 @@ class App(tk.Tk):
         )
 
         status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
-        status_frame.grid(row=5, column=0, columnspan=6, sticky="ew")
+        status_frame.grid(row=4, column=0, columnspan=6, sticky="ew")
         self.watch_state_var = tk.StringVar(value="idle")
         self.watch_status_label = ttk.Label(
             status_frame, textvariable=self.watch_state_var,
@@ -1512,7 +1833,7 @@ class App(tk.Tk):
         self.watch_status_label.pack(side="left")
 
         state_path_frame = ttk.Frame(frame, padding=(0, 10, 0, 0))
-        state_path_frame.grid(row=6, column=0, columnspan=6, sticky="ew")
+        state_path_frame.grid(row=5, column=0, columnspan=6, sticky="ew")
         ttk.Label(state_path_frame, text="Last render-state file:").pack(side="left")
         self.render_state_var = tk.StringVar()
         ttk.Entry(state_path_frame, textvariable=self.render_state_var, state="readonly").pack(
@@ -1539,14 +1860,10 @@ class App(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Crossfade an intro, main body clip, and outro into the final video. "
-            "Fill in the fields yourself, or click \"Load from JSON\" to pull them out "
-            "of a render_state_*.json file a Watch run wrote (even one still in "
-            "progress). Loading from JSON also enables the sermon start/end "
-            "timestamps below, which Trim uses to re-trim the raw recording to "
-            "those exact points, writing the result to Trimmed clip — Stitch "
-            "always reads from there, not Main clip. Doesn't need a config file "
-            "or any live connection either way.",
+            text="Crossfades a Series' intro/outro with a trimmed clip. Pick a Series "
+            "or fill in fields by hand, or \"Load from JSON\" a render-state file from "
+            "a Watch run — Trim writes Main clip's result to Trimmed clip, which "
+            "Stitch always reads from.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
@@ -1557,32 +1874,27 @@ class App(tk.Tk):
             side="left", padx=(8, 0)
         )
 
-        self._labeled_entry(frame, 2, "Intro clip", "st_intro", colspan=3)
-        self._add_browse(frame, 2, "st_intro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
-        self._labeled_spinbox(
-            frame, 2, "Duration (s)", "st_intro_duration", from_=0.1, to=120.0,
-            default=str(DEFAULT_IMAGE_DURATION), width=6, col=5, help_text=IMAGE_DURATION_HELP,
+        series_combo = self._labeled_combobox(frame, 2, "Series", "st_series", self._series_names(), colspan=3)
+        self._series_comboboxes.append(series_combo)
+        self._wire_series_selector(
+            "st_series", "st_intro", "st_intro_duration", "st_outro", "st_outro_duration",
         )
+        self._make_series_combobox_searchable(series_combo, "st_series")
+
         self._labeled_entry(frame, 3, "Main clip", "st_main", colspan=3)
         self._add_browse(frame, 3, "st_main", filetypes=VIDEO_FILETYPES, col=3)
         self._labeled_entry(frame, 4, "Trimmed clip", "st_trimmed", colspan=3, help_text=TIMESTAMP_HELP)
         self._add_browse(frame, 4, "st_trimmed", save=True, filetypes=VIDEO_FILETYPES, col=3)
-        self._labeled_entry(frame, 5, "Outro clip", "st_outro", colspan=3)
-        self._add_browse(frame, 5, "st_outro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
-        self._labeled_spinbox(
-            frame, 5, "Duration (s)", "st_outro_duration", from_=0.1, to=120.0,
-            default=str(DEFAULT_IMAGE_DURATION), width=6, col=5, help_text=IMAGE_DURATION_HELP,
-        )
-        self._labeled_entry(frame, 6, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
-        self._add_browse(frame, 6, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
+        self._labeled_entry(frame, 5, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
+        self._add_browse(frame, 5, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
         self.vars["st_output"].set("output.mp4")
 
-        self._labeled_entry(frame, 7, "Sermon start", "st_start", width=13, col=0)
+        self._labeled_entry(frame, 6, "Sermon start", "st_start", width=13, col=0)
         self.vars["st_start"].set("00:00:00.000")
-        self._labeled_entry(frame, 7, "Sermon end", "st_end", width=13, col=2, pad_left=16)
+        self._labeled_entry(frame, 6, "Sermon end", "st_end", width=13, col=2, pad_left=16)
         self.vars["st_end"].set("00:00:00.000")
         trim_visually_btn = ttk.Button(frame, text="Trim visually…", command=self._open_interactive_trim)
-        trim_visually_btn.grid(row=7, column=4, sticky="w", padx=(16, 0))
+        trim_visually_btn.grid(row=6, column=4, sticky="w", padx=(16, 0))
         Tooltip(
             trim_visually_btn,
             "Pick Sermon start/end by dragging a filmstrip instead of typing "
@@ -1592,10 +1904,10 @@ class App(tk.Tk):
         )
 
         self._labeled_combobox(
-            frame, 8, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
+            frame, 7, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
         )
         self.vars["st_transition"].set("fade")
-        self._labeled_entry(frame, 8, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
+        self._labeled_entry(frame, 7, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
         self.vars["st_duration"].set("1.0")
 
         # Trim/Stitch left-aligned, Advanced… right-aligned, all one row —
@@ -1604,7 +1916,7 @@ class App(tk.Tk):
         # rather than grid columns, so the two sides can anchor
         # independently without needing to know how wide the row is.
         offline_btn_row = ttk.Frame(frame)
-        offline_btn_row.grid(row=9, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        offline_btn_row.grid(row=8, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
@@ -1671,14 +1983,27 @@ class App(tk.Tk):
             return
         trim_cfg = state.get("trim", {})
         stitch_cfg = state.get("stitch", {})
-        if "intro" in stitch_cfg:
-            self.vars["st_intro"].set(stitch_cfg["intro"])
-        if "outro" in stitch_cfg:
-            self.vars["st_outro"].set(stitch_cfg["outro"])
-        if "intro_duration" in stitch_cfg:
-            self.vars["st_intro_duration"].set(str(stitch_cfg["intro_duration"]))
-        if "outro_duration" in stitch_cfg:
-            self.vars["st_outro_duration"].set(str(stitch_cfg["outro_duration"]))
+        # Restore by series name if the one this file last saved still
+        # exists — the normal case, and _wire_series_selector()'s own
+        # trace (fired by the .set() below) fills in st_intro/outro/
+        # durations from it automatically. Otherwise (no series key —
+        # an older/foreign render-state file — or it's since been
+        # renamed/deleted) fall straight back to setting intro/outro/
+        # durations directly from whatever this file has saved, same as
+        # before series existed.
+        saved_series = stitch_cfg.get("series", "")
+        if saved_series and self._find_series(saved_series):
+            self.vars["st_series"].set(saved_series)
+        else:
+            self.vars["st_series"].set("")
+            if "intro" in stitch_cfg:
+                self.vars["st_intro"].set(stitch_cfg["intro"])
+            if "outro" in stitch_cfg:
+                self.vars["st_outro"].set(stitch_cfg["outro"])
+            if "intro_duration" in stitch_cfg:
+                self.vars["st_intro_duration"].set(str(stitch_cfg["intro_duration"]))
+            if "outro_duration" in stitch_cfg:
+                self.vars["st_outro_duration"].set(str(stitch_cfg["outro_duration"]))
         if "output" in stitch_cfg:
             self.vars["st_output"].set(stitch_cfg["output"])
         if "transition_duration" in stitch_cfg:
@@ -2040,10 +2365,22 @@ class App(tk.Tk):
             self.vars["encoder_preset"].set(saved_preset)
 
         self.vars["stitch_auto"].set(bool(stitch.get("auto", True)))
-        self.vars["stitch_intro"].set(stitch.get("intro", ""))
-        self.vars["stitch_outro"].set(stitch.get("outro", ""))
-        self.vars["stitch_intro_duration"].set(str(stitch.get("intro_duration", DEFAULT_IMAGE_DURATION)))
-        self.vars["stitch_outro_duration"].set(str(stitch.get("outro_duration", DEFAULT_IMAGE_DURATION)))
+        # Restore by series name if the one this config last saved still
+        # exists — the normal case, and _wire_series_selector()'s own
+        # trace (fired by the .set() below) fills in stitch_intro/outro/
+        # durations from it automatically. Otherwise (no series key at
+        # all — an older config.json — or it's since been renamed/
+        # deleted) fall straight back to the raw values already saved
+        # here, same as before series existed, rather than going blank.
+        saved_series = stitch.get("series", "")
+        if saved_series and self._find_series(saved_series):
+            self.vars["stitch_series"].set(saved_series)
+        else:
+            self.vars["stitch_series"].set("")
+            self.vars["stitch_intro"].set(stitch.get("intro", ""))
+            self.vars["stitch_outro"].set(stitch.get("outro", ""))
+            self.vars["stitch_intro_duration"].set(str(stitch.get("intro_duration", DEFAULT_IMAGE_DURATION)))
+            self.vars["stitch_outro_duration"].set(str(stitch.get("outro_duration", DEFAULT_IMAGE_DURATION)))
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
         self.vars["stitch_transition_duration"].set(str(stitch.get("transition_duration", 1.0)))
         self.vars["stitch_transition"].set(stitch.get("transition", "fade"))
@@ -2144,6 +2481,10 @@ class App(tk.Tk):
             },
             "stitch": {
                 "auto": bool(v["stitch_auto"].get()),
+                # Purely for the GUI's own convenience restoring the
+                # dropdown selection on load (see load_config()) —
+                # service_video.py itself never reads this key.
+                "series": v["stitch_series"].get().strip(),
                 "intro": v["stitch_intro"].get().strip(),
                 "outro": v["stitch_outro"].get().strip(),
                 "intro_duration": to_float(
@@ -2622,13 +2963,14 @@ class App(tk.Tk):
             messagebox.showerror(error_title, str(e))
             return None
         transition = self.vars["st_transition"].get().strip() or "fade"
+        series = self.vars["st_series"].get().strip()
         return {
             "intro": intro, "main_clip": main_clip, "trimmed_clip": trimmed_clip, "outro": outro, "output": output,
             "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
             "crf": crf, "subsplash_preset": subsplash_preset, "trim_fast_copy": trim_fast_copy,
             "normalize_audio": normalize_audio, "normalize_target_lufs": normalize_target_lufs,
             "encoder": encoder, "encoder_preset": encoder_preset,
-            "start_ts": start_ts, "end_ts": end_ts, "transition": transition,
+            "start_ts": start_ts, "end_ts": end_ts, "transition": transition, "series": series,
         }
 
     @staticmethod
@@ -2664,6 +3006,11 @@ class App(tk.Tk):
             },
             "stitch": {
                 "auto": stitch_auto,
+                # Purely for the GUI's own convenience restoring the
+                # Offline tab's Series dropdown on a later Load from
+                # JSON (see _load_render_state_json()) — nothing else
+                # reads this key.
+                "series": f.get("series", ""),
                 "intro": f["intro"],
                 "outro": f["outro"],
                 "intro_duration": f["intro_duration"],
@@ -2833,9 +3180,7 @@ class OfflineAdvancedWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Applies to Trim and Stitch on the Offline tab — Trim's re-trim step "
-            "(only works when re-trimming a raw recording, right after \"Load from "
-            "JSON\") and Stitch's crossfade.",
+            text="Applies to Offline's Trim and Stitch.",
             style="Muted.TLabel", wraplength=380, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
@@ -2891,6 +3236,154 @@ class OfflineAdvancedWindow(tk.Toplevel):
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
 
         self.withdraw()
+
+
+class SeriesEditWindow(tk.Toplevel):
+    """New/Edit form for one series (see App._build_series_tab()/issue
+    #12) — a fresh instance every time (like InteractiveTrimWindow),
+    since it needs to be re-populated with different data (or blank, for
+    New) each open, rather than built once and hidden the way
+    ConfigWindow/OfflineAdvancedWindow are. Modal (grab_set()): editing
+    two series at once would just let one silently clobber the other's
+    save, and there's nothing useful to do in the main window while this
+    is open anyway."""
+
+    def __init__(self, app: App, series: dict | None):
+        super().__init__(app)
+        self.app = app
+        # None means "New" — Save appends instead of replacing, and there's
+        # no existing name to exclude from the uniqueness check or to
+        # carry a rename forward from (see _save()).
+        self.original_name = series["name"] if series else None
+        self.title("New series" if series is None else f"Edit series — {series['name']}")
+        self.configure(bg=PALETTE["bg"])
+        self.resizable(False, False)
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        self.name_var = tk.StringVar(value=series["name"] if series else "")
+        name_label = ttk.Label(frame, text="Name", style="Header.TLabel")
+        name_label.grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(frame, textvariable=self.name_var, width=40).grid(
+            row=0, column=1, columnspan=3, sticky="ew", pady=3
+        )
+
+        self.intro_var = tk.StringVar(value=series["intro"] if series else "")
+        ttk.Label(frame, text="Intro clip", style="Header.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        ttk.Entry(frame, textvariable=self.intro_var, width=40).grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(frame, text="Browse…", command=lambda: self._browse(self.intro_var)).grid(
+            row=1, column=3, sticky="w", padx=(4, 0), pady=3
+        )
+        self.intro_duration_var = tk.StringVar(
+            value=str(series["intro_duration"]) if series else str(DEFAULT_IMAGE_DURATION)
+        )
+        intro_dur_label = ttk.Label(frame, text="Duration (s)", style="Header.TLabel")
+        intro_dur_label.grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
+        intro_dur_spin = ttk.Spinbox(
+            frame, textvariable=self.intro_duration_var, from_=0.1, to=120.0, increment=0.5, width=8,
+        )
+        intro_dur_spin.grid(row=2, column=1, sticky="w", pady=3)
+        Tooltip(intro_dur_label, IMAGE_DURATION_HELP, font=app.ui_font)
+        Tooltip(intro_dur_spin, IMAGE_DURATION_HELP, font=app.ui_font)
+
+        self.outro_var = tk.StringVar(value=series["outro"] if series else "")
+        ttk.Label(frame, text="Outro clip", style="Header.TLabel").grid(
+            row=3, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        ttk.Entry(frame, textvariable=self.outro_var, width=40).grid(row=3, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(frame, text="Browse…", command=lambda: self._browse(self.outro_var)).grid(
+            row=3, column=3, sticky="w", padx=(4, 0), pady=3
+        )
+        self.outro_duration_var = tk.StringVar(
+            value=str(series["outro_duration"]) if series else str(DEFAULT_IMAGE_DURATION)
+        )
+        outro_dur_label = ttk.Label(frame, text="Duration (s)", style="Header.TLabel")
+        outro_dur_label.grid(row=4, column=0, sticky="w", padx=(0, 6), pady=3)
+        outro_dur_spin = ttk.Spinbox(
+            frame, textvariable=self.outro_duration_var, from_=0.1, to=120.0, increment=0.5, width=8,
+        )
+        outro_dur_spin.grid(row=4, column=1, sticky="w", pady=3)
+        Tooltip(outro_dur_label, IMAGE_DURATION_HELP, font=app.ui_font)
+        Tooltip(outro_dur_spin, IMAGE_DURATION_HELP, font=app.ui_font)
+
+        self.hidden_var = tk.BooleanVar(value=bool(series.get("hidden", False)) if series else False)
+        ttk.Checkbutton(
+            frame, text="Hidden (excluded from Live/Offline Series dropdowns)", variable=self.hidden_var,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=6, column=0, columnspan=4, sticky="e", pady=(10, 0))
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=(0, 8))
+
+        # Grabbed last, after every widget (including Cancel/Save) exists —
+        # grab_set() before the window is fully built can make the very
+        # first click go nowhere on some platforms.
+        self.grab_set()
+        name_label.focus_set()
+
+    def _browse(self, var: tk.StringVar):
+        path = filedialog.askopenfilename(filetypes=INTRO_OUTRO_FILETYPES, initialdir=str(SCRIPT_DIR))
+        if path:
+            var.set(path)
+
+    def _save(self):
+        name = self.name_var.get().strip()
+        intro = self.intro_var.get().strip()
+        outro = self.outro_var.get().strip()
+        if not name:
+            messagebox.showerror("Save series", "Name is required.")
+            return
+        if not intro or not outro:
+            messagebox.showerror("Save series", "Intro and outro paths are both required.")
+            return
+        existing = self.app._find_series(name)
+        if existing is not None and name != self.original_name:
+            messagebox.showerror("Save series", f"A series named {name!r} already exists.")
+            return
+        try:
+            intro_duration = to_float(
+                self.intro_duration_var.get().strip() or str(DEFAULT_IMAGE_DURATION), "Intro duration"
+            )
+            outro_duration = to_float(
+                self.outro_duration_var.get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
+            )
+        except ValueError as e:
+            messagebox.showerror("Save series", str(e))
+            return
+
+        record = {
+            "name": name, "intro": intro, "intro_duration": intro_duration,
+            "outro": outro, "outro_duration": outro_duration, "hidden": bool(self.hidden_var.get()),
+        }
+        if self.original_name is None:
+            self.app.series.append(record)
+        else:
+            for i, s in enumerate(self.app.series):
+                if s["name"] == self.original_name:
+                    self.app.series[i] = record
+                    break
+        self.app._save_series()
+        self.app._refresh_series_choices()
+        # A rename should carry forward wherever it's currently selected
+        # (the Live/Offline tabs' own Series dropdowns), not silently
+        # leave them pointing at a name that no longer exists — done
+        # *after* _refresh_series_choices() above, so the new name is
+        # already in each dropdown's own value list by the time this sets
+        # it (a readonly Combobox can still display a value outside its
+        # values list, but it wouldn't be reselectable from the dropdown
+        # itself until the list catches up).
+        if self.original_name is not None and name != self.original_name:
+            for selector_key, *_rest in self.app._series_bindings:
+                if self.app.vars[selector_key].get() == self.original_name:
+                    self.app.vars[selector_key].set(name)
+        self.destroy()
 
 
 # InteractiveTrimWindow layout constants — a fixed-size filmstrip made of
@@ -3147,10 +3640,7 @@ class InteractiveTrimWindow(tk.Toplevel):
 
         self.hint_label = ttk.Label(
             outer,
-            text="Drag the handles to set the trim range. Click a handle, then "
-            "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
-            "adjustment than dragging allows. The exact Sermon start/end "
-            "fields stay editable after Apply too.",
+            text="Drag handles to trim. Click one, then ←/→ to nudge (Shift for finer).",
             style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
         )
         self.hint_label.pack(side="bottom", anchor="w", pady=(2, 8))
@@ -3763,8 +4253,7 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Settings that apply across the whole app, not tied to any one "
-            "of Watch/Render/Stitch/Learn.",
+            text="App-wide settings.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -3808,10 +4297,8 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Entirely optional — since Mark Start/Mark End on the Live tab can "
-            "drive a whole run by hand, Watch works fine with no ProPresenter "
-            "connection at all. Fill this in only if you want the begin/end slides "
-            "detected automatically instead.",
+            text="Optional — only needed for automatic begin/end slide detection. "
+            "Mark Start/Mark End work without it.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -3839,9 +4326,8 @@ class ConfigWindow(tk.Toplevel):
         )
         ttk.Label(
             frame,
-            text="Connects to ProPresenter only (no OBS needed). Step through your "
-            "slides in ProPresenter — each distinct slide shown appears below with "
-            "its UID.",
+            text="Step through your slides in ProPresenter; each one appears below "
+            "with its UID.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=15, column=0, columnspan=4, sticky="w", pady=(2, 6))
 
@@ -3897,8 +4383,7 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Used to detect when the recording starts and stops during a live "
-            "Watch run.",
+            text="Detects recording start/stop during a live Watch run.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -3917,8 +4402,8 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Settings for the automatic trim + stitch a live Watch run does when "
-            "it finishes. The Offline tab's manual crossfade tool doesn't use these.",
+            text="Used for the automatic trim+stitch after Watch finishes — not used "
+            "by Offline.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
 
