@@ -523,14 +523,8 @@ LOG_PATH_HELP = (
 )
 
 API_HELP = (
-    "An optional HTTP API for marking sermon start/end and checking the "
-    "current watch state from something other than this app — a phone, "
-    "a separate control surface, etc. Only runs during a live Watch "
-    "session (it starts/stops with Watch, same as the ProPresenter/manual-"
-    "mark connections). Interactive docs are served at /swagger once it's "
-    "running. Requires fastapi and uvicorn to be installed "
-    "(pip install fastapi uvicorn) — if they're not, Watch still runs "
-    "fine, it just logs why the API didn't start."
+    "Optional HTTP API for marking start/end remotely. Runs only during Watch; "
+    "docs at /swagger. Requires pip install fastapi uvicorn."
 )
 
 API_PASSWORD_HELP = (
@@ -1649,14 +1643,9 @@ class App(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Named intro/outro bundles — pick one from the Series dropdown on "
-            "the Live and Offline tabs instead of setting intro/outro paths by hand "
-            "every time (type to fuzzy-search it, like Ctrl+P in an editor). "
-            "Double-click a row (or select it and click Edit…) to change it; "
-            "Duplicate makes a copy to start a new one from. Hide/Show keeps a "
-            "series around (e.g. one you don't run anymore, but earlier render-state "
-            "files still reference) without it cluttering the dropdowns — hidden "
-            "series still show here, greyed out, so they can be un-hidden later.",
+            text="Named intro/outro bundles for the Series dropdowns on Live/Offline. "
+            "Double-click a row to edit; Hide keeps one out of the dropdowns without "
+            "deleting it.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
@@ -1782,11 +1771,8 @@ class App(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Tracks the whole service live: waits for OBS to start recording, then "
-            "the begin slide, then the end slide — keeping a render-state file up to "
-            "date as it goes. Nothing renders automatically: click Trim (works even "
-            "before recording stops) and then Stitch whenever you're ready. Connection, "
-            "slide-matching, and trim settings live in Config.",
+            text="Waits for OBS and the begin/end slides, then Trim and Stitch when "
+            "you're ready. Connections and trim settings live in Config.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
 
@@ -1865,15 +1851,8 @@ class App(tk.Tk):
 
         ttk.Label(
             frame,
-            text="Crossfade an intro, main body clip, and outro into the final video. "
-            "Pick a Series for the intro/outro (set those up on the Series Manager "
-            "tab), fill in the rest yourself, or click \"Load from JSON\" to pull "
-            "fields out of a render_state_*.json file a Watch run wrote (even one "
-            "still in progress). Loading from JSON also enables the sermon start/end "
-            "timestamps below, which Trim uses to re-trim the raw recording to those "
-            "exact points, pointing Main clip at the result for a follow-up Stitch — "
-            "otherwise Main clip is assumed to already be trimmed and Stitch alone is "
-            "what you want. Doesn't need a config file or any live connection either way.",
+            text="Crossfades an intro, main clip, and outro. Pick a Series or fill in "
+            "fields by hand, or \"Load from JSON\" a render-state file from a Watch run.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
@@ -3158,9 +3137,7 @@ class OfflineAdvancedWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Applies to Trim and Stitch on the Offline tab — Trim's re-trim step "
-            "(only works when re-trimming a raw recording, right after \"Load from "
-            "JSON\") and Stitch's crossfade.",
+            text="Applies to Offline's Trim and Stitch.",
             style="Muted.TLabel", wraplength=380, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
@@ -3595,10 +3572,7 @@ class InteractiveTrimWindow(tk.Toplevel):
 
         self.hint_label = ttk.Label(
             outer,
-            text="Drag the handles to set the trim range. Click a handle, then "
-            "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
-            "adjustment than dragging allows. The exact Sermon start/end "
-            "fields stay editable after Apply too.",
+            text="Drag handles to trim. Click one, then ←/→ to nudge (Shift for finer).",
             style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
         )
         self.hint_label.pack(side="bottom", anchor="w", pady=(2, 8))
@@ -4211,8 +4185,7 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Settings that apply across the whole app, not tied to any one "
-            "of Watch/Render/Stitch/Learn.",
+            text="App-wide settings.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -4256,10 +4229,8 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Entirely optional — since Mark Start/Mark End on the Live tab can "
-            "drive a whole run by hand, Watch works fine with no ProPresenter "
-            "connection at all. Fill this in only if you want the begin/end slides "
-            "detected automatically instead.",
+            text="Optional — only needed for automatic begin/end slide detection. "
+            "Mark Start/Mark End work without it.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -4287,9 +4258,8 @@ class ConfigWindow(tk.Toplevel):
         )
         ttk.Label(
             frame,
-            text="Connects to ProPresenter only (no OBS needed). Step through your "
-            "slides in ProPresenter — each distinct slide shown appears below with "
-            "its UID.",
+            text="Step through your slides in ProPresenter; each one appears below "
+            "with its UID.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=15, column=0, columnspan=4, sticky="w", pady=(2, 6))
 
@@ -4345,8 +4315,7 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Used to detect when the recording starts and stops during a live "
-            "Watch run.",
+            text="Detects recording start/stop during a live Watch run.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -4365,8 +4334,8 @@ class ConfigWindow(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text="Settings for the automatic trim + stitch a live Watch run does when "
-            "it finishes. The Offline tab's manual crossfade tool doesn't use these.",
+            text="Used for the automatic trim+stitch after Watch finishes — not used "
+            "by Offline.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
 
