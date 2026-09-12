@@ -48,21 +48,25 @@ starter `config.json` next to the script on first run if none exists.
   it resolves, disconnects OBS and ends the Watch run — from there Stitch
   (and a retried Trim, if it failed) work the same way the Offline tab's
   own buttons do, straight off the render-state file this run wrote.
-- **Offline**: crossfade a Series' intro/outro with a main clip by hand
-  via separate Trim and Stitch buttons, or "Load from JSON" a render-state
-  file (even one still in progress) to redo one; this also enables Sermon
-  start/end fields so Trim re-trims the raw recording to those exact
-  points before a follow-up Stitch. "Trim visually…" (next to those
-  fields) sets them by dragging a filmstrip instead of typing timestamps,
-  mobile-photo-app style — drag the two handles for a rough cut, Left/
-  Right nudges the last-touched one for precision (Shift for a finer
-  step). Playback (▶ Play, or ▶ Play selection to preview just the trim
-  range) is embedded right in the window with a seekbar, starting at an
+- **Offline**: crossfade a Series' intro/outro with a trimmed clip by
+  hand via separate Trim and Stitch buttons, or "Load from JSON" a
+  render-state file (even one still in progress) to redo one; this also
+  enables Sermon start/end fields so Trim re-trims Main clip (the raw
+  recording) to those exact points, writing the result to Trimmed clip —
+  Stitch always reads from there, not Main clip, so it's greyed out until
+  Trimmed clip actually points at something, whether that's a fresh Trim
+  result, `trimmed_path` from a loaded render-state file, or one picked
+  by hand. "Trim visually…" (next to Sermon start/end) sets those fields
+  by dragging a filmstrip instead of typing timestamps, mobile-photo-app
+  style — drag the two handles for a rough cut, Left/Right nudges the
+  last-touched one for precision (Shift for a finer step). Playback (the
+  Play/Pause button, or "Play selection" to preview just the trim range)
+  is embedded right in the window with a seekbar, starting at an
   accurate, frame-exact position rather than the nearest keyframe — video
-  plays inline; audio plays too as long as `ffplay` is on PATH (video-only
-  otherwise). "Export to JSON" builds a render-state file from the fields
-  as-is. "Advanced…" holds CRF, Fast copy, Normalize audio (and its
-  Target LUFS), and Encoder settings.
+  plays inline; audio plays too as long as `ffplay` is on PATH (video-
+  only otherwise). "Export to JSON" builds a render-state file from the
+  fields as-is. "Advanced…" holds CRF, Fast copy, Normalize audio (and
+  its Target LUFS), and Encoder settings.
 - **Series Manager**: named intro/outro bundles (a name, an intro clip +
   duration, an outro clip + duration) — set one up once per sermon
   series, then just pick it from the Series dropdown on the Live/Offline
@@ -212,7 +216,9 @@ each one's UID (and text, if any) as you land on it.
 
 Every `watch` run writes a render-state JSON file (path configurable via
 `trim.state_output`): the recording's path, the raw begin/end timestamps,
-and the `trim`/`stitch` settings used. Created the moment `watch` starts
+the trimmed clip's path once Trim has actually produced one (`null`
+until then), and the `trim`/`stitch` settings used. Created the moment
+`watch` starts
 and kept up to date as marks land and recording stops, rather than only
 written once at the end; `render` needs it complete (not still `null`) to
 run. `watch` prints the exact command to reuse it. Edit the file (most
