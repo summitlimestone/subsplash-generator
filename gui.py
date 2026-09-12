@@ -1687,7 +1687,11 @@ class App(tk.Tk):
 
     def _refresh_series_tree(self):
         self.series_tree.delete(*self.series_tree.get_children())
-        for s in self.series:
+        # Visible series first (the ones actually usable from a dropdown
+        # right now), then alphabetically within each group — not insertion
+        # order, so the list stays predictable as entries pile up.
+        ordered = sorted(self.series, key=lambda s: (bool(s.get("hidden", False)), s["name"].lower()))
+        for s in ordered:
             hidden = bool(s.get("hidden", False))
             self.series_tree.insert(
                 "", "end", iid=s["name"], values=(s["name"], s["intro"], s["outro"], "Yes" if hidden else ""),

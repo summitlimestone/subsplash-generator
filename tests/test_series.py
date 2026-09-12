@@ -383,3 +383,13 @@ def test_hiding_the_currently_selected_series_does_not_clear_its_selection(app):
     app._toggle_series_hidden()
     assert app.vars["stitch_series"].get() == "A"
     assert app.vars["stitch_intro"].get() == "/a.mp4"
+
+
+def test_series_tree_sorts_visible_first_then_alphabetically(app):
+    _make_series(app, "Zebra")
+    _make_series(app, "Archived Old One", hidden=True)
+    _make_series(app, "Apple")
+    _make_series(app, "Archived Older Two", hidden=True)
+    assert list(app.series_tree.get_children()) == [
+        "Apple", "Zebra", "Archived Old One", "Archived Older Two",
+    ]
