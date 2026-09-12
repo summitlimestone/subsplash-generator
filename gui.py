@@ -1818,10 +1818,6 @@ class App(tk.Tk):
         )
         self.live_stitch_btn.pack(side="left", padx=(8, 0))
         Tooltip(self.live_stitch_btn, LIVE_STITCH_HELP, font=self.ui_font)
-        self.watch_debug_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn_row, text="Debug", variable=self.watch_debug_var).pack(
-            side="left", padx=(10, 0)
-        )
 
         status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
         status_frame.grid(row=4, column=0, columnspan=6, sticky="ew")
@@ -2140,6 +2136,10 @@ class App(tk.Tk):
             header, text="Stop", style="Danger.TButton", command=self._stop, state="disabled"
         )
         self.stop_button.pack(side="right", padx=(0, 6))
+        self.watch_debug_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Debug", variable=self.watch_debug_var).pack(
+            side="right", padx=(0, 6)
+        )
 
         text_frame = ttk.Frame(parent)
         text_frame.pack(fill="both", expand=True, pady=(4, 0))
