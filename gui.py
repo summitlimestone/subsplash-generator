@@ -38,6 +38,7 @@ import json
 import queue
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -250,11 +251,16 @@ def expand_output_path(path: str) -> str:
     as a subprocess, never imports it) so App._sync_log_file() can expand
     general.log_path itself, the same way every other output-path field
     in this GUI is expanded by service_video.py once it's handed the raw
-    string. Only the filename is expanded, not any directory part of the
-    path — see service_video.py's own copy for the full reasoning."""
-    p = Path(path)
-    name = datetime.now().strftime(p.name).replace("/", "-").replace("\\", "-")
-    return str(p.with_name(name)) if p.name else path
+    string. Expands strftime placeholders anywhere in the path —
+    filename and any directory components — and creates any directory
+    component that doesn't exist yet; see service_video.py's own copy
+    for the full reasoning. Unlike that copy, a failure creating the
+    directory doesn't sys.exit() the whole GUI over a log file — it's
+    left to raise a plain OSError, which _sync_log_file() already
+    catches around its own open() call the same way."""
+    expanded = datetime.now().strftime(path)
+    Path(expanded).parent.mkdir(parents=True, exist_ok=True)
+    return expanded
 
 
 def format_elapsed(seconds: float) -> str:
@@ -270,6 +276,99 @@ def format_elapsed(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def probe_duration(path: str) -> float | None:
+    """A file's duration in seconds via ffprobe, or None if it can't be
+    read — used only by InteractiveTrimWindow to lay out its filmstrip.
+    Called directly rather than through service_video.py: this is a
+    quick, UI-only probe with nothing to trim/stitch, not worth spawning
+    that whole script for."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+
+def accurate_seek_input_args(path: str, timestamp: float) -> list[str]:
+    """ffmpeg input args that seek to `timestamp` both fast and frame-
+    accurately — ffmpeg's own documented "fast + accurate seeking" recipe.
+    A single -ss before -i is a fast demuxer-level seek that only lands
+    at or near the nearest keyframe *before* the target, which is fine
+    for a filmstrip thumbnail but not for something claiming to start
+    "at the right time" (playback, or a precise single-frame preview): a
+    keyframe interval of a few seconds means being off by up to that much.
+
+    Splitting it into a coarse -ss before -i (fast, jumps to just shy of
+    the target) plus a small residual -ss right after -i (which then
+    decodes and discards only that short remaining gap to reach the exact
+    frame) gets both — the "discard" phase stays bounded to a couple of
+    seconds no matter how far into a two-hour recording the target is,
+    unlike putting the whole seek after -i, which would decode from the
+    very start of the file instead."""
+    timestamp = max(timestamp, 0.0)
+    margin = min(timestamp, 5.0)
+    return ["-ss", f"{timestamp - margin:.3f}", "-i", path, "-ss", f"{margin:.3f}"]
+
+
+def extract_frame_png(
+    path: str, timestamp: float, out_path: Path, width: int, height: int | None = None,
+    accurate: bool = False, letterbox: bool = False,
+) -> bool:
+    """Grabs a single frame at `timestamp` as a PNG — Tk's own PhotoImage
+    loads PNG natively (Tk 8.6+), so no Pillow dependency is needed to
+    show it.
+
+    With `height` given and `letterbox=False` (filmstrip thumbnails),
+    scales to fill and center-crops to an exact width x height tile so the
+    filmstrip lines up evenly. With `height` and `letterbox=True` (the
+    large preview, which — unlike a filmstrip tile — shouldn't crop any of
+    the frame away), scales to fit *within* width x height and pads the
+    rest with black, matching the letterbox filter chain the video
+    playback pipe itself uses (see InteractiveTrimWindow._video_playback_worker())
+    so a paused static frame and a playing streamed one line up the same
+    way in the same box. With `height=None`, just scales to `width` wide,
+    keeping the source aspect ratio (unused today, kept for callers that
+    don't care what height they get).
+
+    `accurate=False` (filmstrip thumbnails) uses a plain fast/approximate
+    seek — fine for a coarse scrubber strip, and much quicker across 16 of
+    them. `accurate=True` (the single large preview) uses
+    accurate_seek_input_args() instead, since that image is what the
+    handle-drag readout implicitly claims is "this exact point"."""
+    if height and letterbox:
+        vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+    elif height:
+        # Both dimensions have to be given explicitly here, not -2 for
+        # width — force_original_aspect_ratio=increase needs an actual W:H
+        # box to "increase" against to guarantee the scaled frame covers
+        # it in both dimensions. scale=-2:{height} alone (auto width,
+        # exact aspect match) makes "increase" a no-op — the scaled width
+        # then only happens to be >= the requested crop width by luck of
+        # the source's own aspect ratio, and crop hard-fails once it
+        # isn't: a *real* bug this shipped with (a wide enough window/
+        # filmstrip cell against a source aspect ratio that didn't happen
+        # to cover it left every thumbnail blank above some window width,
+        # confirmed by reproducing the exact ffmpeg crop failure directly).
+        vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+    else:
+        vf = f"scale={width}:-2"
+    input_args = accurate_seek_input_args(path, timestamp) if accurate else ["-ss", f"{max(timestamp, 0):.3f}", "-i", path]
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", *input_args,
+                "-frames:v", "1", "-vf", vf, "-loglevel", "error", str(out_path),
+            ],
+            capture_output=True, timeout=20,
+        )
+        return result.returncode == 0 and out_path.exists()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 # ffmpeg's xfade filter transition names (video-filters.html#xfade-1), for
@@ -1444,10 +1543,10 @@ class App(tk.Tk):
             "Fill in the fields yourself, or click \"Load from JSON\" to pull them out "
             "of a render_state_*.json file a Watch run wrote (even one still in "
             "progress). Loading from JSON also enables the sermon start/end "
-            "timestamps below, which Trim uses to re-trim the raw recording to those "
-            "exact points, pointing Main clip at the result for a follow-up Stitch — "
-            "otherwise Main clip is assumed to already be trimmed and Stitch alone is "
-            "what you want. Doesn't need a config file or any live connection either way.",
+            "timestamps below, which Trim uses to re-trim the raw recording to "
+            "those exact points, writing the result to Trimmed clip — Stitch "
+            "always reads from there, not Main clip. Doesn't need a config file "
+            "or any live connection either way.",
             style="Muted.TLabel", wraplength=760, justify="left",
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
 
@@ -1466,38 +1565,46 @@ class App(tk.Tk):
         )
         self._labeled_entry(frame, 3, "Main clip", "st_main", colspan=3)
         self._add_browse(frame, 3, "st_main", filetypes=VIDEO_FILETYPES, col=3)
-        self._labeled_entry(frame, 4, "Outro clip", "st_outro", colspan=3)
-        self._add_browse(frame, 4, "st_outro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
+        self._labeled_entry(frame, 4, "Trimmed clip", "st_trimmed", colspan=3, help_text=TIMESTAMP_HELP)
+        self._add_browse(frame, 4, "st_trimmed", save=True, filetypes=VIDEO_FILETYPES, col=3)
+        self._labeled_entry(frame, 5, "Outro clip", "st_outro", colspan=3)
+        self._add_browse(frame, 5, "st_outro", filetypes=INTRO_OUTRO_FILETYPES, col=3)
         self._labeled_spinbox(
-            frame, 4, "Duration (s)", "st_outro_duration", from_=0.1, to=120.0,
+            frame, 5, "Duration (s)", "st_outro_duration", from_=0.1, to=120.0,
             default=str(DEFAULT_IMAGE_DURATION), width=6, col=5, help_text=IMAGE_DURATION_HELP,
         )
-        self._labeled_entry(frame, 5, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
-        self._add_browse(frame, 5, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
+        self._labeled_entry(frame, 6, "Output path", "st_output", colspan=3, help_text=TIMESTAMP_HELP)
+        self._add_browse(frame, 6, "st_output", save=True, filetypes=VIDEO_FILETYPES, col=3)
         self.vars["st_output"].set("output.mp4")
 
-        self._labeled_entry(frame, 6, "Sermon start", "st_start", width=13, col=0)
+        self._labeled_entry(frame, 7, "Sermon start", "st_start", width=13, col=0)
         self.vars["st_start"].set("00:00:00.000")
-        self._labeled_entry(frame, 6, "Sermon end", "st_end", width=13, col=2, pad_left=16)
+        self._labeled_entry(frame, 7, "Sermon end", "st_end", width=13, col=2, pad_left=16)
         self.vars["st_end"].set("00:00:00.000")
+        trim_visually_btn = ttk.Button(frame, text="Trim visually…", command=self._open_interactive_trim)
+        trim_visually_btn.grid(row=7, column=4, sticky="w", padx=(16, 0))
+        Tooltip(
+            trim_visually_btn,
+            "Pick Sermon start/end by dragging a filmstrip instead of typing "
+            "timestamps — like a mobile photo app's trim tool. Needs Main clip "
+            "set to a real file first.",
+            font=self.ui_font,
+        )
 
         self._labeled_combobox(
-            frame, 7, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
+            frame, 8, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
         )
         self.vars["st_transition"].set("fade")
-        self._labeled_entry(frame, 7, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
+        self._labeled_entry(frame, 8, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
         self.vars["st_duration"].set("1.0")
 
-        # CRF/Fast copy/Encoder/Encoder preset live in their own "Advanced"
-        # window (see OfflineAdvancedWindow) rather than inline here —
-        # tuning knobs set once and rarely touched, unlike everything
-        # above, which changes per run.
-        ttk.Button(frame, text="Advanced…", command=self._open_offline_advanced_window).grid(
-            row=8, column=0, sticky="w", pady=(6, 0)
-        )
-
+        # Trim/Stitch left-aligned, Advanced… right-aligned, all one row —
+        # a single full-width frame (columnspan matching row 0's own
+        # wraplength'd label above) with plain pack(side=...) inside it,
+        # rather than grid columns, so the two sides can anchor
+        # independently without needing to know how wide the row is.
         offline_btn_row = ttk.Frame(frame)
-        offline_btn_row.grid(row=9, column=0, sticky="w", pady=(10, 0))
+        offline_btn_row.grid(row=9, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
@@ -1506,26 +1613,48 @@ class App(tk.Tk):
         )
         self.offline_stitch_btn.pack(side="left", padx=(8, 0))
         self._start_buttons.append(self.offline_stitch_btn)
-        # Greyed out whenever Main clip is still the untrimmed raw
-        # recording from a loaded render-state file (_offline_use_raw_trim())
-        # — Stitch would just crossfade unedited footage in that case; run
-        # Trim first. Recomputed live off Main clip itself (typed, Browse'd,
-        # or auto-set by a successful Trim — see _handle_offline_trim_line())
-        # rather than only at Load-from-JSON time, so it stays right no
-        # matter how Main clip got to its current value. Doesn't apply
-        # (Stitch stays enabled) once there's no loaded raw state at all —
-        # see _offline_use_raw_trim()'s own docstring.
-        self.vars["st_main"].trace_add("write", self._update_offline_stitch_button)
+        # CRF/Fast copy/Encoder/Encoder preset live in their own "Advanced"
+        # window (see OfflineAdvancedWindow) rather than inline here —
+        # tuning knobs set once and rarely touched, unlike everything
+        # above, which changes per run.
+        ttk.Button(offline_btn_row, text="Advanced…", command=self._open_offline_advanced_window).pack(side="right")
+        # Greyed out whenever Trimmed clip is empty — Stitch always reads
+        # its main clip from there (never Main clip, which is Trim's own
+        # raw source), so there's nothing to crossfade until either Trim
+        # has actually produced one (see _handle_offline_trim_line()) or
+        # it's filled in by hand/Load from JSON.
+        self.vars["st_trimmed"].trace_add("write", self._update_offline_stitch_button)
         self._update_offline_stitch_button()
 
     def _update_offline_stitch_button(self, *_args):
-        raw_trim = self._offline_use_raw_trim(self.vars["st_main"].get().strip())
-        self.offline_stitch_btn.configure(state="disabled" if raw_trim else "normal")
+        has_trimmed = bool(self.vars["st_trimmed"].get().strip())
+        self.offline_stitch_btn.configure(state="normal" if has_trimmed else "disabled")
 
     def _open_offline_advanced_window(self):
         self.offline_advanced_window.deiconify()
         self.offline_advanced_window.lift()
         self.offline_advanced_window.focus_set()
+
+    def _open_interactive_trim(self):
+        main_clip = self.vars["st_main"].get().strip()
+        if not main_clip:
+            messagebox.showerror("Trim visually", "Set Main clip first.")
+            return
+        if not Path(main_clip).exists():
+            messagebox.showerror("Trim visually", f"Main clip not found: {main_clip}")
+            return
+        try:
+            start = to_timestamp(self.vars["st_start"].get().strip() or "00:00:00.000", "Sermon start")
+        except ValueError:
+            start = 0.0
+        try:
+            end = to_timestamp(self.vars["st_end"].get().strip() or "00:00:00.000", "Sermon end")
+        except ValueError:
+            end = 0.0
+        # A fresh window every time (not built-once/withdrawn like
+        # OfflineAdvancedWindow/ConfigWindow) since it's tied to whichever
+        # file Main clip points at right now, which can change between opens.
+        InteractiveTrimWindow(self, main_clip, start, end)
 
     def _browse_render_state(self):
         path = filedialog.askopenfilename(
@@ -1590,13 +1719,13 @@ class App(tk.Tk):
             and state.get("raw_end_offset") is not None
         )
         if has_raw:
-            # Point Main clip at the raw recording (not the already-trimmed
-            # clip) so the timestamp fields below have something meaningful
-            # to trim from — see _run_trim(). Shown as the actual computed
-            # trim points (raw slide-detected offset + any padding that was
-            # applied live), not as a raw/pad split — there's no slide
-            # detection here, just a person looking at footage and picking
-            # exact timestamps.
+            # Point Main clip at the raw recording so the timestamp fields
+            # below have something meaningful to trim from — see
+            # _run_trim(). Shown as the actual computed trim points (raw
+            # slide-detected offset + any padding that was applied live),
+            # not as a raw/pad split — there's no slide detection here,
+            # just a person looking at footage and picking exact
+            # timestamps.
             self.vars["st_main"].set(state["recording_path"])
             try:
                 start_ts = parse_timestamp(state["raw_begin_offset"]) + trim_cfg.get("pad_start_seconds", 0)
@@ -1612,29 +1741,38 @@ class App(tk.Tk):
             self.vars["st_end"].set(format_timestamp(end_ts))
             self._offline_raw_state = {
                 "recording_path": state["recording_path"],
-                "trim_output": trim_cfg.get("output", "body_trimmed.mp4"),
                 "state_output": trim_cfg.get("state_output", DEFAULT_STATE_OUTPUT),
                 "state_path": path,
             }
             self._log(f"[gui] loaded render fields from {path} (timestamps active — Run will re-trim the raw recording)")
         else:
             # Older/hand-built state file missing the raw recording info —
-            # fall back to the pre-trimmed clip, same as before this file
-            # could drive a re-trim at all. Reset the timestamp fields so
-            # they don't show stale numbers left over from a previous load.
-            if "output" in trim_cfg:
-                self.vars["st_main"].set(trim_cfg["output"])
+            # Main clip has nothing meaningful to point at. Reset the
+            # timestamp fields so they don't show stale numbers left over
+            # from a previous load.
             self.vars["st_start"].set("00:00:00.000")
             self.vars["st_end"].set("00:00:00.000")
             self._offline_raw_state = None
             self._log(
                 f"[gui] loaded render fields from {path} (no raw recording info in "
-                "this file — timestamps won't apply; Main clip is treated as already trimmed)"
+                "this file — timestamps won't apply; Trim needs Main clip and both "
+                "set by hand or from a different file)"
             )
-        # Covers the one case a plain Main-clip trace can't: _offline_raw_state
-        # itself just changed above without necessarily re-setting Main clip
-        # to a new value (e.g. the "else" branch above when "output" isn't in
-        # trim_cfg) — see _update_offline_stitch_button()/_offline_use_raw_trim().
+        # Trimmed clip: the real trimmed_path if this state already has
+        # one (see _write_render_state()/service_video.py) — a trim
+        # really happened for it — else blank, not a guess at
+        # trim.output: Stitch's own greying (_update_offline_stitch_button())
+        # keys off this field being non-empty, so pre-filling it with a
+        # destination Trim hasn't actually written yet would make Stitch
+        # look ready when it isn't. Trim falls back to trim.output's own
+        # default on its own once clicked, blank field or not — see
+        # _run_trim(). Independent of has_raw above, so this applies
+        # either way.
+        self.vars["st_trimmed"].set(state.get("trimmed_path") or "")
+        # Covers the one case a plain Trimmed-clip trace can't: it may not
+        # have changed value even though the render-state file (and so
+        # what Stitch would actually use) has — see
+        # _update_offline_stitch_button().
         self._update_offline_stitch_button()
 
     def _open_last_state_in_offline_tab(self):
@@ -1740,11 +1878,11 @@ class App(tk.Tk):
         self._log_path_raw = raw
         if not raw:
             return
-        expanded = expand_output_path(raw)
         try:
+            expanded = expand_output_path(raw)
             self._log_file = open(expanded, "a", encoding="utf-8")
         except OSError as e:
-            self._log(f"[gui] couldn't open log file {expanded}: {e}")
+            self._log(f"[gui] couldn't open log file {raw!r}: {e}")
 
     # ------------------------------------------------------------------
     # Control API — hosted here in the GUI itself (see _build_api_app()),
@@ -2193,15 +2331,16 @@ class App(tk.Tk):
                 # the same way Offline's already do: prefill the Offline
                 # tab from the render-state file this run wrote (the same
                 # "Load from JSON" path, including this session's
-                # Stitch-greying), then point Main clip at the trimmed
-                # clip's own path if Trim actually succeeded (captured off
+                # Stitch-greying), then point Trimmed clip at the trim's
+                # own output path if it actually succeeded (captured off
                 # the console the same way _handle_offline_trim_line() does
                 # for the Offline tab's own Trim — see _handle_watch_line())
-                # instead of the raw recording _load_render_state_json()
-                # would otherwise leave it pointing at.
+                # — the render-state file's own trimmed_path should
+                # already agree (service_video.py writes it too), but this
+                # is the app's own real-time knowledge, so it wins if not.
                 self._load_render_state_json(self.render_state_var.get().strip())
                 if self._live_trimmed_path:
-                    self.vars["st_main"].set(self._live_trimmed_path)
+                    self.vars["st_trimmed"].set(self._live_trimmed_path)
                 self.live_trim_btn.configure(state="normal")
                 self.live_stitch_btn.configure(state=str(self.offline_stitch_btn["state"]))
                 self.mark_start_btn.configure(state="disabled")
@@ -2265,12 +2404,12 @@ class App(tk.Tk):
         self.config_window.add_learned_slide(uid, text)
 
     def _handle_offline_trim_line(self, line: str):
-        """Auto-points Main clip at the Offline tab's Trim button's own
+        """Auto-points Trimmed clip at the Offline tab's Trim button's own
         output once it succeeds, so a follow-up Stitch click picks it up
         without the user having to re-Browse to it themselves."""
         m = TRIMMED_PATH_RE.match(line)
         if m:
-            self.vars["st_main"].set(m.group(1).strip())
+            self.vars["st_trimmed"].set(m.group(1).strip())
 
     def _handle_watch_line(self, line: str):
         m = STATE_RE.search(line)
@@ -2447,15 +2586,18 @@ class App(tk.Tk):
     def _collect_offline_fields(self, error_title: str = "Render") -> dict | None:
         """Validate and collect the Offline tab's fields as a plain dict —
         shared by _run_trim()/_run_stitch()/_export_render_state(), since
-        all three need the same inputs (just doing different things with
-        them afterward). Returns None (after showing an error dialog titled
+        all three need most of the same inputs (just doing different
+        things with them afterward, and each requiring their own subset —
+        e.g. Stitch needs Trimmed clip, not Main clip; see each caller's
+        own check). Returns None (after showing an error dialog titled
         `error_title`) if something required is missing or invalid."""
         intro = self.vars["st_intro"].get().strip()
         main_clip = self.vars["st_main"].get().strip()
+        trimmed_clip = self.vars["st_trimmed"].get().strip()
         outro = self.vars["st_outro"].get().strip()
         output = self.vars["st_output"].get().strip() or "output.mp4"
-        if not intro or not main_clip or not outro:
-            messagebox.showerror(error_title, "Intro, main clip, and outro paths are all required.")
+        if not intro or not outro:
+            messagebox.showerror(error_title, "Intro and outro paths are both required.")
             return None
         try:
             duration = to_float(self.vars["st_duration"].get().strip() or "1.0", "Transition duration")
@@ -2481,7 +2623,7 @@ class App(tk.Tk):
             return None
         transition = self.vars["st_transition"].get().strip() or "fade"
         return {
-            "intro": intro, "main_clip": main_clip, "outro": outro, "output": output,
+            "intro": intro, "main_clip": main_clip, "trimmed_clip": trimmed_clip, "outro": outro, "output": output,
             "duration": duration, "intro_duration": intro_duration, "outro_duration": outro_duration,
             "crf": crf, "subsplash_preset": subsplash_preset, "trim_fast_copy": trim_fast_copy,
             "normalize_audio": normalize_audio, "normalize_target_lufs": normalize_target_lufs,
@@ -2499,11 +2641,15 @@ class App(tk.Tk):
         re-trimming it (_run_trim), or generic defaults when there's no
         loaded file to inherit them from (_export_render_state).
         stitch_auto is False for _run_trim() (trim only, no stitch — see
-        its docstring), True everywhere else."""
+        its docstring), True everywhere else. trimmed_path is whatever's
+        currently in Trimmed clip, if anything — same field Stitch itself
+        reads from (see _run_stitch()) — so a round trip through Export
+        to JSON then Load from JSON preserves it."""
         return {
             "recording_path": f["main_clip"],
             "raw_begin_offset": format_timestamp(f["start_ts"]),
             "raw_end_offset": format_timestamp(f["end_ts"]),
+            "trimmed_path": f.get("trimmed_clip") or None,
             "trim": {
                 "output": trim_output,
                 "state_output": state_output,
@@ -2544,12 +2690,13 @@ class App(tk.Tk):
     def _run_trim(self):
         """Re-trims the raw recording down to Sermon start/Sermon end —
         i.e. just the trim half of what a live Watch run does — writing
-        the result to Main clip so a follow-up Stitch click picks it up
-        (see _handle_offline_command_line()/TRIMMED_PATH_RE). Only
-        meaningful right after "Load from JSON", before Main clip is
-        changed — Sermon start/end are absolute timestamps a person picked
-        by eye, not a raw/pad split (there's no slide detection here), so
-        they're passed straight through as the offsets with zero padding."""
+        the result to Trimmed clip (see _handle_offline_trim_line()/
+        TRIMMED_PATH_RE for how the actual resolved path lands there) so
+        a follow-up Stitch click picks it up. Only meaningful right after
+        "Load from JSON", before Main clip is changed — Sermon start/end
+        are absolute timestamps a person picked by eye, not a raw/pad
+        split (there's no slide detection here), so they're passed
+        straight through as the offsets with zero padding."""
         f = self._collect_offline_fields(error_title="Trim")
         if f is None:
             return
@@ -2559,7 +2706,8 @@ class App(tk.Tk):
                 "Trim",
                 "Main clip isn't the raw recording from a loaded render-state file — "
                 "Trim only works right after \"Load from JSON\", before Main clip is "
-                "changed. Use Stitch instead if Main clip is already trimmed.",
+                "changed. Use Stitch instead if Trimmed clip already points at an "
+                "already-trimmed clip.",
             )
             return
 
@@ -2570,8 +2718,11 @@ class App(tk.Tk):
         # of what actually happened live just because you clicked Trim.
         # So this writes to a throwaway temp file instead (cleaned up
         # once the process exits, see _on_process_exit()); use "Export to
-        # JSON" if you actually want to keep these settings.
-        render_state = self._build_render_state(f, raw["trim_output"], raw["state_output"], stitch_auto=False)
+        # JSON" if you actually want to keep these settings. Trimmed clip
+        # itself is where Trim actually writes — whatever's currently in
+        # that field, same as Stitch will read from once this succeeds.
+        trim_output = f["trimmed_clip"] or "body_trimmed.mp4"
+        render_state = self._build_render_state(f, trim_output, raw["state_output"], stitch_auto=False)
         temp_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="render_state_", delete=False
         )
@@ -2581,20 +2732,22 @@ class App(tk.Tk):
         self._start("trim", ["render", temp_file.name])
 
     def _run_stitch(self):
-        """Crossfades Intro/Main clip/Outro as-is — Main clip is assumed
-        to already be trimmed (a prior Trim click already points it at
-        the result — see _run_trim() — or it's some other already-
-        trimmed file picked by hand)."""
+        """Crossfades Intro/Trimmed clip/Outro as-is — Trimmed clip is
+        assumed to already be trimmed (a prior Trim click already points
+        it at the result — see _run_trim() — or it's some other already-
+        trimmed file picked by hand); Main clip (the raw recording) is
+        never read here."""
         f = self._collect_offline_fields(error_title="Stitch")
         if f is None:
             return
-        if self._offline_use_raw_trim(f["main_clip"]) and (f["start_ts"] or f["end_ts"]):
-            self._log(
-                "[gui] note: Sermon start/Sermon end are ignored by Stitch — trim first, "
-                "or edit Main clip to point at an already-trimmed clip."
+        if not f["trimmed_clip"]:
+            messagebox.showerror(
+                "Stitch", "Trimmed clip is required — run Trim first, or fill it in "
+                "with an already-trimmed file.",
             )
+            return
         args = [
-            "stitch", f["intro"], f["main_clip"], f["outro"],
+            "stitch", f["intro"], f["trimmed_clip"], f["outro"],
             "-o", f["output"], "-d", str(f["duration"]), "-t", f["transition"], "--crf", str(f["crf"]),
             "--intro-duration", str(f["intro_duration"]), "--outro-duration", str(f["outro_duration"]),
             "--encoder", f["encoder"],
@@ -2618,11 +2771,15 @@ class App(tk.Tk):
         f = self._collect_offline_fields(error_title="Export to JSON")
         if f is None:
             return
+        if not f["main_clip"]:
+            messagebox.showerror("Export to JSON", "Main clip is required.")
+            return
         if f["end_ts"] <= f["start_ts"]:
             messagebox.showerror("Export to JSON", "Sermon end must be after Sermon start.")
             return
 
-        render_state = self._build_render_state(f, "body_trimmed.mp4", DEFAULT_STATE_OUTPUT)
+        trim_output = f["trimmed_clip"] or "body_trimmed.mp4"
+        render_state = self._build_render_state(f, trim_output, DEFAULT_STATE_OUTPUT)
         default_name = f"render_state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path = filedialog.asksaveasfilename(
             title="Export render-state JSON", defaultextension=".json",
@@ -2734,6 +2891,816 @@ class OfflineAdvancedWindow(tk.Toplevel):
         Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
 
         self.withdraw()
+
+
+# InteractiveTrimWindow layout constants — a fixed-size filmstrip made of
+# this many square-ish tiles, plus the large preview above it (used both
+# for a single scrubbed frame and for streamed playback).
+TRIM_THUMBS = 16
+TRIM_STRIP_W = 720
+TRIM_STRIP_H = 60
+TRIM_HANDLE_W = 10
+TRIM_PREVIEW_W = 480
+TRIM_PREVIEW_H = 270
+TRIM_PLAYER_FPS = 30
+# How often the main thread checks its inbound queue (thumbnails, preview
+# frames, playback frames, status) — was 50ms, which is coarser than one
+# frame at 30fps (33.3ms) and made playback look choppy independent of
+# TRIM_PLAYER_FPS itself: frames would sit queued a little longer than
+# necessary, land in uneven bursts across drain cycles instead of a
+# steady one-per-tick cadence. Cheap to poll this often — draining an
+# empty queue is just one get_nowait() raising immediately.
+TRIM_QUEUE_POLL_MS = 10
+TRIM_ICON_SIZE = 16  # the play/pause button's icon, in pixels
+
+# Font Awesome Free 6.7.2 "play"/"pause" (solid) icon path data — real
+# vector icon shapes, not a font glyph like "▶"/"⏸" (some fonts render
+# that as a boxed/missing-glyph fallback — the bug this replaced) and not
+# something that needs a specific font (a Nerd Font or otherwise)
+# installed to look right. This is a tool other volunteers run, not just
+# one developer's own machine, so it can't depend on that. Rasterized at
+# runtime by ffmpeg's own SVG decoder (see build_svg_icon()) into a small
+# transparent PNG, loaded the exact same way every other frame/thumbnail
+# in this window already is — Tk's own PhotoImage, no Pillow.
+#   Font Awesome Free by @fontawesome - https://fontawesome.com
+#   License - https://fontawesome.com/license/free
+#   (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License)
+#   Copyright 2024 Fonticons, Inc.
+TRIM_PLAY_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512">'
+    '<path fill="{color}" d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80L0 432c0 17.4 9.4 33.4 24.5 41.9'
+    's33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg>'
+)
+TRIM_PAUSE_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512">'
+    '<path fill="{color}" d="M48 64C21.5 64 0 85.5 0 112L0 400c0 26.5 21.5 48 48 48l32 0c26.5 0 48-21.5 48-48'
+    'l0-288c0-26.5-21.5-48-48-48L48 64zm192 0c-26.5 0-48 21.5-48 48l0 288c0 26.5 21.5 48 48 48l32 0c26.5 0 48-21.5'
+    '48-48l0-288c0-26.5-21.5-48-48-48l-32 0z"/></svg>'
+)
+
+
+def build_svg_icon(svg_template: str, color: str, size: int) -> tk.PhotoImage | None:
+    """Rasterizes a small inline SVG into a `size` x `size` transparent PNG
+    via ffmpeg's own SVG decoder (needs a build with librsvg — true of
+    every mainstream build this project already tells you to install, but
+    not guaranteed of every possible one), then loads it as a Tk
+    PhotoImage. Returns None — the caller falls back to
+    build_fallback_play_icon()/build_fallback_pause_icon() — if ffmpeg
+    can't do this for any reason, rather than letting a decorative icon
+    take the whole window down."""
+    svg = svg_template.format(color=color)
+    svg_path = out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False, mode="w", encoding="utf-8") as f:
+            f.write(svg)
+            svg_path = f.name
+        out_path = svg_path[:-4] + ".png"
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", svg_path, "-vf", f"scale={size}:{size}",
+                "-frames:v", "1", "-loglevel", "error", out_path,
+            ],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0 or not Path(out_path).exists():
+            return None
+        return tk.PhotoImage(file=out_path)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        for p in (svg_path, out_path):
+            if p:
+                Path(p).unlink(missing_ok=True)
+
+
+def build_fallback_play_icon(size: int, color: str) -> tk.PhotoImage:
+    """A solid right-pointing triangle, drawn pixel-by-pixel — used only
+    if build_svg_icon() can't rasterize the real Font Awesome icon (see
+    its own docstring). Still font-independent, just less polished."""
+    img = tk.PhotoImage(width=size, height=size)
+    half = size / 2
+    for y in range(size):
+        span = y if y <= half else size - y
+        x_right = min(size, round((span / half) * size)) if half else size
+        if x_right > 0:
+            img.put(color, to=(0, y, x_right, y + 1))
+    return img
+
+
+def build_fallback_pause_icon(size: int, color: str) -> tk.PhotoImage:
+    """Two solid vertical bars — see build_fallback_play_icon()'s docstring."""
+    img = tk.PhotoImage(width=size, height=size)
+    bar_w = max(2, round(size * 0.26))
+    gap = max(2, round(size * 0.22))
+    x0 = (size - (bar_w * 2 + gap)) // 2
+    img.put(color, to=(x0, 0, x0 + bar_w, size))
+    img.put(color, to=(x0 + bar_w + gap, 0, x0 + bar_w + gap + bar_w, size))
+    return img
+
+
+def build_play_pause_icons(size: int, color: str) -> tuple[tk.PhotoImage, tk.PhotoImage]:
+    """The play/pause pair, preferring the real Font Awesome SVGs and
+    falling back to the plain drawn shapes if ffmpeg can't rasterize them
+    (see build_svg_icon()) — always both from the same source, never one
+    of each, so they stay visually consistent with each other."""
+    play = build_svg_icon(TRIM_PLAY_ICON_SVG, color, size)
+    pause = build_svg_icon(TRIM_PAUSE_ICON_SVG, color, size)
+    if play is not None and pause is not None:
+        return play, pause
+    return build_fallback_play_icon(size, color), build_fallback_pause_icon(size, color)
+
+
+class InteractiveTrimWindow(tk.Toplevel):
+    """A mobile-photo-app-style visual trimmer for the Offline tab's Sermon
+    start/Sermon end fields — a filmstrip of thumbnails spanning Main
+    clip's full length, with two draggable handles marking the selected
+    range, a seekbar with real embedded video playback (in this window,
+    not a separate player window) plus audio, and a live single-frame
+    preview of whichever handle last moved while paused.
+
+    A fresh instance every time (see App._open_interactive_trim()), unlike
+    OfflineAdvancedWindow/ConfigWindow's build-once-and-withdraw pattern —
+    this one is tied to a specific source file and starting range, so
+    there's nothing worth keeping alive between opens.
+
+    All the actual frame-grabbing (ffprobe for duration, ffmpeg for
+    thumbnails/preview frames/playback) happens in background threads and
+    is handed back via a queue drained on a Tk after() loop, the same
+    cross-thread-to-Tk pattern App itself uses for streaming a subprocess's
+    output (see App._drain_queue()) — necessary because Tk widgets can
+    only safely be touched from the main thread.
+
+    Video is a hand-rolled embedded player: an ffmpeg process pipes raw
+    frames (rawvideo/rgb24) from the source/position, read in their own
+    thread and paced against wall-clock so it doesn't just blast frames
+    onto the canvas as fast as ffmpeg can decode them. Audio is
+    deliberately NOT the same trick — it's an invisible `ffplay -nodisp`
+    subprocess instead (see _start_audio()) rather than raw PCM piped into
+    a Python audio library (sounddevice/PortAudio) from a thread in this
+    same process: an earlier version did exactly that, and it reliably
+    segfaulted the whole app a few seconds into playback whenever the
+    video pipe was also running — a native crash no amount of Python-level
+    try/except can catch, since it doesn't happen in Python at all. A
+    subprocess crashing just means silent playback; it can't take the
+    rest of the app down. The trade-off: video and audio aren't frame-
+    locked to each other, just both started at the same position and each
+    paced against real time on its own, which is close enough for a short
+    preview clip (this is a trim tool, not a video editor).
+
+    The filmstrip's own thumbnails stay deliberately coarse/approximate
+    (fine for a scrubber strip spanning a two-hour service, and much
+    faster to generate 16 of) — but *playback* start position and the
+    single large preview frame both use accurate_seek_input_args() so
+    "starts at the right time" is actually true, not just approximately
+    so. Left/Right (Shift for a finer step) nudges the last-touched trim
+    handle for precision beyond dragging; the exact Sermon start/end text
+    fields on the Offline tab stay editable after Apply too."""
+
+    def __init__(self, app: App, source_path: str, start_seconds: float, end_seconds: float):
+        super().__init__(app)
+        self.app = app
+        self.source_path = source_path
+        self.title(f"Trim visually — {Path(source_path).name}")
+        self.configure(bg=PALETTE["bg"])
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self.duration: float | None = None
+        self.start = max(0.0, start_seconds)
+        self.end = max(0.0, end_seconds)
+        self.active_handle = "end"  # which handle Left/Right/preview follows
+        self.playhead = self.end  # seekbar/playback position, independent of the trim handles
+        self._drag: str | None = None
+        self._closed = False
+        self._preview_job = None
+        self._preview_request_id = 0
+        self._thumb_images: dict[int, tk.PhotoImage] = {}  # keep refs alive
+        self._tmpdir = tempfile.mkdtemp(prefix="interactive_trim_")
+
+        # Current preview/filmstrip pixel sizes — start at the module
+        # defaults, track the window from there as it's resized (see
+        # _on_preview_configure()/_on_canvas_configure()). Real ffmpeg-
+        # decoded/extracted media, unlike the rest of the layout, so
+        # resizing them means re-extracting at the new size rather than
+        # anything Tk can do to existing PhotoImages on its own.
+        self.preview_w, self.preview_h = TRIM_PREVIEW_W, TRIM_PREVIEW_H
+        self.strip_w = TRIM_STRIP_W
+        self._preview_resize_job = None
+        self._filmstrip_resize_job = None
+        # Bumped every time filmstrip thumbnails are (re)generated — see
+        # _generate_filmstrip()'s own docstring for why.
+        self._filmstrip_generation = 0
+
+        # Playback state.
+        self.playing = False
+        self._play_generation = 0  # bumped on every start/stop so late frames from a just-stopped run are dropped
+        self._play_stop_at: float | None = None  # set by "Play selection" to auto-pause at the trim end
+        self._video_proc: subprocess.Popen | None = None
+        self._audio_proc: subprocess.Popen | None = None  # an invisible `ffplay -nodisp`, see _start_playback()
+        self._audio_ok = shutil.which("ffplay") is not None
+
+        self._queue: "queue.Queue" = queue.Queue()
+        self._build_ui()
+        # A floor, not a fixed size — resizable (see _build_ui()'s packing:
+        # the preview pane expands, everything else docks to the bottom),
+        # just never shrinks below what the initial layout needs.
+        self.update_idletasks()
+        self.minsize(self.winfo_reqwidth(), self.winfo_reqheight())
+        self.after(TRIM_QUEUE_POLL_MS, self._drain_queue)
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _build_ui(self):
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        # Everything below is packed side="bottom", in reverse of its
+        # visual top-to-bottom order (each new bottom-packed widget claims
+        # space just above the previous one) — a standard pack() trick so
+        # these all stay docked to the bottom, fixed height, while the
+        # preview pane (packed last, side="top", fill="both", expand=True)
+        # claims whatever space is left above them and actually grows/
+        # shrinks with the window. See _on_preview_configure()/
+        # _on_canvas_configure() for how the preview/filmstrip content
+        # itself keeps up with that, not just the widgets holding it.
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(side="bottom", fill="x")
+        # Square, icon-only (drawn icons, same pixel size in both states, so
+        # toggling between them doesn't resize the button) — "Play
+        # selection" stays a plain labeled button since it's a distinct
+        # action, not a play/pause toggle.
+        self._play_icon, self._pause_icon = build_play_pause_icons(TRIM_ICON_SIZE, PALETTE["text"])
+        self.play_pause_btn = ttk.Button(btn_row, image=self._play_icon, command=self._toggle_play)
+        self.play_pause_btn.pack(side="left")
+        self.play_selection_btn = ttk.Button(btn_row, text="Play selection", command=self._play_selection)
+        self.play_selection_btn.pack(side="left", padx=(8, 0))
+        if not self._audio_ok:
+            for btn in (self.play_pause_btn, self.play_selection_btn):
+                Tooltip(
+                    btn,
+                    "Playing video only, no sound — ffplay wasn't found on PATH "
+                    "(it ships with the full ffmpeg suite) to play audio.",
+                    font=self.app.ui_font,
+                )
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side="right")
+        ttk.Button(btn_row, text="Apply", style="Accent.TButton", command=self._apply).pack(side="right", padx=(0, 8))
+
+        self.hint_label = ttk.Label(
+            outer,
+            text="Drag the handles to set the trim range. Click a handle, then "
+            "←/→ to nudge it (0.5s, or 0.05s held with Shift) for finer "
+            "adjustment than dragging allows. The exact Sermon start/end "
+            "fields stay editable after Apply too.",
+            style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
+        )
+        self.hint_label.pack(side="bottom", anchor="w", pady=(2, 8))
+
+        self.status_var = tk.StringVar(value="Loading…")
+        ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").pack(
+            side="bottom", anchor="w", pady=(4, 0)
+        )
+
+        self.canvas = tk.Canvas(
+            outer, width=TRIM_STRIP_W, height=TRIM_STRIP_H,
+            bg=PALETTE["bg"], highlightthickness=1, highlightbackground=PALETTE["border"],
+        )
+        self.canvas.pack(side="bottom", fill="x")
+        self.canvas.create_text(
+            TRIM_STRIP_W // 2, TRIM_STRIP_H // 2, text="Loading filmstrip…",
+            fill=PALETTE["muted"], tags="loading_text",
+        )
+        self.canvas.tag_bind("handle_start", "<ButtonPress-1>", lambda e: self._begin_drag("start"))
+        self.canvas.tag_bind("handle_end", "<ButtonPress-1>", lambda e: self._begin_drag("end"))
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<Left>", lambda e: self._nudge(-1, fine=False))
+        self.canvas.bind("<Right>", lambda e: self._nudge(1, fine=False))
+        self.canvas.bind("<Shift-Left>", lambda e: self._nudge(-1, fine=True))
+        self.canvas.bind("<Shift-Right>", lambda e: self._nudge(1, fine=True))
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.focus_set()
+
+        readout = ttk.Frame(outer)
+        readout.pack(side="bottom", fill="x", pady=(0, 6))
+        # Created before the Scale below, not after — .set(0) on it fires
+        # its command= callback (_on_seekbar_change()) synchronously, which
+        # touches this var, so it has to exist first.
+        self.position_var = tk.StringVar(value=format_timestamp(0))
+        self.start_var = tk.StringVar()
+        self.end_var = tk.StringVar()
+        self.selected_var = tk.StringVar()
+        ttk.Label(readout, textvariable=self.position_var, style="Header.TLabel").pack(side="left")
+        ttk.Label(readout, textvariable=self.start_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.end_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(readout, textvariable=self.selected_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+
+        self.seekbar = ttk.Scale(outer, from_=0, to=100, orient="horizontal", command=self._on_seekbar_change)
+        self.seekbar.set(0)
+        self.seekbar.state(["disabled"])
+        self.seekbar.pack(side="bottom", fill="x", pady=(0, 4))
+        self.seekbar.bind("<ButtonPress-1>", self._seekbar_press)
+        self.seekbar.bind("<ButtonRelease-1>", self._seekbar_release)
+
+        # The preview pane — packed last so it claims all remaining space
+        # (fill="both", expand=True) above the docked rows built above.
+        # A solid black placeholder PhotoImage, not a bare Label — a Label's
+        # width/height options are character-based until it actually has an
+        # image assigned, so setting pixel dimensions before the first real
+        # frame arrives would size it completely wrong.
+        self._preview_image = tk.PhotoImage(width=self.preview_w, height=self.preview_h)
+        self._preview_image.put("black", to=(0, 0, self.preview_w, self.preview_h))
+        self.preview_label = tk.Label(outer, image=self._preview_image, bg="black")
+        self.preview_label.pack(side="top", fill="both", expand=True, pady=(0, 8))
+        self.preview_label.bind("<Configure>", self._on_preview_configure)
+
+    # -- background work --------------------------------------------------
+
+    def _seek_time(self, t: float) -> float:
+        """The timestamp actually handed to ffmpeg for a frame grab —
+        clamped just shy of self.duration, since seeking to (or past) exact
+        EOF reliably yields zero frames. self.start/self.end themselves
+        (the real trim points) are never touched by this, only what's used
+        to render a thumbnail/preview/playback *of* them."""
+        if self.duration:
+            return max(0.0, min(t, self.duration - 0.05))
+        return max(0.0, t)
+
+    def _load_worker(self):
+        duration = probe_duration(self.source_path)
+        if not duration:
+            self._queue.put(("error", "Could not read this file's duration — is ffprobe on PATH?"))
+            return
+        self._queue.put(("duration", duration))
+        self._generate_filmstrip(duration)
+
+    def _generate_filmstrip(self, duration: float):
+        """(Re)extracts all TRIM_THUMBS filmstrip thumbnails at the current
+        self.strip_w — used both for the initial load and to regenerate
+        after a resize settles (see _on_canvas_configure()/
+        _regenerate_filmstrip()). Stamps every queued result with the
+        generation current when this call started, so _on_thumb() can drop
+        stale results from a run a newer resize has already superseded —
+        same guarded-background-work pattern as _preview_request_id/
+        _play_generation elsewhere in this class."""
+        self._filmstrip_generation += 1
+        gen = self._filmstrip_generation
+        strip_w = self.strip_w
+        cell_w = max(strip_w // TRIM_THUMBS, 1)
+        failures = 0
+        for i in range(TRIM_THUMBS):
+            if self._closed or gen != self._filmstrip_generation:
+                return
+            t = self._seek_time(duration * i / max(TRIM_THUMBS - 1, 1))
+            out = Path(self._tmpdir) / f"thumb_{gen}_{i}.png"
+            ok = extract_frame_png(self.source_path, t, out, width=cell_w, height=TRIM_STRIP_H)
+            failures += not ok
+            self._queue.put(("thumb", gen, i, strip_w, str(out) if ok else None))
+            self._queue.put(("status", f"Loading filmstrip… ({i + 1}/{TRIM_THUMBS})"))
+        if gen == self._filmstrip_generation:
+            # Failures used to go unreported — the loop still "finished" and
+            # cleared the status line to blank even if every single
+            # extraction had failed, leaving a silently, permanently blank
+            # filmstrip with no indication anything was wrong (this is
+            # exactly how a real ffmpeg filter bug here once shipped
+            # undetected). Surfacing a count here doesn't fix a bad filter
+            # graph on its own, but at least it's visible when one exists.
+            self._queue.put((
+                "status",
+                f"{failures}/{TRIM_THUMBS} filmstrip thumbnails failed to load" if failures else "",
+            ))
+
+    def _regenerate_filmstrip(self):
+        self._filmstrip_resize_job = None
+        if self._closed or self.duration is None:
+            return
+        self.canvas.delete("thumb")
+        self._thumb_images.clear()
+        threading.Thread(target=self._generate_filmstrip, args=(self.duration,), daemon=True).start()
+
+    def _request_preview(self, label: str, t: float):
+        self._preview_job = None
+        self._preview_request_id += 1
+        req_id = self._preview_request_id
+        t = self._seek_time(t)
+        threading.Thread(target=self._preview_worker, args=(req_id, label, t), daemon=True).start()
+
+    def _preview_worker(self, req_id: int, label: str, t: float):
+        if self._closed:
+            return
+        out = Path(self._tmpdir) / f"preview_{req_id}.png"
+        ok = extract_frame_png(
+            self.source_path, t, out, width=self.preview_w, height=self.preview_h, accurate=True, letterbox=True,
+        )
+        self._queue.put(("preview", req_id, str(out) if ok else None))
+
+    @staticmethod
+    def _read_exact(stream, n: int) -> bytes | None:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = stream.read(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _video_playback_worker(self, gen: int, start_t: float, w: int, h: int):
+        # w/h are passed in (the preview pane's size at the moment
+        # playback started) rather than read from self.preview_w/h here,
+        # so a resize mid-playback can't change them out from under an
+        # already-running pipe — _apply_preview_resize() instead stops and
+        # restarts playback fresh at the new size.
+        frame_bytes = w * h * 3
+        # Same letterbox-to-a-fixed-size idea service_video.py's own filter
+        # chain uses (scale to fit, pad the rest) — needed here because the
+        # raw pipe has to be a known, fixed frame size to parse back out.
+        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={TRIM_PLAYER_FPS}"
+        cmd = [
+            "ffmpeg", *accurate_seek_input_args(self.source_path, start_t),
+            "-map", "0:v:0", "-vf", vf, "-pix_fmt", "rgb24",
+            "-f", "rawvideo", "-loglevel", "error", "-",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        if gen != self._play_generation:
+            proc.terminate()
+            return
+        self._video_proc = proc
+        frame_interval = 1.0 / TRIM_PLAYER_FPS
+        wall_start = time.monotonic()
+        i = 0
+        try:
+            while gen == self._play_generation:
+                buf = self._read_exact(proc.stdout, frame_bytes)
+                if buf is None:
+                    break
+                target_wall = wall_start + i * frame_interval
+                now = time.monotonic()
+                if now < target_wall:
+                    time.sleep(target_wall - now)
+                self._queue.put(("frame", gen, buf, w, h, start_t + i / TRIM_PLAYER_FPS))
+                i += 1
+        finally:
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.terminate()
+        if gen == self._play_generation:
+            self._queue.put(("playback_ended", gen))
+
+    def _start_audio(self, start_t: float) -> subprocess.Popen | None:
+        """Launches audio-only playback as an invisible ffplay subprocess —
+        `-nodisp` skips opening any window at all, so this can't reproduce
+        the original bug report's separate/fullscreen player window, and
+        it paces itself against real time on its own (no manual pacing
+        loop needed the way the video pipe below needs one).
+
+        Deliberately a real OS process, not (say) piping raw audio into a
+        Python audio library from a thread in this same process the way
+        the video side pipes raw frames: an early version of this feature
+        did exactly that (sounddevice/PortAudio), and it reliably
+        segfaulted the whole app a few seconds into playback when a
+        second ffmpeg pipe (video) was also running — a native crash below
+        Python, out of reach of any try/except. A crashed ffplay just
+        means silent playback; it can't take the rest of the app down."""
+        cmd = ["ffplay", "-nodisp", "-loglevel", "error", *accurate_seek_input_args(self.source_path, start_t)]
+        try:
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return None
+
+    # -- queue drain (main thread only) ------------------------------------
+
+    def _drain_queue(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                kind = msg[0]
+                if kind == "error":
+                    self.status_var.set(msg[1])
+                elif kind == "duration":
+                    self._on_duration(msg[1])
+                elif kind == "thumb":
+                    self._on_thumb(msg[1], msg[2], msg[3], msg[4])
+                elif kind == "preview":
+                    self._on_preview(msg[1], msg[2])
+                elif kind == "status":
+                    self.status_var.set(msg[1])
+                elif kind == "frame":
+                    self._on_frame(msg[1], msg[2], msg[3], msg[4], msg[5])
+                elif kind == "playback_ended":
+                    self._on_playback_ended(msg[1])
+        except queue.Empty:
+            pass
+        if not self._closed:
+            self.after(TRIM_QUEUE_POLL_MS, self._drain_queue)
+
+    def _on_duration(self, duration: float):
+        self.duration = duration
+        # Unset/stale timestamps from the text fields (e.g. still the
+        # "00:00:00.000" default, or left over from a different file)
+        # collapse to the full clip rather than a zero-length selection.
+        if self.end <= self.start or self.end > duration + 0.01:
+            self.start, self.end = 0.0, duration
+        self.start = max(0.0, min(self.start, duration))
+        self.end = max(self.start, min(self.end, duration))
+        self.playhead = self.end
+        self.canvas.delete("loading_text")
+        self._draw_handles()
+        self._update_readout()
+        self.seekbar.configure(to=duration)
+        self.seekbar.state(["!disabled"])
+        self.seekbar.set(self.playhead)
+        self._request_preview("end", self.end)
+
+    def _on_thumb(self, gen: int, index: int, strip_w: int, path: str | None):
+        if gen != self._filmstrip_generation:
+            # A resize superseded this run before it finished — see
+            # _generate_filmstrip()'s docstring.
+            if path:
+                Path(path).unlink(missing_ok=True)
+            return
+        if path:
+            try:
+                img = tk.PhotoImage(file=path)
+            except tk.TclError:
+                img = None
+            if img:
+                self._thumb_images[index] = img
+                x = strip_w * index // TRIM_THUMBS
+                self.canvas.create_image(x, 0, image=img, anchor="nw", tags="thumb")
+                self.canvas.tag_raise("shade")
+                self.canvas.tag_raise("handle")
+
+    def _on_preview(self, req_id: int, path: str | None):
+        if req_id != self._preview_request_id or self.playing:
+            # Superseded by a newer drag/nudge/seek before this one
+            # finished, or playback started in the meantime — discard it
+            # (and its file; nothing else will ever read it) rather than
+            # stomp on a newer static frame or interrupt live playback.
+            if path:
+                Path(path).unlink(missing_ok=True)
+            return
+        if path:
+            try:
+                img = tk.PhotoImage(file=path)
+            except tk.TclError:
+                return
+            self._preview_image = img
+            self.preview_label.configure(image=img)
+            Path(path).unlink(missing_ok=True)
+
+    def _on_frame(self, gen: int, raw: bytes, w: int, h: int, t: float):
+        if gen != self._play_generation or not self.playing:
+            return
+        header = f"P6\n{w} {h}\n255\n".encode("ascii")
+        self._preview_image = tk.PhotoImage(data=header + raw)
+        self.preview_label.configure(image=self._preview_image)
+        self.playhead = t
+        self.seekbar.set(t)
+        self.position_var.set(format_timestamp(t))
+        if self._play_stop_at is not None and t >= self._play_stop_at:
+            self._stop_playback()
+
+    def _on_playback_ended(self, gen: int):
+        if gen == self._play_generation:
+            self._stop_playback()
+
+    # -- filmstrip / handle geometry --------------------------------------
+
+    def _time_to_x(self, t: float) -> int:
+        if not self.duration:
+            return 0
+        return int(self.strip_w * t / self.duration)
+
+    def _x_to_time(self, x: float) -> float:
+        if not self.duration:
+            return 0.0
+        x = max(0, min(self.strip_w, x))
+        return self.duration * x / self.strip_w
+
+    def _draw_handles(self):
+        self.canvas.delete("shade")
+        self.canvas.delete("handle")
+        if self.duration is None:
+            return
+        sx, ex = self._time_to_x(self.start), self._time_to_x(self.end)
+        h = TRIM_STRIP_H
+        # Grey out the trimmed-away regions on either side of the selection,
+        # the same visual language mobile trim UIs use.
+        if sx > 0:
+            self.canvas.create_rectangle(0, 0, sx, h, fill="black", stipple="gray50", width=0, tags="shade")
+        if ex < self.strip_w:
+            self.canvas.create_rectangle(ex, 0, self.strip_w, h, fill="black", stipple="gray50", width=0, tags="shade")
+        hw = TRIM_HANDLE_W
+        self.canvas.create_rectangle(
+            sx - hw // 2, 0, sx + hw // 2, h, fill=PALETTE["accent"], outline="", tags=("handle", "handle_start"),
+        )
+        self.canvas.create_rectangle(
+            ex - hw // 2, 0, ex + hw // 2, h, fill=PALETTE["accent"], outline="", tags=("handle", "handle_end"),
+        )
+
+    # -- resize handling ---------------------------------------------------
+    # Both the filmstrip and the preview pane are real ffmpeg-extracted
+    # media, not something Tk can rescale on its own the way it can a
+    # plain widget — so "resize with the window" here means re-extracting
+    # at the new size, not just letting existing pixels stretch. Debounced
+    # (a live window-drag fires many Configure events a second) so this
+    # only actually happens once the user stops dragging, not on every
+    # intermediate pixel.
+
+    def _on_canvas_configure(self, event):
+        new_w = event.width
+        # A deliberately generous "did this really change" threshold — far
+        # smaller than any real user resize, but big enough to absorb the
+        # handful of few-pixel geometry-settling passes Tk itself can take
+        # right after a window first opens (worse, and apparently more
+        # numerous, on Windows than this project's own Linux dev/CI
+        # environment — see this method's sibling _on_preview_configure()
+        # for the same threshold on the preview pane). Each such pass this
+        # absorbs is one fewer regeneration cycle, and thus one fewer
+        # chance for that cycle's own geometry side effects to compound.
+        if abs(new_w - self.strip_w) < 16:
+            return
+        self.strip_w = new_w
+        self.hint_label.configure(wraplength=max(new_w, 200))
+        self._draw_handles()  # cheap — instant reposition, doesn't wait on the debounce below
+        if self._filmstrip_resize_job:
+            self.after_cancel(self._filmstrip_resize_job)
+        self._filmstrip_resize_job = self.after(300, self._regenerate_filmstrip)
+
+    def _on_preview_configure(self, event):
+        w, h = event.width, event.height
+        # See _on_canvas_configure()'s comment on this threshold.
+        if w < 32 or h < 32 or (abs(w - self.preview_w) < 16 and abs(h - self.preview_h) < 16):
+            return
+        self.preview_w, self.preview_h = w, h
+        # Pin the label's own declared size to exactly this, right away —
+        # a Label with no explicit width/height instead takes its size
+        # from whatever image is currently on it (its *content*). Without
+        # pinning, swapping in a freshly-generated frame — even one sized
+        # to match this very Configure event — can still nudge the
+        # label's geometry a hair on its own, firing another Configure,
+        # requesting another frame, forever: the window growing (or
+        # shrinking) on its own with no further input. Pinning here makes
+        # the label's size something only a real Configure event (a user
+        # actually resizing the window) can change, never a side effect
+        # of which image happens to be displayed at the moment.
+        self.preview_label.configure(width=w, height=h)
+        if self._preview_resize_job:
+            self.after_cancel(self._preview_resize_job)
+        self._preview_resize_job = self.after(300, self._apply_preview_resize)
+
+    def _apply_preview_resize(self):
+        self._preview_resize_job = None
+        if self._closed:
+            return
+        if self.playing:
+            # Mid-playback resize: the running video pipe was already
+            # handed its frame size as fixed args at start time (see
+            # _video_playback_worker()), so the clean way to pick up a new
+            # size is a fresh start at the same position, not trying to
+            # resize a pipe that's already running.
+            self._stop_playback()
+            self._start_playback()
+        elif self.duration is not None:
+            self._request_preview("resize", self.playhead)
+
+    def _update_readout(self):
+        self.start_var.set(f"Start  {format_timestamp(self.start)}")
+        self.end_var.set(f"End  {format_timestamp(self.end)}")
+        self.selected_var.set(f"({format_timestamp(max(0.0, self.end - self.start))} selected)")
+
+    # -- interaction --------------------------------------------------------
+
+    def _begin_drag(self, handle: str):
+        if self.playing:
+            self._stop_playback()
+        self._drag = handle
+        self.active_handle = handle
+        self.canvas.focus_set()
+
+    def _on_drag(self, event):
+        if self._drag is None or self.duration is None:
+            return
+        t = self._x_to_time(event.x)
+        if self._drag == "start":
+            self.start = min(t, self.end)
+        else:
+            self.end = max(t, self.start)
+        self._draw_handles()
+        self._update_readout()
+        self._schedule_preview(self._drag)
+
+    def _nudge(self, direction: int, fine: bool):
+        if self.duration is None:
+            return "break"
+        step = (0.05 if fine else 0.5) * direction
+        if self.active_handle == "start":
+            self.start = max(0.0, min(self.start + step, self.end))
+        else:
+            self.end = max(self.start, min(self.end + step, self.duration))
+        self._draw_handles()
+        self._update_readout()
+        self._schedule_preview(self.active_handle)
+        return "break"  # keep Tk from also treating this as focus traversal
+
+    def _schedule_preview(self, handle: str):
+        if self._preview_job:
+            self.after_cancel(self._preview_job)
+        t = self.start if handle == "start" else self.end
+        self._preview_job = self.after(120, lambda: self._request_preview(handle, t))
+
+    def _on_seekbar_change(self, value):
+        # Fires on every value change, including programmatic ones (e.g.
+        # every frame during playback — see _on_frame()) — just a cheap
+        # label update, safe either way. Actually *seeking* only happens
+        # from _seekbar_release(), keyed off a real mouse release.
+        self.position_var.set(format_timestamp(float(value)))
+
+    def _seekbar_press(self, _event):
+        self._seekbar_was_playing = self.playing
+        if self.playing:
+            self._stop_playback()
+
+    def _seekbar_release(self, _event):
+        if self.duration is None:
+            return
+        self.playhead = max(0.0, min(float(self.seekbar.get()), self.duration))
+        self._play_stop_at = None  # free scrubbing clears any pending "stop at selection end"
+        if getattr(self, "_seekbar_was_playing", False):
+            self._start_playback()
+        else:
+            self._request_preview("playhead", self.playhead)
+
+    # -- playback transport -------------------------------------------------
+
+    def _toggle_play(self):
+        if self.playing:
+            self._stop_playback()
+        else:
+            self._play_stop_at = None
+            self._start_playback()
+
+    def _play_selection(self):
+        if self.duration is None:
+            return
+        self.playhead = self.start
+        self._play_stop_at = self.end
+        self._start_playback()
+
+    def _start_playback(self):
+        if self.duration is None or self.playing:
+            return
+        self.playing = True
+        self.play_pause_btn.configure(image=self._pause_icon)
+        self._play_generation += 1
+        gen = self._play_generation
+        threading.Thread(
+            target=self._video_playback_worker, args=(gen, self.playhead, self.preview_w, self.preview_h), daemon=True,
+        ).start()
+        if self._audio_ok:
+            self._audio_proc = self._start_audio(self.playhead)
+
+    def _stop_playback(self):
+        self.playing = False
+        self.play_pause_btn.configure(image=self._play_icon)
+        self._play_generation += 1  # invalidates any in-flight worker/queued frame from this run
+        self._kill_playback_procs()
+
+    def _kill_playback_procs(self):
+        if self._video_proc and self._video_proc.poll() is None:
+            self._video_proc.terminate()
+        self._video_proc = None
+        if self._audio_proc and self._audio_proc.poll() is None:
+            self._audio_proc.terminate()
+        self._audio_proc = None
+
+    # -- actions --------------------------------------------------------
+
+    def _apply(self):
+        if self.duration is None:
+            messagebox.showwarning("Trim visually", "Still loading — wait for the filmstrip before applying.")
+            return
+        self.app.vars["st_start"].set(format_timestamp(self.start))
+        self.app.vars["st_end"].set(format_timestamp(self.end))
+        self._close()
+
+    def _cancel(self):
+        self._close()
+
+    def _close(self):
+        self._closed = True
+        self._play_generation += 1
+        self._filmstrip_generation += 1
+        self._kill_playback_procs()
+        for job in (self._preview_job, self._filmstrip_resize_job, self._preview_resize_job):
+            if job:
+                self.after_cancel(job)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        self.destroy()
 
 
 class ConfigWindow(tk.Toplevel):

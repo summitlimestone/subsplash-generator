@@ -21,6 +21,10 @@ is an optional desktop GUI over the same four subcommands.
   in `service_video.py` itself needs them.
 - For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
   `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
+- `ffplay` (ships with the full ffmpeg suite, separate from `ffmpeg`/
+  `ffprobe` in some minimal installs) is optional — only needed for
+  audio in the Offline tab's "Trim visually…" window's embedded player;
+  video-only playback there still works without it.
 
 ## GUI
 
@@ -43,12 +47,24 @@ starter `config.json` next to the script on first run if none exists.
   it resolves, disconnects OBS and ends the Watch run — from there Stitch
   (and a retried Trim, if it failed) work the same way the Offline tab's
   own buttons do, straight off the render-state file this run wrote.
-- **Offline**: crossfade an intro/main/outro by hand via separate Trim
-  and Stitch buttons, or "Load from JSON" a render-state file (even one
-  still in progress) to redo one; this also enables Sermon start/end
-  fields so Trim re-trims the raw recording to those exact points before
-  a follow-up Stitch. "Export to JSON" builds a render-state file from
-  the fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
+- **Offline**: crossfade an intro/outro with a trimmed clip by hand via
+  separate Trim and Stitch buttons, or "Load from JSON" a render-state
+  file (even one still in progress) to redo one; this also enables
+  Sermon start/end fields so Trim re-trims Main clip (the raw recording)
+  to those exact points, writing the result to Trimmed clip — Stitch
+  always reads from there, not Main clip, so it's greyed out until
+  Trimmed clip actually points at something, whether that's a fresh Trim
+  result, `trimmed_path` from a loaded render-state file, or one picked
+  by hand. "Trim visually…" (next to Sermon start/end) sets those fields
+  by dragging a filmstrip instead of typing timestamps, mobile-photo-app
+  style — drag the two handles for a rough cut, Left/Right nudges the
+  last-touched one for precision (Shift for a finer step). Playback (the
+  Play/Pause button, or "Play selection" to preview just the trim range)
+  is embedded right in the window with a seekbar, starting at an
+  accurate, frame-exact position rather than the nearest keyframe — video
+  plays inline; audio plays too as long as `ffplay` is on PATH (video-
+  only otherwise). "Export to JSON" builds a render-state file from the
+  fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
   "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
   (and its Target LUFS), and Encoder settings.
 
@@ -110,9 +126,11 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 | `--subsplash-preset` | off | Match Subsplash's own recommended settings instead of `--crf` (see below) |
 
 `intro`/`outro` can each be a video or a still image (jpg/png/bmp/tif/
-webp); `main` must be a video. Output paths (here and in
-`trim.output`/`stitch.output`) accept strftime placeholders in the
-filename, e.g. `final_%Y-%m-%d_%H-%M-%S.mp4`.
+webp); `main` must be a video. Output paths (here, `trim.output`/
+`stitch.output`, `trim.state_output`, and the GUI's `general.log_path`)
+accept strftime placeholders anywhere in the path, directories included
+— e.g. `recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory
+that doesn't already exist yet is created automatically.
 
 **Fast copy**: re-encodes only the two crossfade windows and stream-
 copies the untouched middle instead of re-encoding everything, which is
@@ -190,7 +208,9 @@ each one's UID (and text, if any) as you land on it.
 
 Every `watch` run writes a render-state JSON file (path configurable via
 `trim.state_output`): the recording's path, the raw begin/end timestamps,
-and the `trim`/`stitch` settings used. Created the moment `watch` starts
+the trimmed clip's path once Trim has actually produced one (`null`
+until then), and the `trim`/`stitch` settings used. Created the moment
+`watch` starts
 and kept up to date as marks land and recording stops, rather than only
 written once at the end; `render` needs it complete (not still `null`) to
 run. `watch` prints the exact command to reuse it. Edit the file (most
@@ -199,6 +219,29 @@ often `pad_start_seconds`/`pad_end_seconds`) and rerun:
 ```
 python service_video.py render render_state_20260823_133005.json
 ```
+
+## Tests
+
+```
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Covers `gui.py`'s ffmpeg-facing logic (accurate seeking — see
+`accurate_seek_input_args()` — checked against actual pixel content, not
+just a returned timestamp) and the Offline tab's "Trim visually…" window
+(load/drag/nudge/Apply/Cancel, and a regression test for a real bug this
+project hit once already: the window growing/shrinking on its own with no
+further input). Generates its own small synthetic test videos with ffmpeg
+on the fly rather than committing binary fixtures — needs `ffmpeg`/
+`ffprobe` on PATH, same as the app itself.
+
+The GUI tests create real Tk windows, so they need a real or virtual X11
+display: `xvfb-run -a pytest tests/` in CI or any other headless
+environment (see `.github/workflows/ci.yml`'s `test` job for the exact
+setup on a bare Ubuntu runner); on a normal desktop, no wrapper is needed.
+`service_video.py` has no test suite of its own yet — CI only compile-
+checks and lints it (see `ci.yml`'s `lint` job).
 
 ## Setup
 

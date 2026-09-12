@@ -862,24 +862,30 @@ def _fast_copy_stitch(
 
 
 def expand_output_path(path: str) -> str:
-    """Expand strftime placeholders (%Y, %m, %d, %H, %M, %S, etc.) in an
-    output path's filename with the current date/time, so a filename can
-    carry when it was produced — e.g. "final_%Y-%m-%d_%H-%M-%S.mp4". A
-    filename with no '%' in it passes through unchanged. Applied wherever
-    a path is actually written (stitch's output, trim_clip's dst), so it
-    works the same from the CLI, the GUI, or a render-state file.
+    """Expand strftime placeholders (%Y, %m, %d, %H, %M, %S, etc.)
+    anywhere in an output path — filename and any directory components —
+    with the current date/time, so a whole dated folder hierarchy can be
+    produced, not just a dated filename, e.g.
+    "recordings/%Y-%m-%d/final_%H-%M-%S.mp4". A path with no '%' in it
+    passes through unchanged. Applied wherever a path is actually
+    written (stitch's output, trim_clip's dst, the render-state file),
+    so it works the same from the CLI, the GUI, or a render-state file.
 
-    Only the filename is expanded, not any directory part of the path —
-    both because that's what this is for (dated filenames, not a dated
-    folder hierarchy) and because a few strftime directives are locale-
-    dependent and can embed a literal "/" of their own (%D and, on some
-    platforms, %c/%x all expand to something like "09/01/26"), which
-    would otherwise silently turn one filename into unwanted nested
-    directories. Any "/" or "\\" a directive still manages to produce
-    inside the filename is replaced with "-" rather than left to do that."""
-    p = Path(path)
-    name = datetime.now().strftime(p.name).replace("/", "-").replace("\\", "-")
-    return str(p.with_name(name)) if p.name else path
+    Also creates any directory component of the expanded path that
+    doesn't already exist yet (recursively, like `mkdir -p`) — needed
+    now that a directory name itself can be date-based, so it's never
+    going to already exist the first time a given day/hour/etc. rolls
+    around. A failure here (e.g. no permission) is treated the same as
+    any other fatal output-path problem in this file: sys.exit() with a
+    clear message, since there's nowhere useful to write the actual
+    output otherwise."""
+    expanded = datetime.now().strftime(path)
+    parent = Path(expanded).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"Could not create directory {str(parent)!r} for output path {expanded!r}: {e}")
+    return expanded
 
 
 # --------------------------------------------------------------------------
@@ -1877,7 +1883,7 @@ def _resolve_state_path(trim_cfg: dict) -> Path:
 
 def _write_render_state(
     state_path: Path, recording_path: str | None, raw_begin_offset: float | None,
-    raw_end_offset: float | None, trim_cfg: dict, stitch_cfg: dict,
+    raw_end_offset: float | None, trim_cfg: dict, stitch_cfg: dict, trimmed_path: str | None = None,
 ) -> dict:
     """Builds the render-state dict and (over)writes it to `state_path`
     (see _resolve_state_path()) — the same self-contained record
@@ -1887,11 +1893,16 @@ def _write_render_state(
     the moment it starts, then rewrites it in place every time a mark (or
     the recording itself) actually happens, so what's on disk always
     reflects the best information available so far rather than only ever
-    appearing once, fully formed, at the very end."""
+    appearing once, fully formed, at the very end. trimmed_path is None
+    until a trim has actually produced one this run (see watch()'s
+    'trim_result' handling) — the GUI's Offline tab uses it (once
+    present) to prefill its own "Trimmed clip" field on Load from JSON,
+    the same path Trim itself wrote."""
     render_state = {
         "recording_path": recording_path,
         "raw_begin_offset": format_timestamp(raw_begin_offset) if raw_begin_offset is not None else None,
         "raw_end_offset": format_timestamp(raw_end_offset) if raw_end_offset is not None else None,
+        "trimmed_path": trimmed_path,
         "trim": trim_cfg,
         "stitch": stitch_cfg,
     }
@@ -2152,7 +2163,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
             state_path, recording_path,
             (t_begin - t0) if (t_begin is not None and t0 is not None) else None,
             (t_end - t0) if (t_end is not None and t0 is not None) else None,
-            trim_cfg, stitch_cfg,
+            trim_cfg, stitch_cfg, trimmed_path,
         )
 
     obs_disconnected = False
