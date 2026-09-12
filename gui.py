@@ -3295,7 +3295,7 @@ class MiniLiveControlsWindow(tk.Toplevel):
         self.app = app
         self.title("Service Video — Live Controls")
         self.configure(bg=PALETTE["bg"])
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
 
         frame = ttk.Frame(self, padding=12)
