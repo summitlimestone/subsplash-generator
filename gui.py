@@ -531,6 +531,13 @@ LOG_PATH_HELP = (
     "itself is unaffected either way."
 )
 
+BULK_STATES_HELP = (
+    "A JSON file containing an array of render-state objects — the same "
+    "self-contained shape a 'watch' run or the Offline tab's \"Export to "
+    "JSON\" writes. Trim/Full Render rewrite this file's trimmed_path "
+    "fields in place as each entry finishes."
+)
+
 API_HELP = (
     "Optional HTTP API for marking start/end remotely. Runs only during Watch; "
     "docs at /swagger. Requires pip install fastapi uvicorn."
@@ -1238,6 +1245,7 @@ class App(tk.Tk):
 
         self._build_live_tab()
         self._build_offline_tab()
+        self._build_bulk_render_tab()
         self._build_series_tab()
 
         console_frame = ttk.Frame(paned, padding=(0, 6, 0, 0))
@@ -2106,6 +2114,109 @@ class App(tk.Tk):
             self._load_render_state_json(path)
         self.mode_notebook.select(self.offline_tab)
 
+    # -- Bulk Render tab (trim/stitch many render-state files in one go —
+    #    a JSON array of the same self-contained state dicts 'watch'/
+    #    'render'/the Offline tab's own "Load from JSON" already use) -----
+
+    def _build_bulk_render_tab(self):
+        self.bulk_render_tab, frame = self._make_scrollable_tab(self.mode_notebook, "Bulk Render")
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Trim and/or stitch every render-state entry in a JSON array file, "
+            "in one pass. Trim writes each entry's Trimmed clip back to the file, so "
+            "a later Stitch (or Full Render, which does both per entry) picks it up.",
+            style="Muted.TLabel", wraplength=760, justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+
+        self._labeled_entry(frame, 1, "Render states JSON", "bulk_states_path", colspan=3, help_text=BULK_STATES_HELP)
+        self._add_browse(frame, 1, "bulk_states_path", filetypes=JSON_FILETYPES, col=3)
+        self.vars["bulk_states_path"].trace_add("write", lambda *_a: self._refresh_bulk_render_tree())
+
+        self.bulk_render_tree = ttk.Treeview(
+            frame, columns=("index", "recording", "trimmed", "output"), show="headings",
+            height=10, selectmode="browse",
+        )
+        self.bulk_render_tree.heading("index", text="#")
+        self.bulk_render_tree.heading("recording", text="Recording")
+        self.bulk_render_tree.heading("trimmed", text="Trimmed clip")
+        self.bulk_render_tree.heading("output", text="Output")
+        self.bulk_render_tree.column("index", width=40, anchor="center")
+        self.bulk_render_tree.column("recording", width=260, anchor="w")
+        self.bulk_render_tree.column("trimmed", width=260, anchor="w")
+        self.bulk_render_tree.column("output", width=200, anchor="w")
+        self.bulk_render_tree.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self.bulk_trim_btn = ttk.Button(
+            btn_row, text="Trim", command=lambda: self._run_bulk_render("trim"), state="disabled",
+        )
+        self.bulk_trim_btn.pack(side="left")
+        self.bulk_stitch_btn = ttk.Button(
+            btn_row, text="Stitch", command=lambda: self._run_bulk_render("stitch"), state="disabled",
+        )
+        self.bulk_stitch_btn.pack(side="left", padx=(8, 0))
+        self.bulk_full_btn = ttk.Button(
+            btn_row, text="Full Render", style="Accent.TButton",
+            command=lambda: self._run_bulk_render("full"), state="disabled",
+        )
+        self.bulk_full_btn.pack(side="left", padx=(8, 0))
+        self._start_buttons.append(self.bulk_trim_btn)
+        self._start_buttons.append(self.bulk_stitch_btn)
+        self._start_buttons.append(self.bulk_full_btn)
+
+        self.bulk_states: list[dict] = []
+        self._refresh_bulk_render_tree()
+
+    def _refresh_bulk_render_tree(self):
+        """Reloads the Bulk Render tab's list from whatever's currently at
+        `bulk_states_path` — called on every edit to that field (typing or
+        Browse…) and again after a bulk run finishes (see
+        _on_process_exit()), since Trim/Full Render rewrite the file's own
+        trimmed_path fields as they go. A path that's blank, unreadable, or
+        not a JSON array of objects just empties the list (with a console
+        log line for the latter two, same as any other bad-input report in
+        this app) rather than raising — the same tolerant, keep-going
+        spirit bulk-render itself uses per-entry, applied here to the file
+        as a whole."""
+        self.bulk_render_tree.delete(*self.bulk_render_tree.get_children())
+        self.bulk_states = []
+        path = self.vars["bulk_states_path"].get().strip()
+        if path:
+            try:
+                data = json.loads(Path(path).read_text())
+            except (OSError, json.JSONDecodeError) as e:
+                self._log(f"[gui] could not read {path!r} as JSON: {e}")
+                data = None
+            if data is not None and not (isinstance(data, list) and all(isinstance(s, dict) for s in data)):
+                self._log(f"[gui] {path!r} must contain a JSON array of render-state objects.")
+                data = None
+            if data:
+                self.bulk_states = data
+        for i, state in enumerate(self.bulk_states):
+            self.bulk_render_tree.insert(
+                "", "end", iid=str(i),
+                values=(
+                    i + 1, state.get("recording_path") or "", state.get("trimmed_path") or "",
+                    (state.get("stitch") or {}).get("output") or "",
+                ),
+            )
+        self._update_bulk_render_buttons()
+
+    def _update_bulk_render_buttons(self):
+        state = "normal" if self.bulk_states else "disabled"
+        for btn in (self.bulk_trim_btn, self.bulk_stitch_btn, self.bulk_full_btn):
+            btn.configure(state=state)
+
+    def _run_bulk_render(self, mode: str):
+        path = self.vars["bulk_states_path"].get().strip()
+        if not path or not self.bulk_states:
+            messagebox.showerror("Bulk Render", "Load a valid render states JSON file first.")
+            return
+        self._start(f"bulk_{mode}", ["bulk-render", path, "--mode", mode])
+
     # -- Console ----------------------------------------------------------
 
     def _build_console(self, parent):
@@ -2665,6 +2776,13 @@ class App(tk.Tk):
             self._log(f"[gui] {label} finished successfully.\n")
         else:
             self._log(f"[gui] {label} exited with code {code}.\n")
+        if label.startswith("bulk_"):
+            # Trim/Full Render rewrite bulk_states_path's own trimmed_path
+            # fields as they go (see bulk_render() in service_video.py) —
+            # reload so the tab's list (and Stitch/Full Render's own
+            # enabled state) reflects that, success or partial failure
+            # either way.
+            self._refresh_bulk_render_tree()
         if label == "watch":
             if self._live_trim_resolved and self.render_state_var.get().strip():
                 # watch() itself now exits once a live Trim resolves (see

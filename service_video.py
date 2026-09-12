@@ -1823,6 +1823,51 @@ def compute_trim_offsets(raw_begin_offset: float, raw_end_offset: float, pad_sta
     return start_offset, end_offset
 
 
+def _trim_from_state(state: dict) -> str:
+    """Runs trim_clip() from a render-state dict's own trim config plus
+    its raw_begin_offset/raw_end_offset/recording_path — the shared
+    argument mapping render() and bulk_render() both use, so the two
+    can't drift apart. Requires recording_path/raw_begin_offset/
+    raw_end_offset already be non-None; each caller validates that
+    itself first (the message — and what happens next on failure —
+    differs: render() aborts the whole run, bulk_render() just skips
+    that one entry and keeps going). Returns the resolved trimmed-clip
+    path (see trim_clip())."""
+    trim_cfg = state.get("trim", {})
+    start_offset, end_offset = compute_trim_offsets(
+        parse_timestamp(state["raw_begin_offset"]), parse_timestamp(state["raw_end_offset"]),
+        trim_cfg.get("pad_start_seconds", 0.0), trim_cfg.get("pad_end_seconds", 0.0),
+    )
+    return trim_clip(
+        state["recording_path"], trim_cfg.get("output", "body_trimmed.mp4"),
+        start_offset, end_offset, crf=trim_cfg.get("crf", 23),
+        fast_copy=trim_cfg.get("fast_copy", True), encoder=trim_cfg.get("encoder", "nvenc"),
+        encoder_preset=trim_cfg.get("encoder_preset"),
+        normalize_audio=trim_cfg.get("normalize_audio", True),
+        normalize_target_lufs=trim_cfg.get("normalize_target_lufs", -16.0),
+    )
+
+
+def _stitch_from_state(state: dict, main_clip: str) -> str:
+    """Runs stitch() from a render-state dict's own stitch config plus
+    an already-resolved main clip path — see _trim_from_state()'s own
+    docstring for why this is factored out the same way. Returns the
+    resolved output path (see stitch())."""
+    stitch_cfg = state.get("stitch", {})
+    return stitch(
+        stitch_cfg["intro"], main_clip, stitch_cfg["outro"],
+        output=stitch_cfg.get("output", "final.mp4"),
+        transition_duration=stitch_cfg.get("transition_duration", 1.0),
+        transition=stitch_cfg.get("transition", "fade"),
+        crf=stitch_cfg.get("crf", 23),
+        intro_duration=stitch_cfg.get("intro_duration"),
+        outro_duration=stitch_cfg.get("outro_duration"),
+        fast_copy=stitch_cfg.get("fast_copy", False),
+        encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
+        subsplash_preset=stitch_cfg.get("subsplash_preset", False),
+    )
+
+
 def render(state: dict):
     """Trim the recording and (optionally) stitch it with the intro/outro,
     entirely from a self-contained state dict — no OBS/ProPresenter
@@ -1840,34 +1885,119 @@ def render(state: dict):
         )
     _reset_steps(_render_step_total(trim_cfg, stitch_cfg))
 
-    start_offset, end_offset = compute_trim_offsets(
-        parse_timestamp(state["raw_begin_offset"]), parse_timestamp(state["raw_end_offset"]),
-        trim_cfg.get("pad_start_seconds", 0.0), trim_cfg.get("pad_end_seconds", 0.0),
-    )
-
-    trimmed_path = trim_clip(
-        state["recording_path"], trim_cfg.get("output", "body_trimmed.mp4"),
-        start_offset, end_offset, crf=trim_cfg.get("crf", 23),
-        fast_copy=trim_cfg.get("fast_copy", True), encoder=trim_cfg.get("encoder", "nvenc"),
-        encoder_preset=trim_cfg.get("encoder_preset"),
-        normalize_audio=trim_cfg.get("normalize_audio", True),
-        normalize_target_lufs=trim_cfg.get("normalize_target_lufs", -16.0),
-    )
+    trimmed_path = _trim_from_state(state)
     print(f"\nTrimmed body clip -> {trimmed_path}")
 
     if stitch_cfg.get("auto"):
-        stitch(
-            stitch_cfg["intro"], trimmed_path, stitch_cfg["outro"],
-            output=stitch_cfg.get("output", "final.mp4"),
-            transition_duration=stitch_cfg.get("transition_duration", 1.0),
-            transition=stitch_cfg.get("transition", "fade"),
-            crf=stitch_cfg.get("crf", 23),
-            intro_duration=stitch_cfg.get("intro_duration"),
-            outro_duration=stitch_cfg.get("outro_duration"),
-            fast_copy=stitch_cfg.get("fast_copy", False),
-            encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
-            subsplash_preset=stitch_cfg.get("subsplash_preset", False),
+        _stitch_from_state(state, trimmed_path)
+
+
+def _bulk_entry_step_total(mode: str, trim_cfg: dict, stitch_cfg: dict) -> int:
+    """_render_step_total()'s bulk_render() counterpart — the difference
+    (beyond trim-only/stitch-only modes) is that mode="full" always
+    counts the stitch phase, unlike render()'s own stitch_cfg.get("auto")
+    check: that flag governs watch()/render()'s own automatic post-trim
+    stitch decision, not any of the manual, on-request Stitch actions
+    (the GUI's other Stitch buttons included), which always stitch."""
+    total = 0
+    if mode in ("trim", "full"):
+        total += _trim_worst_case_steps(trim_cfg)
+    if mode in ("stitch", "full"):
+        total += _phase_worst_case_steps(stitch_cfg.get("fast_copy", False), STITCH_FAST_COPY_STEPS)
+    return total
+
+
+def bulk_render(states_path: str, mode: str) -> int:
+    """Runs trim and/or stitch (mode: "trim", "stitch", or "full") against
+    every render-state dict in a JSON array at `states_path` — the Bulk
+    Render tab's backing command, for running the same trim/stitch work a
+    live 'watch' run (or 'render') does against one state, over many saved
+    ones in a single pass. Each entry is the same self-contained shape
+    'watch'/'render' already use (recording_path/raw_begin_offset/
+    raw_end_offset, trim/stitch config, trimmed_path — see README's
+    render-state section).
+
+    One entry failing (a missing file, a bad ffmpeg run — anything
+    trim_clip()/stitch() itself sys.exit()s over, same as a missing/
+    incomplete recording_path/raw_begin_offset/raw_end_offset here)
+    doesn't abort the whole batch, unlike render(): this catches
+    SystemExit around each entry, reports it, and moves on to the next
+    one, so one bad entry partway through a long list doesn't waste every
+    entry's work either side of it. sys.exit()s itself, over the whole
+    batch, only if at least one entry failed — with a summary listing
+    which — so the process's own exit code still reflects a partial
+    failure, same as any other fatal problem in this file.
+
+    mode="trim": trims every entry, writing each result back into that
+    entry's own trimmed_path in memory, then (successes and failures
+    both, since a skipped entry's own fields are simply left as they
+    were) rewrites the whole array back to `states_path` once, at the
+    end — the same on-disk hand-off watch()'s own render-state file
+    already uses, so a later, separate mode="stitch" pass (its own
+    subprocess — the GUI's Trim/Stitch/Full Render buttons each start a
+    fresh one, never share memory) can pick the result back up from disk.
+    mode="stitch": stitches every entry straight from its current
+    trimmed_path (whatever's already on record — a prior mode="trim"/
+    "full" pass, or one already present in the file); an entry with no
+    trimmed_path yet is skipped, same as Offline's own Stitch button
+    being unusable before Trimmed clip is set. Ignores stitch.auto
+    entirely, on every mode — see _bulk_entry_step_total().
+    mode="full": trim then stitch, per entry, before moving to the next —
+    a failed trim skips that entry's stitch too. Also rewrites
+    trimmed_path back to `states_path`, same as mode="trim": harmless
+    (nothing reads it again this run) but keeps the file an accurate
+    record of what was actually produced, same reasoning as trim's own
+    case."""
+    try:
+        states = json.loads(Path(states_path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"Could not read {states_path!r} as JSON: {e}")
+    if not isinstance(states, list) or not all(isinstance(s, dict) for s in states):
+        sys.exit(f"{states_path!r} must contain a JSON array of render-state objects.")
+    if not states:
+        sys.exit(f"{states_path!r} is empty — nothing to render.")
+
+    _reset_steps(sum(
+        _bulk_entry_step_total(mode, s.get("trim", {}), s.get("stitch", {})) for s in states
+    ))
+
+    failures: list[tuple[int, str]] = []
+    for i, state in enumerate(states):
+        print(f"\n=== Entry {i + 1}/{len(states)} ===")
+        try:
+            trimmed_path = state.get("trimmed_path")
+            if mode in ("trim", "full"):
+                if state.get("recording_path") is None or state.get("raw_begin_offset") is None or state.get("raw_end_offset") is None:
+                    sys.exit(
+                        "recording_path/raw_begin_offset/raw_end_offset is still null "
+                        "— this entry's recording was never completed."
+                    )
+                trimmed_path = _trim_from_state(state)
+                state["trimmed_path"] = trimmed_path
+                print(f"\nTrimmed body clip -> {trimmed_path}")
+            if mode in ("stitch", "full"):
+                if not trimmed_path:
+                    sys.exit(
+                        "No trimmed_path set on this entry — run Trim (mode=trim/full) "
+                        "first, or set trimmed_path directly in the JSON."
+                    )
+                _stitch_from_state(state, trimmed_path)
+        except SystemExit as e:
+            message = e.code if isinstance(e.code, str) else f"exit code {e.code}"
+            print(f"[bulk-render] entry {i + 1} FAILED: {message}", file=sys.stderr)
+            failures.append((i, message))
+
+    if mode in ("trim", "full"):
+        Path(states_path).write_text(json.dumps(states, indent=2))
+
+    succeeded = len(states) - len(failures)
+    print(f"\n[bulk-render] {succeeded}/{len(states)} entries succeeded")
+    if failures:
+        sys.exit(
+            f"{len(failures)}/{len(states)} entries failed: "
+            + ", ".join(f"#{i + 1} ({msg})" for i, msg in failures)
         )
+    return 0
 
 
 def _resolve_state_path(trim_cfg: dict) -> Path:
@@ -2377,6 +2507,11 @@ def main():
     p_render.add_argument("state_json", help="Path to a render_state_*.json file written by a previous 'watch' run")
     p_render.add_argument("--machine-progress", **machine_progress_kwargs)
 
+    p_bulk_render = sub.add_parser("bulk-render", help="Run trim and/or stitch against every render-state entry in a JSON array file")
+    p_bulk_render.add_argument("states_json", help="Path to a JSON file containing an array of render-state objects")
+    p_bulk_render.add_argument("--mode", choices=["trim", "stitch", "full"], required=True, help="trim: trim every entry. stitch: stitch every entry from its trimmed_path. full: both, per entry")
+    p_bulk_render.add_argument("--machine-progress", **machine_progress_kwargs)
+
     p_stitch = sub.add_parser("stitch", help="Crossfade an intro, main body, and outro clip into one video")
     p_stitch.add_argument("intro", help="Path to the intro clip")
     p_stitch.add_argument("main_clip", help="Path to the main body clip")
@@ -2436,6 +2571,10 @@ def main():
     if args.command == "render":
         state = json.loads(Path(args.state_json).read_text())
         render(state)
+        return
+
+    if args.command == "bulk-render":
+        bulk_render(args.states_json, args.mode)
         return
 
     cfg_path = Path(args.config)

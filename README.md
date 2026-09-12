@@ -37,7 +37,7 @@ console pane shows its output (also mirrored to a log file, see Config >
 General), with a progress bar tracking ffmpeg's own steps. Creates a
 starter `config.json` next to the script on first run if none exists.
 
-**Main window**: Live/Offline/Series Manager tabs plus the console.
+**Main window**: Live/Offline/Bulk Render/Series Manager tabs plus the console.
 - **Live**: a Series dropdown in place of typing intro/outro paths (see
   Series Manager below), output field, Start Watch, Mark Sermon
   Start/Mark Sermon End (the only way to run without ProPresenter, or to
@@ -68,6 +68,13 @@ starter `config.json` next to the script on first run if none exists.
   fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
   "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
   (and its Target LUFS), and Encoder settings.
+- **Bulk Render**: trim and/or stitch every entry in a JSON array of
+  render-state objects (the same self-contained shape a `watch` run or
+  Offline's "Export to JSON" writes) in one pass — Trim, Stitch, and Full
+  Render (both, per entry) mirror `bulk-render`'s own `--mode` below. One
+  entry failing doesn't stop the rest; Trim/Full Render write each
+  entry's resolved Trimmed clip back into the file as they go, so a
+  later Stitch pass (a separate run) picks it up.
 - **Series Manager**: named intro/outro bundles (a name, an intro clip +
   duration, an outro clip + duration) — set one up once per sermon
   series, then just pick it from the Series dropdown on the Live/Offline
@@ -243,6 +250,26 @@ often `pad_start_seconds`/`pad_end_seconds`) and rerun:
 ```
 python service_video.py render render_state_20260823_133005.json
 ```
+
+### `bulk-render`: trim/stitch many render-state files in one pass
+
+```
+python service_video.py bulk-render states.json --mode {trim,stitch,full}
+```
+
+`states.json` is a JSON array of render-state objects — the same shape
+`render` above takes one of, written by `watch` or the GUI's "Export to
+JSON". `--mode trim` trims every entry and writes each result back into
+that entry's own `trimmed_path` (the array is rewritten to `states.json`
+once, at the end, so a later `--mode stitch` pass — a separate run — can
+pick it up). `--mode stitch` stitches every entry straight from its
+current `trimmed_path`, whatever's already on record; an entry with none
+yet is skipped. `--mode full` does both, per entry, before moving to the
+next. Ignores `stitch.auto` on every mode — unlike `watch`/`render`, an
+explicit `bulk-render` invocation always does what its own `--mode` says.
+One entry failing (a missing file, a bad ffmpeg run) doesn't abort the
+rest: it's reported and skipped, and the process exits non-zero only at
+the end, with a summary of which entries failed.
 
 ## Tests
 
