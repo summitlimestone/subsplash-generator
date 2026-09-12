@@ -296,6 +296,15 @@ def to_timestamp(text: str, field: str) -> float:
         raise ValueError(f"{field} must be HH:MM:SS.mmm (got {text!r})")
 
 
+# Kept identical to service_video.py's own _STRFTIME_CODES — see that
+# module's expand_output_path() for why this is a fixed whitelist
+# (substituted directive-by-directive) rather than handing the whole
+# path to the platform's own strftime(), which is what actually broke
+# on Windows (ValueError: Invalid format string) over an unrelated '%'
+# in a directory name.
+_STRFTIME_CODES = re.compile(r"%[YymdHIMSpBbAaj%]")
+
+
 def expand_output_path(path: str) -> str:
     """Duplicated from service_video.py's function of the same name
     (rather than imported — this script only ever runs service_video.py
@@ -305,11 +314,13 @@ def expand_output_path(path: str) -> str:
     string. Expands strftime placeholders anywhere in the path —
     filename and any directory components — and creates any directory
     component that doesn't exist yet; see service_video.py's own copy
-    for the full reasoning. Unlike that copy, a failure creating the
-    directory doesn't sys.exit() the whole GUI over a log file — it's
-    left to raise a plain OSError, which _sync_log_file() already
-    catches around its own open() call the same way."""
-    expanded = datetime.now().strftime(path)
+    for the full reasoning, _STRFTIME_CODES included. Unlike that copy, a
+    failure creating the directory doesn't sys.exit() the whole GUI over
+    a log file — it's left to raise a plain OSError, which
+    _sync_log_file() already catches around its own open() call the same
+    way."""
+    now = datetime.now()
+    expanded = _STRFTIME_CODES.sub(lambda m: now.strftime(m.group()), path)
     Path(expanded).parent.mkdir(parents=True, exist_ok=True)
     return expanded
 

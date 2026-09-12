@@ -861,15 +861,38 @@ def _fast_copy_stitch(
     return output
 
 
+# The only strftime directives expand_output_path() actually substitutes
+# — see that function's docstring for why this is a fixed whitelist
+# rather than handing the whole path to the platform's own strftime().
+_STRFTIME_CODES = re.compile(r"%[YymdHIMSpBbAaj%]")
+
+
 def expand_output_path(path: str) -> str:
-    """Expand strftime placeholders (%Y, %m, %d, %H, %M, %S, etc.)
-    anywhere in an output path — filename and any directory components —
-    with the current date/time, so a whole dated folder hierarchy can be
-    produced, not just a dated filename, e.g.
-    "recordings/%Y-%m-%d/final_%H-%M-%S.mp4". A path with no '%' in it
-    passes through unchanged. Applied wherever a path is actually
-    written (stitch's output, trim_clip's dst, the render-state file),
-    so it works the same from the CLI, the GUI, or a render-state file.
+    """Expand strftime placeholders (%Y, %m, %d, %H, %M, %S, and the rest
+    of _STRFTIME_CODES) anywhere in an output path — filename and any
+    directory components — with the current date/time, so a whole dated
+    folder hierarchy can be produced, not just a dated filename, e.g.
+    "recordings/%Y-%m-%d/final_%H-%M-%S.mp4". A path with none of those
+    codes in it passes through unchanged. Applied wherever a path is
+    actually written (stitch's output, trim_clip's dst, the render-state
+    file), so it works the same from the CLI, the GUI, or a render-state
+    file.
+
+    Deliberately does NOT hand the raw path to datetime.strftime()
+    directly (str.strftime(path), the obvious approach, and what this
+    used to do) — that delegates whole-string parsing to the current
+    platform's own C library, and platforms disagree on how strict that
+    parsing is: glibc (Linux/Mac) silently passes an unrecognized or
+    malformed directive through as a literal, but Windows' C runtime
+    raises ValueError("Invalid format string") for anything outside its
+    own smaller supported set — which a real directory name can trip
+    over with zero intent to use a date code at all (a literal '%' in a
+    folder name, or a directive glibc tolerates that Windows doesn't).
+    Substituting only the fixed codes in _STRFTIME_CODES instead — each
+    expanded via its own isolated, always-portable single-directive
+    strftime() call — sidesteps that platform difference entirely: any
+    other '%' in the path is left exactly as typed, on every platform,
+    rather than ever risking a crash over it.
 
     Also creates any directory component of the expanded path that
     doesn't already exist yet (recursively, like `mkdir -p`) — needed
@@ -879,7 +902,8 @@ def expand_output_path(path: str) -> str:
     any other fatal output-path problem in this file: sys.exit() with a
     clear message, since there's nowhere useful to write the actual
     output otherwise."""
-    expanded = datetime.now().strftime(path)
+    now = datetime.now()
+    expanded = _STRFTIME_CODES.sub(lambda m: now.strftime(m.group()), path)
     parent = Path(expanded).parent
     try:
         parent.mkdir(parents=True, exist_ok=True)
