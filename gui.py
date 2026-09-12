@@ -1819,6 +1819,11 @@ class App(tk.Tk):
         )
         self.live_trim_btn.pack(side="left", padx=(8, 0))
         Tooltip(self.live_trim_btn, LIVE_TRIM_HELP, font=self.ui_font)
+        self.live_stitch_btn = ttk.Button(
+            btn_row, text="Stitch", command=self._stitch_live, state="disabled",
+        )
+        self.live_stitch_btn.pack(side="left", padx=(8, 0))
+        Tooltip(self.live_stitch_btn, LIVE_STITCH_HELP, font=self.ui_font)
         mini_controls_btn = ttk.Button(
             btn_row, text="Mini controls…", command=self._open_mini_live_controls,
         )
@@ -1830,11 +1835,6 @@ class App(tk.Tk):
             "in view without the full main window.",
             font=self.ui_font,
         )
-        self.live_stitch_btn = ttk.Button(
-            btn_row, text="Stitch", command=self._stitch_live, state="disabled",
-        )
-        self.live_stitch_btn.pack(side="left", padx=(8, 0))
-        Tooltip(self.live_stitch_btn, LIVE_STITCH_HELP, font=self.ui_font)
 
         status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
         status_frame.grid(row=4, column=0, columnspan=6, sticky="ew")
