@@ -105,18 +105,7 @@ def default_config() -> dict:
         },
         "stitch": {
             "auto": True,
-            # Which saved series (see SERIES_PATH) intro/outro below came
-            # from, purely so the GUI's own Series dropdown can restore
-            # its selection on load — service_video.py itself never reads
-            # this key, only intro/outro/*_duration below.
-            "series": "",
-            "intro": "",
-            "outro": "",
-            "intro_duration": DEFAULT_IMAGE_DURATION,
-            "outro_duration": DEFAULT_IMAGE_DURATION,
             "output": "final.mp4",
-            "transition_duration": 1.0,
-            "transition": "fade",
             # Off by default and not exposed in the GUI — see stitch()'s
             # own docstring in service_video.py: it's always safe to turn
             # on (verifies its own result before trusting it), just not
@@ -980,7 +969,7 @@ class App(tk.Tk):
         # build their own widgets, below.
         self.series: list[dict] = []
         self._series_comboboxes: list[ttk.Combobox] = []
-        self._series_bindings: list[tuple[str, str, str, str, str]] = []
+        self._series_bindings: list[tuple[str, str | None, str | None, str | None, str | None, str | None, str | None]] = []
         # The last real series name each selector successfully resolved —
         # what a Series combobox's search text snaps back to if the user
         # types something that never matches a real, visible series (see
@@ -1547,30 +1536,56 @@ class App(tk.Tk):
         return None
 
     def _apply_series_to_vars(
-        self, selector_key: str, intro_key: str, intro_duration_key: str, outro_key: str, outro_duration_key: str,
+        self, selector_key: str, intro_key: str | None = None, intro_duration_key: str | None = None,
+        outro_key: str | None = None, outro_duration_key: str | None = None,
+        transition_key: str | None = None, transition_duration_key: str | None = None,
     ):
         series = self._find_series(self.vars[selector_key].get())
         if series is None:
             return
         self._series_last_valid[selector_key] = series["name"]
-        self.vars[intro_key].set(series["intro"])
-        self.vars[intro_duration_key].set(str(series["intro_duration"]))
-        self.vars[outro_key].set(series["outro"])
-        self.vars[outro_duration_key].set(str(series["outro_duration"]))
+        if intro_key:
+            self.vars[intro_key].set(series["intro"])
+        if intro_duration_key:
+            self.vars[intro_duration_key].set(str(series["intro_duration"]))
+        if outro_key:
+            self.vars[outro_key].set(series["outro"])
+        if outro_duration_key:
+            self.vars[outro_duration_key].set(str(series["outro_duration"]))
+        # transition/transition_duration are newer fields on the series
+        # record than intro/outro/*_duration — defaulted (unlike those,
+        # always present) so a series.json saved before they existed
+        # still resolves cleanly, same reasoning as service_video.py's
+        # own _stitch_from_state().
+        if transition_key:
+            self.vars[transition_key].set(series.get("transition", "fade"))
+        if transition_duration_key:
+            self.vars[transition_duration_key].set(str(series.get("transition_duration", 1.0)))
 
     def _wire_series_selector(
-        self, selector_key: str, intro_key: str, intro_duration_key: str, outro_key: str, outro_duration_key: str,
+        self, selector_key: str, intro_key: str | None = None, intro_duration_key: str | None = None,
+        outro_key: str | None = None, outro_duration_key: str | None = None,
+        transition_key: str | None = None, transition_duration_key: str | None = None,
     ):
-        """Selecting a series in `selector_key`'s combobox fills in the
-        given intro/outro/duration var keys from the matching record (see
-        self.series/_find_series()) — this (not a direct Entry) is now
-        the normal way the Live/Offline tabs set intro/outro, per issue
-        #12. Those 4 target vars are created here too (StringVars),
-        since nothing else builds them anymore now that they're not
-        directly-editable fields."""
-        for key in (intro_key, intro_duration_key, outro_key, outro_duration_key):
-            self.vars.setdefault(key, tk.StringVar())
-        binding = (selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key)
+        """Selecting a series in `selector_key`'s combobox fills in
+        whichever target var keys are given from the matching record
+        (see self.series/_find_series()) — this (not a direct Entry) is
+        now the normal way the Live/Offline tabs set intro/outro/
+        transition, per issue #12. All target keys are optional: the
+        Live tab's own `stitch_series` binds none of them (nothing
+        reads intro/outro/transition there directly any more — see
+        _build_live_tab()) but still needs registering here so
+        _delete_series()/a rename (see SeriesEditWindow._save()) keep
+        working for it. Given target vars are created here too
+        (StringVars), since nothing else builds them anymore now that
+        they're not directly-editable fields."""
+        for key in (intro_key, intro_duration_key, outro_key, outro_duration_key, transition_key, transition_duration_key):
+            if key:
+                self.vars.setdefault(key, tk.StringVar())
+        binding = (
+            selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key,
+            transition_key, transition_duration_key,
+        )
         self._series_bindings.append(binding)
         self.vars[selector_key].trace_add("write", lambda *_a, b=binding: self._apply_series_to_vars(*b))
 
@@ -1766,16 +1781,27 @@ class App(tk.Tk):
         self.series = [s for s in self.series if s["name"] != name]
         self._save_series()
         # A dropdown that had the now-deleted series selected shouldn't
-        # keep showing it (or keep whatever intro/outro it last resolved
-        # to) — clear both back to blank rather than leave a dangling
-        # reference nothing else knows is now stale.
-        for selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key in self._series_bindings:
+        # keep showing it (or keep whatever intro/outro/transition it
+        # last resolved to) — clear back to blank rather than leave a
+        # dangling reference nothing else knows is now stale.
+        for (
+            selector_key, intro_key, intro_duration_key, outro_key, outro_duration_key,
+            transition_key, transition_duration_key,
+        ) in self._series_bindings:
             if self.vars[selector_key].get() == name:
                 self.vars[selector_key].set("")
-                self.vars[intro_key].set("")
-                self.vars[intro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
-                self.vars[outro_key].set("")
-                self.vars[outro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
+                if intro_key:
+                    self.vars[intro_key].set("")
+                if intro_duration_key:
+                    self.vars[intro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
+                if outro_key:
+                    self.vars[outro_key].set("")
+                if outro_duration_key:
+                    self.vars[outro_duration_key].set(str(DEFAULT_IMAGE_DURATION))
+                if transition_key:
+                    self.vars[transition_key].set("fade")
+                if transition_duration_key:
+                    self.vars[transition_duration_key].set("1.0")
                 self._series_last_valid.pop(selector_key, None)
         self._refresh_series_choices()
 
@@ -1795,9 +1821,14 @@ class App(tk.Tk):
 
         series_combo = self._labeled_combobox(frame, 1, "Series", "stitch_series", self._series_names(), width=26)
         self._series_comboboxes.append(series_combo)
-        self._wire_series_selector(
-            "stitch_series", "stitch_intro", "stitch_intro_duration", "stitch_outro", "stitch_outro_duration",
-        )
+        # No intro/outro/transition target keys — resolving a series
+        # name to those now happens server-side (service_video.py's
+        # resolve_series()), whether that's watch()'s own live 'stitch
+        # <name>' command or a later render()/bulk-render() run. Still
+        # registered (with nothing to auto-fill) so _delete_series()/a
+        # rename (see SeriesEditWindow._save()) keep working correctly
+        # for this dropdown.
+        self._wire_series_selector("stitch_series")
         self._make_series_combobox_searchable(series_combo, "stitch_series")
 
         self._labeled_entry(frame, 2, "Output path", "stitch_output", help_text=TIMESTAMP_HELP)
@@ -1886,6 +1917,7 @@ class App(tk.Tk):
         self._series_comboboxes.append(series_combo)
         self._wire_series_selector(
             "st_series", "st_intro", "st_intro_duration", "st_outro", "st_outro_duration",
+            "st_transition", "st_duration",
         )
         self._make_series_combobox_searchable(series_combo, "st_series")
 
@@ -1911,20 +1943,13 @@ class App(tk.Tk):
             font=self.ui_font,
         )
 
-        self._labeled_combobox(
-            frame, 7, "Transition type", "st_transition", XFADE_TRANSITIONS, width=12, col=0,
-        )
-        self.vars["st_transition"].set("fade")
-        self._labeled_entry(frame, 7, "Transition duration (s)", "st_duration", width=8, col=2, pad_left=16)
-        self.vars["st_duration"].set("1.0")
-
         # Trim/Stitch left-aligned, Advanced… right-aligned, all one row —
         # a single full-width frame (columnspan matching row 0's own
         # wraplength'd label above) with plain pack(side=...) inside it,
         # rather than grid columns, so the two sides can anchor
         # independently without needing to know how wide the row is.
         offline_btn_row = ttk.Frame(frame)
-        offline_btn_row.grid(row=8, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        offline_btn_row.grid(row=7, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         trim_btn = ttk.Button(offline_btn_row, text="Trim", style="Accent.TButton", command=self._run_trim)
         trim_btn.pack(side="left")
         self._start_buttons.append(trim_btn)
@@ -1994,30 +2019,24 @@ class App(tk.Tk):
         # Restore by series name if the one this file last saved still
         # exists — the normal case, and _wire_series_selector()'s own
         # trace (fired by the .set() below) fills in st_intro/outro/
-        # durations from it automatically. Otherwise (no series key —
-        # an older/foreign render-state file — or it's since been
-        # renamed/deleted) fall straight back to setting intro/outro/
-        # durations directly from whatever this file has saved, same as
-        # before series existed.
+        # durations/transition from it automatically. Otherwise (no
+        # series key — an older/foreign render-state file — or it's
+        # since been renamed/deleted) there's nothing to resolve
+        # intro/outro/transition from any more, so those are cleared
+        # rather than left showing a stale previous selection's values.
         saved_series = stitch_cfg.get("series", "")
         if saved_series and self._find_series(saved_series):
             self.vars["st_series"].set(saved_series)
         else:
             self.vars["st_series"].set("")
-            if "intro" in stitch_cfg:
-                self.vars["st_intro"].set(stitch_cfg["intro"])
-            if "outro" in stitch_cfg:
-                self.vars["st_outro"].set(stitch_cfg["outro"])
-            if "intro_duration" in stitch_cfg:
-                self.vars["st_intro_duration"].set(str(stitch_cfg["intro_duration"]))
-            if "outro_duration" in stitch_cfg:
-                self.vars["st_outro_duration"].set(str(stitch_cfg["outro_duration"]))
+            self.vars["st_intro"].set("")
+            self.vars["st_outro"].set("")
+            self.vars["st_intro_duration"].set(str(DEFAULT_IMAGE_DURATION))
+            self.vars["st_outro_duration"].set(str(DEFAULT_IMAGE_DURATION))
+            self.vars["st_transition"].set("fade")
+            self.vars["st_duration"].set("1.0")
         if "output" in stitch_cfg:
             self.vars["st_output"].set(stitch_cfg["output"])
-        if "transition_duration" in stitch_cfg:
-            self.vars["st_duration"].set(str(stitch_cfg["transition_duration"]))
-        if "transition" in stitch_cfg:
-            self.vars["st_transition"].set(stitch_cfg["transition"])
         # This one field drives both trim.crf and stitch.crf when Trim/
         # Stitch runs (see _run_trim()/_run_stitch()) — on load, prefer
         # stitch.crf (what actually determines the final video's visible
@@ -2476,25 +2495,11 @@ class App(tk.Tk):
             self.vars["encoder_preset"].set(saved_preset)
 
         self.vars["stitch_auto"].set(bool(stitch.get("auto", True)))
-        # Restore by series name if the one this config last saved still
-        # exists — the normal case, and _wire_series_selector()'s own
-        # trace (fired by the .set() below) fills in stitch_intro/outro/
-        # durations from it automatically. Otherwise (no series key at
-        # all — an older config.json — or it's since been renamed/
-        # deleted) fall straight back to the raw values already saved
-        # here, same as before series existed, rather than going blank.
-        saved_series = stitch.get("series", "")
-        if saved_series and self._find_series(saved_series):
-            self.vars["stitch_series"].set(saved_series)
-        else:
-            self.vars["stitch_series"].set("")
-            self.vars["stitch_intro"].set(stitch.get("intro", ""))
-            self.vars["stitch_outro"].set(stitch.get("outro", ""))
-            self.vars["stitch_intro_duration"].set(str(stitch.get("intro_duration", DEFAULT_IMAGE_DURATION)))
-            self.vars["stitch_outro_duration"].set(str(stitch.get("outro_duration", DEFAULT_IMAGE_DURATION)))
+        # config.json no longer carries series/intro/outro/*_duration/
+        # transition* at all (see resolve_series() in service_video.py)
+        # — the Live tab's Series selection is never restored across a
+        # config load/app restart, only ever picked fresh.
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
-        self.vars["stitch_transition_duration"].set(str(stitch.get("transition_duration", 1.0)))
-        self.vars["stitch_transition"].set(stitch.get("transition", "fade"))
         self.vars["stitch_subsplash_preset"].set(bool(stitch.get("subsplash_preset", False)))
 
         self.config_path_var.set(str(path))
@@ -2592,23 +2597,7 @@ class App(tk.Tk):
             },
             "stitch": {
                 "auto": bool(v["stitch_auto"].get()),
-                # Purely for the GUI's own convenience restoring the
-                # dropdown selection on load (see load_config()) —
-                # service_video.py itself never reads this key.
-                "series": v["stitch_series"].get().strip(),
-                "intro": v["stitch_intro"].get().strip(),
-                "outro": v["stitch_outro"].get().strip(),
-                "intro_duration": to_float(
-                    v["stitch_intro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Intro duration"
-                ),
-                "outro_duration": to_float(
-                    v["stitch_outro_duration"].get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
-                ),
                 "output": v["stitch_output"].get().strip() or "final.mp4",
-                "transition_duration": to_float(
-                    v["stitch_transition_duration"].get().strip() or "1.0", "Transition duration"
-                ),
-                "transition": v["stitch_transition"].get().strip() or "fade",
                 "subsplash_preset": bool(v["stitch_subsplash_preset"].get()),
                 # Not GUI-exposed (see FAST_COPY_HELP / stitch()'s own
                 # docstring in service_video.py for why) — always off here;
@@ -3004,10 +2993,52 @@ class App(tk.Tk):
                 self.live_trim_btn.configure(state="disabled")
 
     def _stitch_live(self):
+        # "If no series is selected, stitch should fail" — checked here
+        # up front (rather than left to service_video.py's own
+        # resolve_series()) so the live case fails the same clean way
+        # the post-exit one does (see _run_stitch()) instead of a
+        # background-thread error only visible in the console.
+        series = self.vars["stitch_series"].get().strip()
+        if not series:
+            messagebox.showerror(
+                "Stitch", "Select a series first — Stitch needs one to know which intro/outro to use.",
+            )
+            return
         if self.runner.running():
-            self.runner.send_line("stitch")
-            self._log("[gui] sent: stitch")
+            # Sends whatever's *currently* selected, not whatever this
+            # watch() run started with — see watch()'s own 'stitch'
+            # manual-command handling (service_video.py), which records
+            # it into the render-state file before actually stitching.
+            self.runner.send_line(f"stitch {series}")
+            self._log(f"[gui] sent: stitch {series}")
         else:
+            # Post-exit Stitch reuses Offline's own flow (_run_stitch())
+            # — sync the Live tab's own CURRENT Series/Output selection
+            # into Offline's fields first (a series picked here, on the
+            # Live tab, after watch() already exited otherwise never
+            # reaches Offline's own Series dropdown at all — _run_stitch()
+            # would check *that* var, find it still blank or pointed at
+            # something stale from the just-loaded render-state file, and
+            # fail confusingly even though a series is clearly selected
+            # right here). Also updates the render-state file on disk to
+            # match, so it stays an accurate record of what was actually
+            # stitched — same "record what was actually used" principle
+            # watch()'s own live 'stitch <name>' command follows (see
+            # service_video.py's apply_stitch_command_series()), just
+            # done here since there's no live process left to do it.
+            self.vars["st_series"].set(series)
+            output = self.vars["stitch_output"].get().strip() or "final.mp4"
+            self.vars["st_output"].set(output)
+            state_path = self.render_state_var.get().strip()
+            if state_path:
+                try:
+                    state = json.loads(Path(state_path).read_text())
+                    stitch_cfg = state.setdefault("stitch", {})
+                    stitch_cfg["series"] = series
+                    stitch_cfg["output"] = output
+                    Path(state_path).write_text(json.dumps(state, indent=2))
+                except (OSError, json.JSONDecodeError) as e:
+                    self._log(f"[gui] could not update render-state file's series: {e}")
             self._run_stitch()
             if self.runner.running():
                 self._live_handoff_which = "stitch"
@@ -3047,17 +3078,15 @@ class App(tk.Tk):
         shared by _run_trim()/_run_stitch()/_export_render_state(), since
         all three need most of the same inputs (just doing different
         things with them afterward, and each requiring their own subset —
-        e.g. Stitch needs Trimmed clip, not Main clip; see each caller's
-        own check). Returns None (after showing an error dialog titled
-        `error_title`) if something required is missing or invalid."""
+        e.g. Stitch needs Trimmed clip and a selected series, Trim needs
+        neither; see each caller's own check). Returns None (after
+        showing an error dialog titled `error_title`) if something
+        required is missing or invalid."""
         intro = self.vars["st_intro"].get().strip()
         main_clip = self.vars["st_main"].get().strip()
         trimmed_clip = self.vars["st_trimmed"].get().strip()
         outro = self.vars["st_outro"].get().strip()
         output = self.vars["st_output"].get().strip() or "output.mp4"
-        if not intro or not outro:
-            messagebox.showerror(error_title, "Intro and outro paths are both required.")
-            return None
         try:
             duration = to_float(self.vars["st_duration"].get().strip() or "1.0", "Transition duration")
             intro_duration = to_float(
@@ -3124,18 +3153,11 @@ class App(tk.Tk):
             },
             "stitch": {
                 "auto": stitch_auto,
-                # Purely for the GUI's own convenience restoring the
-                # Offline tab's Series dropdown on a later Load from
-                # JSON (see _load_render_state_json()) — nothing else
-                # reads this key.
+                # The only way intro/outro/durations/transition get
+                # resolved now — see service_video.py's resolve_series()
+                # — not just GUI convenience the way this key used to be.
                 "series": f.get("series", ""),
-                "intro": f["intro"],
-                "outro": f["outro"],
-                "intro_duration": f["intro_duration"],
-                "outro_duration": f["outro_duration"],
                 "output": f["output"],
-                "transition_duration": f["duration"],
-                "transition": f["transition"],
                 "crf": f["crf"],
                 "subsplash_preset": f["subsplash_preset"],
                 # Not GUI-exposed (see FAST_COPY_HELP) — always off here.
@@ -3204,6 +3226,11 @@ class App(tk.Tk):
         never read here."""
         f = self._collect_offline_fields(error_title="Stitch")
         if f is None:
+            return
+        if not f["series"]:
+            messagebox.showerror(
+                "Stitch", "Select a series first — Stitch needs one to know which intro/outro to use.",
+            )
             return
         if not f["trimmed_clip"]:
             messagebox.showerror(
@@ -3430,13 +3457,31 @@ class SeriesEditWindow(tk.Toplevel):
         Tooltip(outro_dur_label, IMAGE_DURATION_HELP, font=app.ui_font)
         Tooltip(outro_dur_spin, IMAGE_DURATION_HELP, font=app.ui_font)
 
+        self.transition_var = tk.StringVar(value=series.get("transition", "fade") if series else "fade")
+        ttk.Label(frame, text="Transition type", style="Header.TLabel").grid(
+            row=5, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        transition_combo = ttk.Combobox(
+            frame, textvariable=self.transition_var, values=XFADE_TRANSITIONS, state="readonly", width=12,
+        )
+        transition_combo.grid(row=5, column=1, sticky="w", pady=3)
+        self.transition_duration_var = tk.StringVar(
+            value=str(series.get("transition_duration", 1.0)) if series else "1.0"
+        )
+        ttk.Label(frame, text="Duration (s)", style="Header.TLabel").grid(
+            row=5, column=2, sticky="w", padx=(16, 6), pady=3
+        )
+        ttk.Entry(frame, textvariable=self.transition_duration_var, width=8).grid(
+            row=5, column=3, sticky="w", pady=3
+        )
+
         self.hidden_var = tk.BooleanVar(value=bool(series.get("hidden", False)) if series else False)
         ttk.Checkbutton(
             frame, text="Hidden (excluded from Live/Offline Series dropdowns)", variable=self.hidden_var,
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=6, column=0, columnspan=4, sticky="e", pady=(10, 0))
+        btn_row.grid(row=7, column=0, columnspan=4, sticky="e", pady=(10, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(btn_row, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=(0, 8))
 
@@ -3472,13 +3517,19 @@ class SeriesEditWindow(tk.Toplevel):
             outro_duration = to_float(
                 self.outro_duration_var.get().strip() or str(DEFAULT_IMAGE_DURATION), "Outro duration"
             )
+            transition_duration = to_float(
+                self.transition_duration_var.get().strip() or "1.0", "Transition duration"
+            )
         except ValueError as e:
             messagebox.showerror("Save series", str(e))
             return
+        transition = self.transition_var.get().strip() or "fade"
 
         record = {
             "name": name, "intro": intro, "intro_duration": intro_duration,
-            "outro": outro, "outro_duration": outro_duration, "hidden": bool(self.hidden_var.get()),
+            "outro": outro, "outro_duration": outro_duration,
+            "transition": transition, "transition_duration": transition_duration,
+            "hidden": bool(self.hidden_var.get()),
         }
         if self.original_name is None:
             self.app.series.append(record)
@@ -4540,25 +4591,18 @@ class ConfigWindow(tk.Toplevel):
             frame, 4, "End offset (s)", "trim_pad_end", colspan=3, help_text=OFFSET_HELP,
         )
 
-        # Same fields, same order/columns as the Offline tab, for
-        # consistency — these are the defaults a live Watch run's
-        # auto-stitch uses; the Offline tab always lets you override them
-        # per run.
-        app._labeled_combobox(
-            frame, 5, "Transition type", "stitch_transition", XFADE_TRANSITIONS, width=12, col=0,
-        )
-        app.vars["stitch_transition"].set("fade")
-        app._labeled_entry(frame, 5, "Transition duration (s)", "stitch_transition_duration", width=8, col=2, pad_left=16)
-        app.vars["stitch_transition_duration"].set("1.0")
-
-        crf_scale = app._crf_slider(frame, 6, "CRF (quality)", "trim_crf", col=0, colspan=3)
+        # Transition type/duration used to live here too — now set per-
+        # series instead (Series Manager tab), since the auto-stitch
+        # step resolves intro/outro/transition from whichever series is
+        # selected, same as everywhere else stitching happens.
+        crf_scale = app._crf_slider(frame, 5, "CRF (quality)", "trim_crf", col=0, colspan=3)
 
         app.vars["stitch_subsplash_preset"] = tk.BooleanVar(value=False)
         subsplash_cb = ttk.Checkbutton(
             frame, text="Subsplash On-Demand (1080p) preset (stitch only)",
             variable=app.vars["stitch_subsplash_preset"],
         )
-        subsplash_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        subsplash_cb.grid(row=6, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(subsplash_cb, SUBSPLASH_PRESET_HELP, font=app.ui_font)
         # CRF is ignored for the auto-stitch step once this is on (see
         # stitch()'s subsplash_preset) — grey the slider out so that's
@@ -4575,37 +4619,37 @@ class ConfigWindow(tk.Toplevel):
         fast_trim_cb = ttk.Checkbutton(
             frame, text="Fast copy (recommended)", variable=app.vars["trim_fast_copy"],
         )
-        fast_trim_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
+        fast_trim_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(fast_trim_cb, FAST_COPY_HELP, font=app.ui_font)
 
         app.vars["trim_normalize_audio"] = tk.BooleanVar(value=True)
         normalize_cb = ttk.Checkbutton(
             frame, text="Normalize audio (recommended)", variable=app.vars["trim_normalize_audio"],
         )
-        normalize_cb.grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+        normalize_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP, font=app.ui_font)
 
-        lufs_entry = app._labeled_entry(frame, 10, "Target LUFS", "trim_normalize_target_lufs", width=8, col=0)
+        lufs_entry = app._labeled_entry(frame, 9, "Target LUFS", "trim_normalize_target_lufs", width=8, col=0)
         app.vars["trim_normalize_target_lufs"].set("-16.0")
         Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
 
-        encoder_combo = app._labeled_combobox(frame, 11, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
+        encoder_combo = app._labeled_combobox(frame, 10, "Encoder", "encoder", ENCODER_CHOICES, width=14, col=0)
         encoder_combo.configure(state="readonly")
         app.vars["encoder"].set("nvenc")
         Tooltip(encoder_combo, ENCODER_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
-        preset_combo = app._labeled_combobox(frame, 12, "Encoder preset", "encoder_preset", [], width=14, col=0)
+        preset_combo = app._labeled_combobox(frame, 11, "Encoder preset", "encoder_preset", [], width=14, col=0)
         preset_combo.configure(state="readonly")
         app._wire_encoder_preset_choices("encoder", preset_combo, "encoder_preset")
         Tooltip(preset_combo, ENCODER_PRESET_HELP + " Applies to both the trim and the auto-stitch step.", font=app.ui_font)
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=13, column=0, columnspan=5, sticky="ew", pady=(12, 8)
+            row=12, column=0, columnspan=5, sticky="ew", pady=(12, 8)
         )
         app.vars["stitch_auto"] = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame, text="Auto-stitch after trim", variable=app.vars["stitch_auto"],
-        ).grid(row=14, column=0, columnspan=3, sticky="w", pady=3)
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
 
 
 if __name__ == "__main__":

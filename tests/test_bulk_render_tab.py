@@ -15,7 +15,7 @@ def _write_states(tmp_path, n=2, trimmed=None):
             "recording_path": f"/rec{i}.mp4", "raw_begin_offset": 1.0, "raw_end_offset": 4.0,
             "trimmed_path": trimmed,
             "trim": {"output": f"/trim{i}.mp4"},
-            "stitch": {"auto": True, "intro": "/intro.mp4", "outro": "/outro.mp4", "output": f"/final{i}.mp4"},
+            "stitch": {"auto": True, "series": "Some Series", "output": f"/final{i}.mp4"},
         }
         for i in range(n)
     ]
