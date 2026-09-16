@@ -2172,23 +2172,31 @@ class App(tk.Tk):
         ttk.Button(load_export_row, text="Export…", command=self._export_bulk_states).pack(side="left", padx=(8, 0))
 
         self.bulk_render_tree = ttk.Treeview(
-            frame, columns=("index", "status", "recording", "output"), show="headings", selectmode="browse",
+            frame, columns=("index", "recording", "output", "status"), show="headings", selectmode="browse",
         )
         self.bulk_render_tree.heading("index", text="#", anchor="w")
-        self.bulk_render_tree.heading("status", text="Status", anchor="w")
         self.bulk_render_tree.heading("recording", text="Recording", anchor="w")
         self.bulk_render_tree.heading("output", text="Output", anchor="w")
+        self.bulk_render_tree.heading("status", text="Status", anchor="w")
         self.bulk_render_tree.column("index", width=36, anchor="center")
-        self.bulk_render_tree.column("status", width=110, anchor="w")
         self.bulk_render_tree.column("recording", width=300, anchor="w")
         self.bulk_render_tree.column("output", width=220, anchor="w")
-        for status_key, (_label, color_key) in BULK_STATUS_DISPLAY.items():
-            self.bulk_render_tree.tag_configure(f"bulk_status_{status_key}", foreground=PALETTE[color_key])
+        self.bulk_render_tree.column("status", width=110, anchor="w")
         self.bulk_render_tree.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.bulk_render_tree.bind("<Double-1>", self._on_bulk_render_double_click)
         self.bulk_render_tree.bind("<ButtonPress-1>", self._on_bulk_render_drag_start)
         self.bulk_render_tree.bind("<B1-Motion>", self._on_bulk_render_drag_motion)
         self.bulk_render_tree.bind("<ButtonRelease-1>", self._on_bulk_render_drag_end)
+        # ttk.Treeview tags recolor an entire row, which would tint the
+        # #/Recording/Output columns' text along with Status — instead a
+        # small tk.Label is overlaid on top of just each row's Status
+        # cell (see _sync_bulk_status_labels()), keeping color-coding
+        # scoped to the status text itself. Resynced on resize/tab
+        # switch too, since bbox()-based placement depends on the tree
+        # actually being laid out/visible.
+        self._bulk_status_labels: dict[str, tk.Label] = {}
+        self.bulk_render_tree.bind("<Configure>", lambda _e: self._sync_bulk_status_labels())
+        self.bulk_render_tree.bind("<Map>", lambda _e: self._sync_bulk_status_labels())
         self._bulk_drag_iid: str | None = None
         self._bulk_drag_moved = False
 
@@ -2244,19 +2252,17 @@ class App(tk.Tk):
         self.bulk_render_tree.delete(*self.bulk_render_tree.get_children())
         if not preserve_status:
             self._bulk_run_status = []
-        idle_label, idle_tag = BULK_STATUS_DISPLAY["idle"][0], "bulk_status_idle"
+        idle = (BULK_STATUS_DISPLAY["idle"][0], "idle")
         for i, state in enumerate(self.bulk_states):
-            status_label, status_tag = (
-                self._bulk_run_status[i] if preserve_status and i < len(self._bulk_run_status)
-                else (idle_label, idle_tag)
+            status_label, _status_key = (
+                self._bulk_run_status[i] if preserve_status and i < len(self._bulk_run_status) else idle
             )
             self.bulk_render_tree.insert(
                 "", "end", iid=str(i),
                 values=(
-                    i + 1, status_label, state.get("recording_path") or "",
-                    (state.get("stitch") or {}).get("output") or "",
+                    i + 1, state.get("recording_path") or "",
+                    (state.get("stitch") or {}).get("output") or "", status_label,
                 ),
-                tags=(status_tag,),
             )
         # Treeview's own height is in rows, not pixels, with no built-in
         # auto-fit — grown/shrunk explicitly here to match content; the
@@ -2265,6 +2271,33 @@ class App(tk.Tk):
         # internally.
         self.bulk_render_tree.configure(height=max(1, len(self.bulk_states)))
         self._update_bulk_render_buttons()
+        self._sync_bulk_status_labels()
+
+    def _sync_bulk_status_labels(self):
+        """Repositions/recolors the small overlay Label on top of each
+        row's Status cell (see _build_bulk_render_tab()) from
+        self._bulk_run_status — call after anything that changes row
+        count/order/status. A no-op per-row until the tree is actually
+        laid out and visible (bbox() returns empty until then); the
+        <Configure>/<Map> bindings pick it up once it is."""
+        self.bulk_render_tree.update_idletasks()
+        live_iids = set(self.bulk_render_tree.get_children())
+        for stale_iid in [iid for iid in self._bulk_status_labels if iid not in live_iids]:
+            self._bulk_status_labels.pop(stale_iid).destroy()
+        idle = (BULK_STATUS_DISPLAY["idle"][0], "idle")
+        for i, iid in enumerate(self.bulk_render_tree.get_children()):
+            label_text, status_key = self._bulk_run_status[i] if i < len(self._bulk_run_status) else idle
+            color = PALETTE[BULK_STATUS_DISPLAY.get(status_key, (None, "muted"))[1]]
+            bbox = self.bulk_render_tree.bbox(iid, "status")
+            if not bbox:
+                continue
+            label = self._bulk_status_labels.get(iid)
+            if label is None:
+                label = tk.Label(self.bulk_render_tree, font=self.ui_font, bg=PALETTE["surface"], anchor="w")
+                self._bulk_status_labels[iid] = label
+            label.configure(text=label_text, fg=color)
+            x, y, w, h = bbox
+            label.place(x=x + 2, y=y, width=max(1, w - 2), height=h)
 
     def _update_bulk_render_buttons(self):
         state = "normal" if self.bulk_states else "disabled"
@@ -2305,7 +2338,7 @@ class App(tk.Tk):
         self._log(f"[gui] exported {len(self.bulk_states)} bulk render entries -> {path}")
 
     def _add_bulk_entry(self):
-        BulkEntryEditWindow(self, None, _blank_bulk_entry())
+        BulkEntryEditWindow(self, None, _blank_bulk_entry(self))
 
     def _on_bulk_render_double_click(self, event):
         iid = self.bulk_render_tree.identify_row(event.y)
@@ -2342,7 +2375,7 @@ class App(tk.Tk):
             new_order = [int(iid) for iid in self.bulk_render_tree.get_children()]
             self.bulk_states = [self.bulk_states[i] for i in new_order]
             if self._bulk_run_status:
-                idle = (BULK_STATUS_DISPLAY["idle"][0], "bulk_status_idle")
+                idle = (BULK_STATUS_DISPLAY["idle"][0], "idle")
                 self._bulk_run_status = [
                     self._bulk_run_status[i] if i < len(self._bulk_run_status) else idle for i in new_order
                 ]
@@ -2366,12 +2399,13 @@ class App(tk.Tk):
         with temp_file:
             json.dump(self.bulk_states, temp_file, indent=2)
         self._bulk_run_temp_path = temp_file.name
-        idle = (BULK_STATUS_DISPLAY["idle"][0], "bulk_status_idle")
+        idle = (BULK_STATUS_DISPLAY["idle"][0], "idle")
         self._bulk_run_status = [idle for _ in self.bulk_states]
         for iid in self.bulk_render_tree.get_children():
             values = list(self.bulk_render_tree.item(iid, "values"))
-            values[1] = idle[0]
-            self.bulk_render_tree.item(iid, values=values, tags=(idle[1],))
+            values[-1] = idle[0]
+            self.bulk_render_tree.item(iid, values=values)
+        self._sync_bulk_status_labels()
         self._start(f"bulk_{mode}", ["bulk-render", self._bulk_run_temp_path, "--mode", mode])
 
     def _handle_bulk_render_line(self, line: str):
@@ -2387,14 +2421,16 @@ class App(tk.Tk):
         index = int(m.group(1)) - 1
         status_key = m.group(2)
         label, _color_key = BULK_STATUS_DISPLAY.get(status_key, (status_key, "muted"))
-        tag = f"bulk_status_{status_key}"
-        if index < len(self._bulk_run_status):
-            self._bulk_run_status[index] = (label, tag)
+        if index >= len(self._bulk_run_status):
+            idle = (BULK_STATUS_DISPLAY["idle"][0], "idle")
+            self._bulk_run_status.extend([idle] * (index + 1 - len(self._bulk_run_status)))
+        self._bulk_run_status[index] = (label, status_key)
         iid = str(index)
         if self.bulk_render_tree.exists(iid):
             values = list(self.bulk_render_tree.item(iid, "values"))
-            values[1] = label
-            self.bulk_render_tree.item(iid, values=values, tags=(tag,))
+            values[-1] = label
+            self.bulk_render_tree.item(iid, values=values)
+        self._sync_bulk_status_labels()
 
     # -- Console ----------------------------------------------------------
 
@@ -3726,21 +3762,40 @@ class SeriesEditWindow(tk.Toplevel):
         self.destroy()
 
 
-def _blank_bulk_entry() -> dict:
+def _blank_bulk_entry(app: "App") -> dict:
     """A fresh render-state dict for the Bulk Render tab's "+ Add
     entry…" — same series-only shape (see resolve_series() in
-    service_video.py) and the same trim/stitch defaults
-    default_config() uses, just per-entry instead of app-wide."""
+    service_video.py) that _save() below produces, but with trim/stitch
+    defaults read live from app.vars (the Config tab's currently loaded
+    config.json), not a hardcoded copy of them — so a brand-new entry
+    always starts out matching whatever the app is actually configured
+    with right now, not some fixed fallback that can drift out of sync."""
+    v = app.vars
+
+    def _num(key: str, default: float) -> float:
+        try:
+            return float(v[key].get().strip() or default)
+        except (ValueError, tk.TclError):
+            return default
+
+    crf = v["trim_crf"].get()
+    encoder = v["encoder"].get()
+    encoder_preset = v["encoder_preset"].get() or None
     return {
         "recording_path": None, "raw_begin_offset": None, "raw_end_offset": None, "trimmed_path": None,
         "trim": {
-            "output": "body_trimmed.mp4", "pad_start_seconds": 0, "pad_end_seconds": 0,
-            "crf": 23, "fast_copy": True, "normalize_audio": True, "normalize_target_lufs": -16.0,
-            "encoder": "nvenc", "encoder_preset": None,
+            "output": v["trim_output"].get().strip() or "body_trimmed.mp4",
+            "pad_start_seconds": _num("trim_pad_start", 0.0), "pad_end_seconds": _num("trim_pad_end", 0.0),
+            "crf": crf, "fast_copy": bool(v["trim_fast_copy"].get()),
+            "normalize_audio": bool(v["trim_normalize_audio"].get()),
+            "normalize_target_lufs": _num("trim_normalize_target_lufs", -16.0),
+            "encoder": encoder, "encoder_preset": encoder_preset,
         },
         "stitch": {
-            "auto": True, "series": "", "output": "final.mp4", "crf": 23, "subsplash_preset": False,
-            "fast_copy": False, "encoder": "nvenc", "encoder_preset": None,
+            "auto": bool(v["stitch_auto"].get()), "series": "",
+            "output": v["stitch_output"].get().strip() or "final.mp4",
+            "crf": crf, "subsplash_preset": bool(v["stitch_subsplash_preset"].get()),
+            "fast_copy": False, "encoder": encoder, "encoder_preset": encoder_preset,
         },
     }
 
@@ -3772,16 +3827,27 @@ class BulkEntryEditWindow(tk.Toplevel):
         self.transient(app)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
-        trim_cfg = state.get("trim", {})
-        stitch_cfg = state.get("stitch", {})
+        # Same shape as the Offline tab's own load_export_row — loads/saves
+        # just this one entry's render-state dict (see
+        # _load_state_into_fields()/_collect_state()), independent of the
+        # Bulk Render tab's own list-level Import/Export.
+        top_row = ttk.Frame(self, padding=(12, 12, 12, 0))
+        top_row.pack(fill="x")
+        ttk.Button(top_row, text="Load from JSON…", command=self._load_from_json).pack(side="left")
+        ttk.Button(top_row, text="Export to JSON…", command=self._export_to_json).pack(side="left", padx=(8, 0))
 
         frame = ttk.Frame(self, padding=12)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
 
+        # Widgets below are built against blank/placeholder var values —
+        # _load_state_into_fields(state) at the very end of __init__ (after
+        # every trace is wired) is the single place actual values (from
+        # `state`, or later from a Load-from-JSON reload) get applied, so
+        # construction and reload can't drift out of sync with each other.
         app.vars.setdefault("bulk_edit_series", tk.StringVar())
         self.series_var = app.vars["bulk_edit_series"]
-        self.series_var.set(stitch_cfg.get("series", ""))
+        self.series_var.set("")
         ttk.Label(frame, text="Series", style="Header.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 6), pady=3
         )
@@ -3791,7 +3857,7 @@ class BulkEntryEditWindow(tk.Toplevel):
         series_combo.grid(row=0, column=1, columnspan=3, sticky="ew", pady=3)
         app._make_series_combobox_searchable(series_combo, "bulk_edit_series")
 
-        self.recording_var = tk.StringVar(value=state.get("recording_path") or "")
+        self.recording_var = tk.StringVar(value="")
         ttk.Label(frame, text="Main clip", style="Header.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 6), pady=3
         )
@@ -3802,7 +3868,7 @@ class BulkEntryEditWindow(tk.Toplevel):
             row=1, column=3, sticky="w", padx=(4, 0), pady=3
         )
 
-        self.trimmed_var = tk.StringVar(value=state.get("trimmed_path") or "")
+        self.trimmed_var = tk.StringVar(value="")
         trimmed_label = ttk.Label(frame, text="Trimmed clip", style="Header.TLabel")
         trimmed_label.grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
         trimmed_entry = ttk.Entry(frame, textvariable=self.trimmed_var, width=40)
@@ -3813,7 +3879,7 @@ class BulkEntryEditWindow(tk.Toplevel):
         Tooltip(trimmed_label, TIMESTAMP_HELP, font=app.ui_font)
         Tooltip(trimmed_entry, TIMESTAMP_HELP, font=app.ui_font)
 
-        self.output_var = tk.StringVar(value=stitch_cfg.get("output") or "final.mp4")
+        self.output_var = tk.StringVar(value="final.mp4")
         output_label = ttk.Label(frame, text="Output path", style="Header.TLabel")
         output_label.grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
         output_entry = ttk.Entry(frame, textvariable=self.output_var, width=40)
@@ -3824,16 +3890,12 @@ class BulkEntryEditWindow(tk.Toplevel):
         Tooltip(output_label, TIMESTAMP_HELP, font=app.ui_font)
         Tooltip(output_entry, TIMESTAMP_HELP, font=app.ui_font)
 
-        self.start_var = tk.StringVar(
-            value=format_timestamp(parse_timestamp(state["raw_begin_offset"])) if state.get("raw_begin_offset") is not None else "00:00:00.000"
-        )
+        self.start_var = tk.StringVar(value="00:00:00.000")
         ttk.Label(frame, text="Sermon start", style="Header.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 6), pady=3
         )
         ttk.Entry(frame, textvariable=self.start_var, width=13).grid(row=4, column=1, sticky="w", pady=3)
-        self.end_var = tk.StringVar(
-            value=format_timestamp(parse_timestamp(state["raw_end_offset"])) if state.get("raw_end_offset") is not None else "00:00:00.000"
-        )
+        self.end_var = tk.StringVar(value="00:00:00.000")
         ttk.Label(frame, text="Sermon end", style="Header.TLabel").grid(
             row=4, column=2, sticky="w", padx=(16, 6), pady=3
         )
@@ -3859,8 +3921,7 @@ class BulkEntryEditWindow(tk.Toplevel):
         # CRF drives both trim.crf and stitch.crf, same as the Offline
         # tab's own single CRF field (see _build_render_state()) — one
         # knob, not two, since they're both "how good should this look".
-        crf_default = stitch_cfg.get("crf", trim_cfg.get("crf", 23))
-        self.crf_var = tk.IntVar(value=max(0, min(51, round(crf_default))))
+        self.crf_var = tk.IntVar(value=23)
         ttk.Label(frame, text="CRF (quality)", style="Header.TLabel").grid(
             row=8, column=0, sticky="w", padx=(0, 6), pady=3
         )
@@ -3876,7 +3937,7 @@ class BulkEntryEditWindow(tk.Toplevel):
             row=0, column=1, padx=(6, 0)
         )
 
-        self.subsplash_preset_var = tk.BooleanVar(value=bool(stitch_cfg.get("subsplash_preset", False)))
+        self.subsplash_preset_var = tk.BooleanVar(value=False)
         subsplash_cb = ttk.Checkbutton(
             frame, text="Subsplash On-Demand (1080p) preset", variable=self.subsplash_preset_var,
         )
@@ -3887,19 +3948,19 @@ class BulkEntryEditWindow(tk.Toplevel):
             lambda *_args: crf_scale.configure(state="disabled" if self.subsplash_preset_var.get() else "normal"),
         )
 
-        self.fast_copy_var = tk.BooleanVar(value=bool(trim_cfg.get("fast_copy", True)))
+        self.fast_copy_var = tk.BooleanVar(value=True)
         fast_copy_cb = ttk.Checkbutton(frame, text="Fast copy (recommended)", variable=self.fast_copy_var)
         fast_copy_cb.grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(fast_copy_cb, FAST_COPY_HELP, font=app.ui_font)
 
-        self.normalize_audio_var = tk.BooleanVar(value=bool(trim_cfg.get("normalize_audio", True)))
+        self.normalize_audio_var = tk.BooleanVar(value=True)
         normalize_cb = ttk.Checkbutton(
             frame, text="Normalize audio (recommended)", variable=self.normalize_audio_var,
         )
         normalize_cb.grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP, font=app.ui_font)
 
-        self.normalize_target_lufs_var = tk.StringVar(value=str(trim_cfg.get("normalize_target_lufs", -16.0)))
+        self.normalize_target_lufs_var = tk.StringVar(value="-16.0")
         ttk.Label(frame, text="Target LUFS", style="Header.TLabel").grid(
             row=12, column=0, sticky="w", padx=(0, 6), pady=3
         )
@@ -3907,7 +3968,7 @@ class BulkEntryEditWindow(tk.Toplevel):
         lufs_entry.grid(row=12, column=1, sticky="w", pady=3)
         Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
 
-        self.encoder_var = tk.StringVar(value=stitch_cfg.get("encoder", trim_cfg.get("encoder", "nvenc")))
+        self.encoder_var = tk.StringVar(value="nvenc")
         ttk.Label(frame, text="Encoder", style="Header.TLabel").grid(
             row=13, column=0, sticky="w", padx=(0, 6), pady=3
         )
@@ -3917,7 +3978,7 @@ class BulkEntryEditWindow(tk.Toplevel):
         encoder_combo.grid(row=13, column=1, sticky="w", pady=3)
         Tooltip(encoder_combo, ENCODER_HELP, font=app.ui_font)
 
-        self.encoder_preset_var = tk.StringVar(value=stitch_cfg.get("encoder_preset") or trim_cfg.get("encoder_preset") or "")
+        self.encoder_preset_var = tk.StringVar(value="")
         ttk.Label(frame, text="Encoder preset", style="Header.TLabel").grid(
             row=14, column=0, sticky="w", padx=(0, 6), pady=3
         )
@@ -3940,6 +4001,8 @@ class BulkEntryEditWindow(tk.Toplevel):
         ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(btn_row, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=(0, 8))
 
+        self._load_state_into_fields(state)
+
         self.transient(app)
         self.grab_set()
 
@@ -3950,6 +4013,53 @@ class BulkEntryEditWindow(tk.Toplevel):
             path = filedialog.askopenfilename(filetypes=filetypes, initialdir=str(SCRIPT_DIR))
         if path:
             var.set(path)
+
+    def _load_state_into_fields(self, state: dict):
+        """Populates every field from a render-state dict — used both by
+        __init__ (the entry being edited, or a blank one for "+ Add
+        entry…") and by _load_from_json() (reloading from a picked
+        file without closing/reopening the window)."""
+        trim_cfg = state.get("trim") or {}
+        stitch_cfg = state.get("stitch") or {}
+        self.series_var.set(stitch_cfg.get("series", ""))
+        self.recording_var.set(state.get("recording_path") or "")
+        self.trimmed_var.set(state.get("trimmed_path") or "")
+        self.output_var.set(stitch_cfg.get("output") or "final.mp4")
+        self.start_var.set(
+            format_timestamp(parse_timestamp(state["raw_begin_offset"]))
+            if state.get("raw_begin_offset") is not None else "00:00:00.000"
+        )
+        self.end_var.set(
+            format_timestamp(parse_timestamp(state["raw_end_offset"]))
+            if state.get("raw_end_offset") is not None else "00:00:00.000"
+        )
+        crf_default = stitch_cfg.get("crf", trim_cfg.get("crf", 23))
+        self.crf_var.set(max(0, min(51, round(crf_default))))
+        self.subsplash_preset_var.set(bool(stitch_cfg.get("subsplash_preset", False)))
+        self.fast_copy_var.set(bool(trim_cfg.get("fast_copy", True)))
+        self.normalize_audio_var.set(bool(trim_cfg.get("normalize_audio", True)))
+        self.normalize_target_lufs_var.set(str(trim_cfg.get("normalize_target_lufs", -16.0)))
+        # Encoder preset set *after* encoder — encoder_var's own write
+        # trace (refresh_presets, wired in __init__) resets the preset to
+        # that encoder's default as a side effect of the .set() below,
+        # which this then overrides when the loaded state actually has one.
+        self.encoder_var.set(stitch_cfg.get("encoder", trim_cfg.get("encoder", "nvenc")))
+        saved_preset = stitch_cfg.get("encoder_preset") or trim_cfg.get("encoder_preset")
+        if saved_preset:
+            self.encoder_preset_var.set(saved_preset)
+
+    def _load_from_json(self):
+        path = filedialog.askopenfilename(
+            title="Load render state JSON", filetypes=JSON_FILETYPES, initialdir=str(SCRIPT_DIR)
+        )
+        if not path:
+            return
+        try:
+            state = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Load from JSON", f"Could not read {path}: {e}")
+            return
+        self._load_state_into_fields(state)
 
     def _open_interactive_trim(self):
         main_clip = self.recording_var.get().strip()
@@ -3972,20 +4082,20 @@ class BulkEntryEditWindow(tk.Toplevel):
             on_apply=lambda s, e: (self.start_var.set(format_timestamp(s)), self.end_var.set(format_timestamp(e))),
         )
 
-    def _save(self):
+    def _collect_state(self) -> dict:
+        """Builds the render-state dict for this entry's current field
+        values — shared by _save() (writes it into app.bulk_states) and
+        _export_to_json() (writes it straight to a file instead).
+        Raises ValueError (caller shows it as an error dialog) if a
+        field can't be parsed."""
         series = self.series_var.get().strip()
         recording_path = self.recording_var.get().strip() or None
-        try:
-            start_ts = to_timestamp(self.start_var.get().strip() or "00:00:00.000", "Sermon start")
-            end_ts = to_timestamp(self.end_var.get().strip() or "00:00:00.000", "Sermon end")
-            normalize_target_lufs = to_float(
-                self.normalize_target_lufs_var.get().strip() or "-16.0", "Normalize target LUFS",
-            )
-        except ValueError as e:
-            messagebox.showerror("Save entry", str(e))
-            return
-
-        state = {
+        start_ts = to_timestamp(self.start_var.get().strip() or "00:00:00.000", "Sermon start")
+        end_ts = to_timestamp(self.end_var.get().strip() or "00:00:00.000", "Sermon end")
+        normalize_target_lufs = to_float(
+            self.normalize_target_lufs_var.get().strip() or "-16.0", "Normalize target LUFS",
+        )
+        return {
             "recording_path": recording_path,
             "raw_begin_offset": format_timestamp(start_ts) if recording_path else None,
             "raw_end_offset": format_timestamp(end_ts) if recording_path else None,
@@ -4011,12 +4121,33 @@ class BulkEntryEditWindow(tk.Toplevel):
                 "encoder_preset": self.encoder_preset_var.get() or None,
             },
         }
+
+    def _save(self):
+        try:
+            state = self._collect_state()
+        except ValueError as e:
+            messagebox.showerror("Save entry", str(e))
+            return
         if self.index is None:
             self.app.bulk_states.append(state)
         else:
             self.app.bulk_states[self.index] = state
         self.app._refresh_bulk_render_tree()
         self.destroy()
+
+    def _export_to_json(self):
+        try:
+            state = self._collect_state()
+        except ValueError as e:
+            messagebox.showerror("Export to JSON", str(e))
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export render state JSON", defaultextension=".json", initialfile="render_state.json",
+            initialdir=str(SCRIPT_DIR), filetypes=JSON_FILETYPES,
+        )
+        if not path:
+            return
+        Path(path).write_text(json.dumps(state, indent=2))
 
 
 # InteractiveTrimWindow layout constants — a fixed-size filmstrip made of
