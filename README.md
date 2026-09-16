@@ -75,29 +75,32 @@ starter `config.json` next to the script on first run if none exists.
   entry failing doesn't stop the rest; Trim/Full Render write each
   entry's resolved Trimmed clip back into the file as they go, so a
   later Stitch pass (a separate run) picks it up.
-- **Series Manager**: named intro/outro bundles (a name, an intro clip +
-  duration, an outro clip + duration) — set one up once per sermon
-  series, then just pick it from the Series dropdown on the Live/Offline
-  tabs instead of setting intro/outro paths by hand every run. New…/
-  Edit…/Duplicate/Hide-Show/Delete manage the list; double-click a row
-  to edit it. Both Series dropdowns are type-ahead: typing fuzzy-matches
-  against the series names (subsequence match, like a command palette —
-  "f26s" finds "Fall 2026 Series"), narrowing the dropdown as you type;
-  leaving the field with text that doesn't resolve to a real series
-  snaps back to whatever was last selected. A series can be marked
-  Hidden (in its Edit dialog, or via the Hide/Show button) to keep it
-  out of the Live/Offline dropdowns — e.g. one you don't run anymore but
-  an old render-state file still references — without deleting it; it
-  still shows (greyed out) in the Series Manager list so it can be
-  un-hidden or edited later. Saved to `series.json` next to the script
-  (auto-created empty on first run, not committed — these are real
-  local file paths specific to one setup). Editing a series that's
-  currently selected on the Live/Offline tab updates that tab's own
-  intro/outro immediately; deleting one that's currently selected clears
-  the selection instead of leaving it pointed at something gone. Purely
-  a GUI convenience layer — `service_video.py`'s CLI has no concept of a
-  "series", only the literal intro/outro paths the GUI resolves a
-  selection to before ever running anything.
+- **Series Manager**: named intro/outro/transition bundles (a name, an
+  intro clip + duration, an outro clip + duration, a transition type +
+  duration) — set one up once per sermon series, then just pick it from
+  the Series dropdown on the Live/Offline tabs instead of setting these
+  by hand every run. New…/Edit…/Duplicate/Hide-Show/Delete manage the
+  list; double-click a row to edit it. Both Series dropdowns are
+  type-ahead: typing fuzzy-matches against the series names (subsequence
+  match, like a command palette — "f26s" finds "Fall 2026 Series"),
+  narrowing the dropdown as you type; leaving the field with text that
+  doesn't resolve to a real series snaps back to whatever was last
+  selected. A series can be marked Hidden (in its Edit dialog, or via
+  the Hide/Show button) to keep it out of the Live/Offline dropdowns —
+  e.g. one you don't run anymore but an old render-state file still
+  references — without deleting it; it still shows (greyed out) in the
+  Series Manager list so it can be un-hidden or edited later. Saved to
+  `series.json` next to the script (auto-created empty on first run, not
+  committed — these are real local file paths specific to one setup).
+  Editing a series that's currently selected on the Offline tab updates
+  that tab's own intro/outro/transition immediately; deleting one that's
+  currently selected clears the selection instead of leaving it pointed
+  at something gone. `service_video.py` itself resolves a series *name*
+  to these fields (see `resolve_series()`) at the moment a stitch
+  actually runs — config.json and render-state files only ever carry the
+  name, never literal intro/outro/transition values (see below) — so
+  Stitch fails outright with no series selected, rather than falling
+  back to some blank/default intro-outro.
 
 **Config window** (the main window's "Config" button): General (console
 log path), API (the control API below: Enabled, Host/Port, Password),
@@ -226,6 +229,16 @@ handoff for you automatically — its Trim/Stitch buttons keep working
 after `watch` exits, now driving the same fields/buttons as its Offline
 tab underneath.
 
+**Stitch (while still connected)**: once Trim has produced a clip this
+run, send `stitch <series name>` (the GUI's "Stitch" button, while Watch
+is still running) to crossfade it with that series' intro/outro right
+away — no need to wait for `watch` to exit first. The series name is
+whatever's selected *at the moment Stitch is clicked*, not whatever was
+selected when `watch` started; it's recorded into the render-state file
+(`stitch.series`) as part of running it. A bare `stitch` with no name
+reuses whatever's already on record there, or fails cleanly if nothing
+is (see "Series Manager" above — Stitch always needs a series).
+
 ### `learn`: find your begin/end slide UIDs
 
 ```
@@ -240,7 +253,10 @@ each one's UID (and text, if any) as you land on it.
 Every `watch` run writes a render-state JSON file (path configurable via
 `trim.state_output`): the recording's path, the raw begin/end timestamps,
 the trimmed clip's path once Trim has actually produced one (`null`
-until then), and the `trim`/`stitch` settings used. Created the moment
+until then), and the `trim`/`stitch` settings used — `stitch` here only
+ever names a *series* (`stitch.series`), resolved via `resolve_series()`
+at the moment a stitch actually runs, never literal intro/outro/
+transition values (see "Series Manager" above). Created the moment
 `watch` starts
 and kept up to date as marks land and recording stops, rather than only
 written once at the end; `render` needs it complete (not still `null`) to
@@ -358,14 +374,7 @@ checks and lints it (see `ci.yml`'s `lint` job).
   },
   "stitch": {
     "auto": true,
-    "series": "",                         // optional, GUI-only (see "Series Manager" above) — service_video.py ignores it
-    "intro": "intro.mp4",                 // video, or a still image (jpg/png/bmp/tif/tiff/webp)
-    "outro": "outro.mp4",                 // same
-    "intro_duration": 5.0,                // optional, default 5.0; only used if intro is a still image
-    "outro_duration": 5.0,                // optional, default 5.0; only used if outro is a still image
     "output": "final.mp4",
-    "transition_duration": 1.0,
-    "transition": "fade",                 // optional, default "fade"; any ffmpeg xfade transition name
     "crf": 23,                            // optional, default 23; ignored if subsplash_preset is true
     "subsplash_preset": false,            // optional, default false; see "Subsplash preset" below
     "fast_copy": false,                   // optional, default false; see "Fast copy" above (usually a no-op)
@@ -375,12 +384,22 @@ checks and lints it (see `ci.yml`'s `lint` job).
 }
 ```
 
+Notably absent from `stitch` above: `series`/`intro`/`outro`/
+`intro_duration`/`outro_duration`/`transition`/`transition_duration`.
+`config.json` never carries any of these — a stitch's intro/outro/
+transition always come from a *series* (see "Series Manager" above and
+`resolve_series()` in `service_video.py`), named only in a render-state
+file's own `stitch.series` (see "Config reference" continues below,
+and the `render`/`bulk-render` sections), never in `config.json`
+itself. This is also why Stitch always needs a series actually selected
+— there's no config-level fallback to use instead.
+
 `pad_start_seconds`/`pad_end_seconds` accept fractional/negative values;
-`stitch.transition`/`stitch.crf` apply to the final crossfaded output,
-separately from `trim.crf` (the trimmed intermediate clip). The GUI
-exposes one "Fast copy" checkbox (`trim.fast_copy`) and one "Encoder"
-dropdown (sets both `trim.encoder` and `stitch.encoder` together); see
-"Fast copy"/"Encoder" under `stitch` above for what each does.
+`stitch.crf` applies to the final crossfaded output, separately from
+`trim.crf` (the trimmed intermediate clip). The GUI exposes one "Fast
+copy" checkbox (`trim.fast_copy`) and one "Encoder" dropdown (sets both
+`trim.encoder` and `stitch.encoder` together); see "Fast copy"/
+"Encoder" under `stitch` above for what each does.
 
 **Normalize audio** (`trim.normalize_audio`, on by default;
 `trim.normalize_target_lufs`, default `-16.0`): loudness-normalizes the

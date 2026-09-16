@@ -295,6 +295,14 @@ DEFAULT_IMAGE_DURATION = 5.0
 # out of a custom state_output entirely if you don't want it.
 DEFAULT_STATE_OUTPUT = "render_state_%Y%m%d_%H%M%S.json"
 
+# Mirrors gui.py's own SCRIPT_DIR/SERIES_PATH exactly — series.json is
+# owned/edited by the GUI's Series Manager tab, but resolve_series()
+# below needs to read it too, since a stitch config now only ever
+# carries a series *name* (never literal intro/outro paths) by the time
+# it reaches this module.
+SCRIPT_DIR = Path(__file__).resolve().parent
+SERIES_PATH = SCRIPT_DIR / "series.json"
+
 
 def is_image_file(path: str) -> bool:
     """Whether a path looks like a still image (by extension) rather than a
@@ -1413,10 +1421,13 @@ def start_stdin_thread(out_queue: "queue.Queue"):
     'mark_begin'/'mark_end' (lets an operator, or the GUI, manually
     trigger what a slide match would normally trigger, for when
     something's gone wrong live and there's no time to fix ProPresenter
-    itself) and 'trim'/'stitch' (see _trim_worker()/_stitch_worker()) —
-    and feeds them into the same event queue as ProPresenter/OBS events,
-    tagged "manual". Works the same typed directly into a terminal
-    running 'watch' interactively."""
+    itself), 'trim', and 'stitch' or 'stitch <series name>' (see
+    _trim_worker()/_stitch_worker() — a series name updates the current
+    run's stitch series selection, recorded into the render-state file;
+    a bare 'stitch' reuses whatever's already on record, or fails if
+    nothing is) — and feeds them into the same event queue as
+    ProPresenter/OBS events, tagged "manual". Works the same typed
+    directly into a terminal running 'watch' interactively."""
     def runner():
         for raw in sys.stdin:
             cmd = raw.strip()
@@ -1823,6 +1834,47 @@ def compute_trim_offsets(raw_begin_offset: float, raw_end_offset: float, pad_sta
     return start_offset, end_offset
 
 
+def resolve_series(name: str) -> dict:
+    """Resolves a Series Manager series name to its intro/outro/
+    intro_duration/outro_duration/transition/transition_duration fields,
+    read from series.json (SERIES_PATH — the same file, same convention,
+    the GUI's own Series Manager tab maintains; this module has no
+    editing UI of its own for it). The one place this module needs
+    series awareness at all: a stitch config's own 'stitch' section now
+    only ever carries a series *name* (never literal clip paths) by the
+    time it gets here, whether that's render()/bulk_render() (a saved
+    file, no GUI involved) or watch()'s own live 'stitch <name>' command
+    — see _stitch_from_state(). sys.exit()s with a clear message if
+    `name` is blank (nothing selected — Stitch has nothing to work
+    from), series.json doesn't exist yet, or `name` doesn't match any
+    entry in it (renamed/deleted since whatever wrote this name down)."""
+    if not name:
+        sys.exit("No series selected — Stitch needs one to know which intro/outro to use.")
+    try:
+        series = json.loads(SERIES_PATH.read_text())
+    except FileNotFoundError:
+        sys.exit(f"No series.json found at {SERIES_PATH} — set up a series in the GUI's Series Manager tab first.")
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"Could not read {SERIES_PATH} for series {name!r}: {e}")
+    for s in series:
+        if s.get("name") == name:
+            return s
+    sys.exit(f"Series {name!r} not found in {SERIES_PATH} — it may have been renamed or deleted.")
+
+
+def apply_stitch_command_series(payload: str, stitch_cfg: dict) -> None:
+    """Parses an optional series name off a 'stitch'/'stitch <name>'
+    manual command (see watch()'s own 'manual' event handling) and
+    records it into stitch_cfg in place. Series names may contain
+    spaces, so this splits on the first space only, not on whitespace
+    generally — a bare 'stitch' (no space at all) records an empty
+    name, same as an explicit 'stitch ' with nothing after it. Split out
+    from watch() itself so this parsing/mutation is directly testable
+    without a live OBS/ProPresenter connection."""
+    _, _, series_name = payload.partition(" ")
+    stitch_cfg["series"] = series_name.strip()
+
+
 def _trim_from_state(state: dict) -> str:
     """Runs trim_clip() from a render-state dict's own trim config plus
     its raw_begin_offset/raw_end_offset/recording_path — the shared
@@ -1851,17 +1903,25 @@ def _trim_from_state(state: dict) -> str:
 def _stitch_from_state(state: dict, main_clip: str) -> str:
     """Runs stitch() from a render-state dict's own stitch config plus
     an already-resolved main clip path — see _trim_from_state()'s own
-    docstring for why this is factored out the same way. Returns the
+    docstring for why this is factored out the same way. The stitch
+    config's own intro/outro/*_duration/transition*/etc are never read
+    directly — they don't exist any more (see resolve_series()); only
+    'series' (a name) is, resolved here via series.json. Returns the
     resolved output path (see stitch())."""
     stitch_cfg = state.get("stitch", {})
+    series = resolve_series(stitch_cfg.get("series", ""))
     return stitch(
-        stitch_cfg["intro"], main_clip, stitch_cfg["outro"],
+        series["intro"], main_clip, series["outro"],
         output=stitch_cfg.get("output", "final.mp4"),
-        transition_duration=stitch_cfg.get("transition_duration", 1.0),
-        transition=stitch_cfg.get("transition", "fade"),
+        # transition/transition_duration are new fields on the series
+        # record — defaulted (unlike intro/outro/*_duration, always
+        # present since the Series Manager form requires them) so a
+        # series.json saved before they existed still resolves cleanly.
+        transition_duration=series.get("transition_duration", 1.0),
+        transition=series.get("transition", "fade"),
         crf=stitch_cfg.get("crf", 23),
-        intro_duration=stitch_cfg.get("intro_duration"),
-        outro_duration=stitch_cfg.get("outro_duration"),
+        intro_duration=series.get("intro_duration"),
+        outro_duration=series.get("outro_duration"),
         fast_copy=stitch_cfg.get("fast_copy", False),
         encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
         subsplash_preset=stitch_cfg.get("subsplash_preset", False),
@@ -2159,22 +2219,13 @@ def _trim_worker(
 
 def _stitch_worker(events_q: "queue.Queue", trimmed_path: str, stitch_cfg: dict):
     """Stitches a clip a previous Trim already produced with the
-    intro/outro, triggered by watch()'s 'stitch' manual command. Reports
-    back over events_q the same way _trim_worker() does."""
+    series' intro/outro (see _stitch_from_state()/resolve_series() —
+    stitch_cfg only ever carries a series *name* now), triggered by
+    watch()'s 'stitch' manual command. Reports back over events_q the
+    same way _trim_worker() does."""
     _reset_steps(_phase_worst_case_steps(stitch_cfg.get("fast_copy", False), STITCH_FAST_COPY_STEPS))
     try:
-        final_path = stitch(
-            stitch_cfg["intro"], trimmed_path, stitch_cfg["outro"],
-            output=stitch_cfg.get("output", "final.mp4"),
-            transition_duration=stitch_cfg.get("transition_duration", 1.0),
-            transition=stitch_cfg.get("transition", "fade"),
-            crf=stitch_cfg.get("crf", 23),
-            intro_duration=stitch_cfg.get("intro_duration"),
-            outro_duration=stitch_cfg.get("outro_duration"),
-            fast_copy=stitch_cfg.get("fast_copy", False),
-            encoder=stitch_cfg.get("encoder", "nvenc"), encoder_preset=stitch_cfg.get("encoder_preset"),
-            subsplash_preset=stitch_cfg.get("subsplash_preset", False),
-        )
+        final_path = _stitch_from_state({"stitch": stitch_cfg}, trimmed_path)
     except (SystemExit, Exception) as e:
         print(f"[watcher] stitch failed: {e}", file=sys.stderr)
         events_q.put(("stitch_result", time.time(), {"succeeded": False, "final_path": None}))
@@ -2433,7 +2484,7 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                             daemon=True,
                         )
                         trim_thread.start()
-                elif payload == "stitch":
+                elif payload == "stitch" or payload.startswith("stitch "):
                     # Only meaningful once a trim in this run has actually
                     # succeeded (trimmed_path known).
                     if trimmed_path is None:
@@ -2441,7 +2492,19 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
                     elif stitch_thread is not None and stitch_thread.is_alive():
                         print("[watcher] ignoring stitch — one is already running", file=sys.stderr)
                     else:
-                        print("[watcher] stitch status = RUNNING")
+                        # Records whichever series is currently selected
+                        # on the Live tab at the moment Stitch is
+                        # actually clicked (not whatever was selected
+                        # back when this watch() run started) into
+                        # stitch_cfg in place — sync_state() below writes
+                        # it verbatim (see _write_render_state()), so the
+                        # render-state file reflects the series actually
+                        # used. A bare 'stitch' with no name (e.g. typed
+                        # directly into a terminal) falls through to
+                        # resolve_series("")'s own clean failure inside
+                        # _stitch_worker().
+                        apply_stitch_command_series(payload, stitch_cfg)
+                        print(f"[watcher] stitch status = RUNNING (series={stitch_cfg['series']!r})")
                         sync_state()
                         stitch_thread = threading.Thread(
                             target=_stitch_worker, args=(events_q, trimmed_path, stitch_cfg), daemon=True,
