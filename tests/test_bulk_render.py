@@ -1,0 +1,294 @@
+"""bulk_render() (service_video.py, backing the GUI's Bulk Render tab):
+trim and/or stitch every entry in a JSON array of render-state dicts in
+one pass, tolerating one entry's failure rather than aborting the whole
+batch. Pure CLI-module tests — no GUI/display needed — using real
+ffmpeg-generated clips, the same "verify against real behavior, not just
+the code" discipline the rest of this test suite already applies to its
+own ffmpeg-facing logic (see conftest.py).
+
+A render-state's own "stitch" section only ever carries a series *name*
+now (never literal intro/outro) — resolved via resolve_series(), which
+reads SERIES_PATH (series.json) — so every test here points that at a
+real series.json via the `series_name` fixture rather than embedding
+intro/outro directly in each state dict."""
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+import service_video as sv
+
+
+def _run_ffmpeg(args: list[str]) -> None:
+    result = subprocess.run(["ffmpeg", "-y", *args], capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
+@pytest.fixture(scope="session")
+def bulk_clips(tmp_path_factory) -> dict[str, str]:
+    """Small synthetic intro/outro/recording clips, real content (not just
+    distinct paths) since bulk_render() actually runs ffmpeg over these —
+    built once and reused read-only across every test in this file, same
+    convention as conftest.py's own video fixtures."""
+    out_dir = tmp_path_factory.mktemp("bulk_clips")
+    intro, outro = out_dir / "intro.mp4", out_dir / "outro.mp4"
+    rec1, rec2 = out_dir / "rec1.mp4", out_dir / "rec2.mp4"
+    _run_ffmpeg(["-f", "lavfi", "-i", "color=c=red:size=64x64:duration=1:rate=10", "-pix_fmt", "yuv420p", str(intro)])
+    _run_ffmpeg(["-f", "lavfi", "-i", "color=c=green:size=64x64:duration=1:rate=10", "-pix_fmt", "yuv420p", str(outro)])
+    for path, color in ((rec1, "blue"), (rec2, "purple")):
+        _run_ffmpeg([
+            "-f", "lavfi", "-i", f"color=c={color}:size=64x64:duration=6:rate=10",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path),
+        ])
+    return {"intro": str(intro), "outro": str(outro), "rec1": str(rec1), "rec2": str(rec2)}
+
+
+@pytest.fixture
+def series_name(bulk_clips, tmp_path, monkeypatch) -> str:
+    """Points sv.SERIES_PATH at a real series.json (one series, "Test
+    Series", resolving to bulk_clips' intro/outro) for the duration of
+    one test — bulk_render() resolves every entry's stitch.series
+    through resolve_series(), which reads this file. Returns the name
+    to put in a state's stitch.series."""
+    series_path = tmp_path / "series.json"
+    series_path.write_text(json.dumps([{
+        "name": "Test Series", "intro": bulk_clips["intro"], "intro_duration": 1.0,
+        "outro": bulk_clips["outro"], "outro_duration": 1.0,
+        "transition": "fade", "transition_duration": 0.2, "hidden": False,
+    }]))
+    monkeypatch.setattr(sv, "SERIES_PATH", series_path)
+    return "Test Series"
+
+
+def _make_state(series_name: str, out_dir: Path, idx: int, recording_path: str | None) -> dict:
+    return {
+        "recording_path": recording_path,
+        "raw_begin_offset": 1.0,
+        "raw_end_offset": 4.0,
+        "trimmed_path": None,
+        "trim": {
+            "output": str(out_dir / f"trim{idx}.mp4"), "pad_start_seconds": 0, "pad_end_seconds": 0,
+            "crf": 30, "fast_copy": False, "normalize_audio": False, "normalize_target_lufs": -16.0,
+            "encoder": "software", "encoder_preset": "ultrafast",
+        },
+        "stitch": {
+            "auto": True, "series": series_name, "output": str(out_dir / f"final{idx}.mp4"),
+            "crf": 30, "fast_copy": False, "encoder": "software", "encoder_preset": "ultrafast",
+        },
+    }
+
+
+def test_bulk_render_full_trims_and_stitches_every_entry(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    states = [
+        _make_state(series_name, tmp_path, 0, bulk_clips["rec1"]),
+        _make_state(series_name, tmp_path, 1, bulk_clips["rec2"]),
+    ]
+    states_path.write_text(json.dumps(states))
+
+    result = sv.bulk_render(str(states_path), "full")
+
+    assert result == 0
+    assert (tmp_path / "trim0.mp4").is_file()
+    assert (tmp_path / "trim1.mp4").is_file()
+    assert (tmp_path / "final0.mp4").is_file()
+    assert (tmp_path / "final1.mp4").is_file()
+    saved = json.loads(states_path.read_text())
+    assert saved[0]["trimmed_path"] == str(tmp_path / "trim0.mp4")
+    assert saved[1]["trimmed_path"] == str(tmp_path / "trim1.mp4")
+
+
+def test_bulk_render_trim_only_does_not_stitch(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    states_path.write_text(json.dumps([_make_state(series_name, tmp_path, 0, bulk_clips["rec1"])]))
+
+    result = sv.bulk_render(str(states_path), "trim")
+
+    assert result == 0
+    assert (tmp_path / "trim0.mp4").is_file()
+    assert not (tmp_path / "final0.mp4").exists()
+    saved = json.loads(states_path.read_text())
+    assert saved[0]["trimmed_path"] == str(tmp_path / "trim0.mp4")
+
+
+def test_bulk_render_stitch_only_uses_existing_trimmed_path(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    state = _make_state(series_name, tmp_path, 0, bulk_clips["rec1"])
+    # An entry that was already trimmed by some earlier pass (or hand-
+    # edited) — mode="stitch" should use it directly, not re-trim.
+    trimmed = tmp_path / "already_trimmed.mp4"
+    sv.trim_clip(
+        bulk_clips["rec1"], str(trimmed), 1.0, 4.0, crf=30, fast_copy=False,
+        encoder="software", encoder_preset="ultrafast", normalize_audio=False,
+    )
+    state["trimmed_path"] = str(trimmed)
+    states_path.write_text(json.dumps([state]))
+
+    result = sv.bulk_render(str(states_path), "stitch")
+
+    assert result == 0
+    assert (tmp_path / "final0.mp4").is_file()
+
+
+def test_bulk_render_stitch_only_skips_entry_with_no_trimmed_path(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    states_path.write_text(json.dumps([_make_state(series_name, tmp_path, 0, bulk_clips["rec1"])]))
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "stitch")
+
+    assert "trimmed_path" in str(exc_info.value.code)
+    assert not (tmp_path / "final0.mp4").exists()
+
+
+def test_bulk_render_stitch_only_skips_entry_with_no_series(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    state = _make_state(series_name, tmp_path, 0, bulk_clips["rec1"])
+    trimmed = tmp_path / "already_trimmed.mp4"
+    sv.trim_clip(
+        bulk_clips["rec1"], str(trimmed), 1.0, 4.0, crf=30, fast_copy=False,
+        encoder="software", encoder_preset="ultrafast", normalize_audio=False,
+    )
+    state["trimmed_path"] = str(trimmed)
+    state["stitch"]["series"] = ""
+    states_path.write_text(json.dumps([state]))
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "stitch")
+
+    assert "series" in str(exc_info.value.code).lower()
+    assert not (tmp_path / "final0.mp4").exists()
+
+
+def test_bulk_render_tolerates_one_bad_entry_and_keeps_going(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    states = [
+        _make_state(series_name, tmp_path, 0, bulk_clips["rec1"]),
+        _make_state(series_name, tmp_path, 1, str(tmp_path / "does_not_exist.mp4")),
+        _make_state(series_name, tmp_path, 2, bulk_clips["rec2"]),
+    ]
+    states_path.write_text(json.dumps(states))
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "full")
+
+    assert exc_info.value.code != 0
+    assert "#2" in str(exc_info.value.code)
+    assert (tmp_path / "final0.mp4").is_file()
+    assert (tmp_path / "final2.mp4").is_file()
+    assert not (tmp_path / "final1.mp4").exists()
+    saved = json.loads(states_path.read_text())
+    assert saved[0]["trimmed_path"] is not None
+    assert saved[1]["trimmed_path"] is None
+    assert saved[2]["trimmed_path"] is not None
+
+
+def test_bulk_render_rejects_non_array_json(tmp_path):
+    states_path = tmp_path / "states.json"
+    states_path.write_text(json.dumps({"not": "a list"}))
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "trim")
+
+    assert "array" in str(exc_info.value.code)
+
+
+def test_bulk_render_rejects_empty_array(tmp_path):
+    states_path = tmp_path / "states.json"
+    states_path.write_text("[]")
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "trim")
+
+    assert "empty" in str(exc_info.value.code)
+
+
+def test_bulk_render_rejects_missing_file(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(tmp_path / "nope.json"), "trim")
+
+    assert "Could not read" in str(exc_info.value.code)
+
+
+# -- resolve_series() ---------------------------------------------------
+
+def test_resolve_series_rejects_blank_name():
+    with pytest.raises(SystemExit) as exc_info:
+        sv.resolve_series("")
+    assert "series" in str(exc_info.value.code).lower()
+
+
+def test_resolve_series_rejects_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sv, "SERIES_PATH", tmp_path / "nope.json")
+    with pytest.raises(SystemExit) as exc_info:
+        sv.resolve_series("Anything")
+    assert "series.json" in str(exc_info.value.code)
+
+
+def test_resolve_series_rejects_unknown_name(series_name):
+    with pytest.raises(SystemExit) as exc_info:
+        sv.resolve_series("Not A Real Series")
+    assert "Not A Real Series" in str(exc_info.value.code)
+
+
+def test_resolve_series_returns_the_matching_record(series_name, bulk_clips):
+    series = sv.resolve_series(series_name)
+    assert series["intro"] == bulk_clips["intro"]
+    assert series["outro"] == bulk_clips["outro"]
+    assert series["transition"] == "fade"
+    assert series["transition_duration"] == 0.2
+
+
+def test_resolve_series_defaults_transition_for_older_series_json(tmp_path, monkeypatch):
+    # A series.json saved before transition/transition_duration existed
+    # on the record — resolve_series() should still work, defaulting
+    # both rather than raising a KeyError.
+    series_path = tmp_path / "series.json"
+    series_path.write_text(json.dumps([{
+        "name": "Old Series", "intro": "/i.mp4", "intro_duration": 5.0,
+        "outro": "/o.mp4", "outro_duration": 5.0, "hidden": False,
+    }]))
+    monkeypatch.setattr(sv, "SERIES_PATH", series_path)
+    series = sv.resolve_series("Old Series")
+    assert series["intro"] == "/i.mp4"
+    assert "transition" not in series  # not defaulted onto the record itself, only when read
+
+
+# -- apply_stitch_command_series() (watch()'s live 'stitch <name>' parsing) -
+
+def test_apply_stitch_command_series_records_the_name():
+    stitch_cfg = {"series": "Old Series"}
+    sv.apply_stitch_command_series("stitch New Series", stitch_cfg)
+    assert stitch_cfg["series"] == "New Series"
+
+
+def test_apply_stitch_command_series_handles_a_name_with_multiple_words():
+    stitch_cfg = {}
+    sv.apply_stitch_command_series("stitch Fall 2026 Sermon Series", stitch_cfg)
+    assert stitch_cfg["series"] == "Fall 2026 Sermon Series"
+
+
+def test_apply_stitch_command_series_bare_command_records_blank():
+    stitch_cfg = {"series": "Old Series"}
+    sv.apply_stitch_command_series("stitch", stitch_cfg)
+    assert stitch_cfg["series"] == ""
+
+
+def test_watch_live_stitch_command_updates_the_render_state_file(bulk_clips, series_name, tmp_path, monkeypatch):
+    """End-to-end version of the two tests above: applying the parsed
+    series the same way watch() does, then writing the render-state file
+    the same way sync_state()/_write_render_state() does, produces a
+    file whose stitch.series matches — without needing a live OBS/
+    ProPresenter connection to exercise watch() itself."""
+    stitch_cfg = {"auto": True, "series": "", "output": str(tmp_path / "final.mp4")}
+    trim_cfg = {"output": str(tmp_path / "trim.mp4"), "state_output": str(tmp_path / "state.json")}
+    state_path = tmp_path / "state.json"
+
+    sv.apply_stitch_command_series(f"stitch {series_name}", stitch_cfg)
+    sv._write_render_state(state_path, "/rec.mp4", 1.0, 4.0, trim_cfg, stitch_cfg, trimmed_path="/trimmed.mp4")
+
+    saved = json.loads(state_path.read_text())
+    assert saved["stitch"]["series"] == series_name
