@@ -186,6 +186,59 @@ def test_bulk_render_tolerates_one_bad_entry_and_keeps_going(bulk_clips, series_
     assert saved[2]["trimmed_path"] is not None
 
 
+def test_bulk_render_prints_per_entry_status_lines(bulk_clips, series_name, tmp_path, capsys):
+    """The GUI's Bulk Render tab parses these lines live (see
+    BULK_ENTRY_STATUS_RE/_handle_bulk_render_line() in gui.py) to drive
+    its own per-row Status column — this is the wire format contract
+    between the two, checked directly against real output here."""
+    states_path = tmp_path / "states.json"
+    states = [
+        _make_state(series_name, tmp_path, 0, bulk_clips["rec1"]),
+        _make_state(series_name, tmp_path, 1, str(tmp_path / "does_not_exist.mp4")),
+    ]
+    states_path.write_text(json.dumps(states))
+
+    with pytest.raises(SystemExit):
+        sv.bulk_render(str(states_path), "full")
+
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("[bulk-render] status ")
+    ]
+    assert lines == [
+        "[bulk-render] status entry=1 state=trimming",
+        "[bulk-render] status entry=1 state=trimmed",
+        "[bulk-render] status entry=1 state=stitching",
+        "[bulk-render] status entry=1 state=stitched",
+        "[bulk-render] status entry=2 state=trimming",
+        "[bulk-render] status entry=2 state=failed_trim",
+    ]
+
+
+def test_bulk_render_status_line_reports_failed_stitch_not_failed_trim(
+    bulk_clips, series_name, tmp_path, capsys,
+):
+    # An entry that already has a trimmed_path (so trim never runs in
+    # mode="stitch") but an unresolvable series — the failure happens
+    # during the *stitch* half, so the status line should say so, not
+    # blame trim (which never even ran this entry).
+    states_path = tmp_path / "states.json"
+    state = _make_state(series_name, tmp_path, 0, bulk_clips["rec1"])
+    state["trimmed_path"] = str(tmp_path / "already_trimmed.mp4")
+    state["stitch"]["series"] = "Not A Real Series"
+    states_path.write_text(json.dumps([state]))
+
+    with pytest.raises(SystemExit):
+        sv.bulk_render(str(states_path), "stitch")
+
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("[bulk-render] status ")
+    ]
+    assert lines == [
+        "[bulk-render] status entry=1 state=stitching",
+        "[bulk-render] status entry=1 state=failed_stitch",
+    ]
+
+
 def test_bulk_render_rejects_non_array_json(tmp_path):
     states_path = tmp_path / "states.json"
     states_path.write_text(json.dumps({"not": "a list"}))

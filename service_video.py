@@ -2024,6 +2024,13 @@ def bulk_render(states_path: str, mode: str) -> int:
     failures: list[tuple[int, str]] = []
     for i, state in enumerate(states):
         print(f"\n=== Entry {i + 1}/{len(states)} ===")
+        # Which half was in flight when/if this entry fails — lets the
+        # except block below report state=failed_trim vs failed_stitch
+        # correctly. These "[bulk-render] status ..." lines are the GUI's
+        # own live per-row Status column feed (see BULK_ENTRY_STATUS_RE
+        # in gui.py) — meaningless to a terminal user, same spirit as
+        # _print_step()'s own "[progress] ..." lines.
+        phase = "trim"
         try:
             trimmed_path = state.get("trimmed_path")
             if mode in ("trim", "full"):
@@ -2032,19 +2039,25 @@ def bulk_render(states_path: str, mode: str) -> int:
                         "recording_path/raw_begin_offset/raw_end_offset is still null "
                         "— this entry's recording was never completed."
                     )
+                print(f"[bulk-render] status entry={i + 1} state=trimming")
                 trimmed_path = _trim_from_state(state)
                 state["trimmed_path"] = trimmed_path
                 print(f"\nTrimmed body clip -> {trimmed_path}")
+                print(f"[bulk-render] status entry={i + 1} state=trimmed")
             if mode in ("stitch", "full"):
+                phase = "stitch"
                 if not trimmed_path:
                     sys.exit(
                         "No trimmed_path set on this entry — run Trim (mode=trim/full) "
                         "first, or set trimmed_path directly in the JSON."
                     )
+                print(f"[bulk-render] status entry={i + 1} state=stitching")
                 _stitch_from_state(state, trimmed_path)
+                print(f"[bulk-render] status entry={i + 1} state=stitched")
         except SystemExit as e:
             message = e.code if isinstance(e.code, str) else f"exit code {e.code}"
             print(f"[bulk-render] entry {i + 1} FAILED: {message}", file=sys.stderr)
+            print(f"[bulk-render] status entry={i + 1} state=failed_{phase}")
             failures.append((i, message))
 
     if mode in ("trim", "full"):

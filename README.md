@@ -68,13 +68,21 @@ starter `config.json` next to the script on first run if none exists.
   fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
   "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
   (and its Target LUFS), and Encoder settings.
-- **Bulk Render**: trim and/or stitch every entry in a JSON array of
-  render-state objects (the same self-contained shape a `watch` run or
-  Offline's "Export to JSON" writes) in one pass — Trim, Stitch, and Full
-  Render (both, per entry) mirror `bulk-render`'s own `--mode` below. One
-  entry failing doesn't stop the rest; Trim/Full Render write each
-  entry's resolved Trimmed clip back into the file as they go, so a
-  later Stitch pass (a separate run) picks it up.
+- **Bulk Render**: an editable list of render-state entries (the same
+  self-contained shape a `watch` run or Offline's "Export to JSON"
+  writes), trimmed and/or stitched in one pass — Trim, Stitch, and Full
+  Render (both, per entry) mirror `bulk-render`'s own `--mode` below.
+  "Import…"/"Export…" load/save the whole list as JSON; "+ Add entry…"
+  or double-clicking a row opens an editor with the same fields as the
+  Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
+  start-end/Trim visually…, plus Advanced settings) minus the
+  Trim/Stitch buttons themselves. Drag a row to reorder it. The Status
+  column updates live, color-coded, while a run is in progress (idle,
+  trimming/stitching, trimmed/stitched, failed (trim)/failed (stitch)).
+  One entry failing doesn't stop the rest. Trim/Stitch/Full Render always
+  run against the list's *current* in-GUI state (including any
+  unsaved Add/Edit/reorder) via a throwaway snapshot — nothing is
+  written back to an imported file unless you click Export.
 - **Series Manager**: named intro/outro/transition bundles (a name, an
   intro clip + duration, an outro clip + duration, a transition type +
   duration) — set one up once per sermon series, then just pick it from
