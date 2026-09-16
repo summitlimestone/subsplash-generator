@@ -3012,6 +3012,33 @@ class App(tk.Tk):
             self.runner.send_line(f"stitch {series}")
             self._log(f"[gui] sent: stitch {series}")
         else:
+            # Post-exit Stitch reuses Offline's own flow (_run_stitch())
+            # — sync the Live tab's own CURRENT Series/Output selection
+            # into Offline's fields first (a series picked here, on the
+            # Live tab, after watch() already exited otherwise never
+            # reaches Offline's own Series dropdown at all — _run_stitch()
+            # would check *that* var, find it still blank or pointed at
+            # something stale from the just-loaded render-state file, and
+            # fail confusingly even though a series is clearly selected
+            # right here). Also updates the render-state file on disk to
+            # match, so it stays an accurate record of what was actually
+            # stitched — same "record what was actually used" principle
+            # watch()'s own live 'stitch <name>' command follows (see
+            # service_video.py's apply_stitch_command_series()), just
+            # done here since there's no live process left to do it.
+            self.vars["st_series"].set(series)
+            output = self.vars["stitch_output"].get().strip() or "final.mp4"
+            self.vars["st_output"].set(output)
+            state_path = self.render_state_var.get().strip()
+            if state_path:
+                try:
+                    state = json.loads(Path(state_path).read_text())
+                    stitch_cfg = state.setdefault("stitch", {})
+                    stitch_cfg["series"] = series
+                    stitch_cfg["output"] = output
+                    Path(state_path).write_text(json.dumps(state, indent=2))
+                except (OSError, json.JSONDecodeError) as e:
+                    self._log(f"[gui] could not update render-state file's series: {e}")
             self._run_stitch()
             if self.runner.running():
                 self._live_handoff_which = "stitch"

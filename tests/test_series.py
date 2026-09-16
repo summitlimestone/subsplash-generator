@@ -336,6 +336,48 @@ def test_stitch_live_sends_the_currently_selected_series(app, monkeypatch):
     assert sent == ["stitch Fall 2026 Series"]
 
 
+def test_stitch_live_post_exit_uses_the_live_tabs_own_current_selection(app, monkeypatch, tmp_path):
+    """Regression: watch() exits after a live Trim, with no series ever
+    selected live — the render-state file's stitch.series (and so
+    Offline's own st_series, restored from it — see
+    _load_render_state_json()) stays blank. Selecting a series *only* on
+    the Live tab's own dropdown and clicking Stitch used to still fail
+    (post-exit Stitch called _run_stitch(), which checked Offline's own
+    st_series — never touched — instead of the Live tab's stitch_series
+    the user actually just set)."""
+    _make_series(app, "Fall Series", intro="/videos/intro.mp4", outro="/videos/outro.mp4")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "recording_path": "/rec.mp4", "raw_begin_offset": 1.0, "raw_end_offset": 4.0,
+        "trimmed_path": "/videos/body_trimmed.mp4",
+        "trim": {"output": "/videos/body_trimmed.mp4"},
+        "stitch": {"auto": True, "series": "", "output": "final.mp4"},
+    }))
+    app.render_state_var.set(str(state_path))
+    app._load_render_state_json(str(state_path))
+    assert app.vars["st_series"].get() == ""  # confirms the bug's precondition
+
+    app.vars["stitch_series"].set("Fall Series")
+    app.vars["stitch_output"].set("live_final.mp4")
+    monkeypatch.setattr(app.runner, "running", lambda: False)
+    captured = {}
+    monkeypatch.setattr(app, "_start", lambda name, args: captured.setdefault("args", args))
+    errors = []
+    import tkinter.messagebox as messagebox
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg: errors.append(msg))
+
+    app._stitch_live()
+
+    assert errors == []
+    args = captured["args"]
+    assert args[0:4] == ["stitch", "/videos/intro.mp4", "/videos/body_trimmed.mp4", "/videos/outro.mp4"]
+    assert args[args.index("-o") + 1] == "live_final.mp4"
+    assert app.vars["st_series"].get() == "Fall Series"
+    saved = json.loads(state_path.read_text())
+    assert saved["stitch"]["series"] == "Fall Series"
+    assert saved["stitch"]["output"] == "live_final.mp4"
+
+
 # -- Fuzzy search -------------------------------------------------------
 
 def test_fuzzy_match_is_subsequence_not_substring():
