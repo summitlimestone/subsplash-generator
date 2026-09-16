@@ -384,8 +384,30 @@ def test_bulk_entry_status_re_matches_real_service_video_output():
 
 
 def test_every_status_key_has_a_display_entry():
-    for state in ("idle", "trimming", "stitching", "trimmed", "stitched", "failed_trim", "failed_stitch"):
+    for state in (
+        "idle", "verifying", "ready", "check_console", "trimming", "stitching",
+        "trimmed", "stitched", "failed_trim", "failed_stitch",
+    ):
         assert state in gui.BULK_STATUS_DISPLAY
+
+
+def test_verifying_ready_and_check_console_use_the_expected_colors(app):
+    _load(app, _make_states(n=1))
+
+    app._handle_bulk_render_line("[bulk-render] status entry=1 state=verifying")
+    label_text, color = _status_label(app, "0")
+    assert label_text == "verifying"
+    assert color == gui.PALETTE["info"]
+
+    app._handle_bulk_render_line("[bulk-render] status entry=1 state=ready")
+    label_text, color = _status_label(app, "0")
+    assert label_text == "ready"
+    assert color == gui.PALETTE["text"]
+
+    app._handle_bulk_render_line("[bulk-render] status entry=1 state=check_console")
+    label_text, color = _status_label(app, "0")
+    assert label_text == "check console"
+    assert color == gui.PALETTE["warning"]
 
 
 # -- _blank_bulk_entry() -----------------------------------------------------

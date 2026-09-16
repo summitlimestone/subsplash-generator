@@ -149,6 +149,9 @@ BULK_ENTRY_STATUS_RE = re.compile(r"^\[bulk-render\] status entry=(\d+) state=(\
 # _handle_bulk_render_line()'s own .get() with a default).
 BULK_STATUS_DISPLAY = {
     "idle": ("idle", "muted"),
+    "verifying": ("verifying", "info"),
+    "ready": ("ready", "text"),
+    "check_console": ("check console", "warning"),
     "trimming": ("trimming", "info"),
     "stitching": ("stitching", "info"),
     "trimmed": ("trimmed", "success"),

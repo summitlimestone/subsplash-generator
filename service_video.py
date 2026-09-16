@@ -2007,47 +2007,119 @@ def _check_series(name: str) -> str | None:
     return None
 
 
+def _check_trim_range(state: dict, recording_path: str, trim_cfg: dict, stitch_cfg: dict) -> str | None:
+    """Non-exiting probe for _validate_bulk_entry()'s trim/full checks —
+    only called once Main clip/Sermon start/Sermon end have each already
+    passed their own individual checks, since it needs all three to mean
+    anything. Checks, in order: the padded [start, end] range doesn't
+    push past itself (compute_trim_offsets() already enforces start <
+    end this way and sys.exit()s if not — reused the same
+    catch-its-SystemExit way _check_output_path()/etc. do); that range
+    actually fits inside the main clip's own probed length; and, only if
+    a series is set *and* resolves (trim doesn't otherwise require one —
+    see _validate_bulk_entry()), that the resulting trimmed clip is
+    longer than that series' own transition_duration, the same minimum
+    stitch() itself enforces for every clip it crossfades (see its own
+    per-clip duration check). Returns a problem description, or None if
+    the range is fine."""
+    try:
+        start_offset, end_offset = compute_trim_offsets(
+            parse_timestamp(state["raw_begin_offset"]), parse_timestamp(state["raw_end_offset"]),
+            trim_cfg.get("pad_start_seconds", 0.0), trim_cfg.get("pad_end_seconds", 0.0),
+        )
+    except SystemExit as e:
+        return e.code if isinstance(e.code, str) else str(e.code)
+
+    try:
+        main_duration = probe(recording_path)["duration"]
+    except SystemExit as e:
+        return e.code if isinstance(e.code, str) else str(e.code)
+    # None means ffprobe couldn't report one at all (e.g. a recording
+    # still being written) — nothing to check bounds against yet, same
+    # as probe()'s own docstring says: leave it to whoever actually
+    # needs a real duration to notice, rather than treating unknown as
+    # an error here.
+    if main_duration is not None and (start_offset > main_duration or end_offset > main_duration):
+        return (
+            f"Sermon start/end ({start_offset:.2f}s-{end_offset:.2f}s) falls outside the main "
+            f"clip's own length ({main_duration:.2f}s)."
+        )
+
+    series_name = stitch_cfg.get("series", "")
+    if series_name:
+        try:
+            series = resolve_series(series_name)
+        except SystemExit:
+            # Not this function's problem to report — mode="stitch"/"full"
+            # already check series resolution themselves (see
+            # _validate_bulk_entry()); mode="trim" alone never requires
+            # one, so an unresolvable name just means this last check
+            # can't run, not that the range itself is bad.
+            return None
+        transition_duration = series.get("transition_duration", 1.0)
+        trimmed_duration = end_offset - start_offset
+        if trimmed_duration <= transition_duration:
+            return (
+                f"The trimmed clip would only be {trimmed_duration:.2f}s, too short for the "
+                f"{transition_duration}s transition on series {series_name!r}."
+            )
+    return None
+
+
 def _validate_bulk_entry(state: dict, mode: str) -> list[str]:
     """Basic input checks for one bulk_render() entry — see
     bulk_render()'s own upfront validation pass, which runs this against
     every entry before any of them starts, so a bad input anywhere in
     the batch is caught immediately instead of only after burning time
     on every entry ahead of it. Checks only what `mode` actually needs:
-    mode="trim" needs a real Main clip and populated Sermon start/end,
-    plus a usable Trimmed clip *output* path; mode="stitch" needs an
-    already-existing Trimmed clip (input this time, not output) and a
-    Series that actually resolves, plus a usable output path;
-    mode="full" is trim's checks plus stitch's, minus Trimmed clip
-    existing — it won't yet, since trim hasn't produced it (see
-    _stitch_from_state()). Returns a list of problem descriptions
-    (empty if the entry is fine for this mode)."""
+    mode="trim" needs a real Main clip and populated Sermon start/end (in
+    range, start before end, long enough for the series' transition if
+    one's set — see _check_trim_range()), plus a usable Trimmed clip
+    *output* path; mode="stitch" needs an already-existing Trimmed clip
+    (input this time, not output) and a Series that actually resolves,
+    plus a usable output path; mode="full" is trim's checks plus
+    stitch's, minus Trimmed clip existing — it won't yet, since trim
+    hasn't produced it (see _stitch_from_state()). Returns a list of
+    problem descriptions (empty if the entry is fine for this mode)."""
     trim_cfg = state.get("trim") or {}
     stitch_cfg = state.get("stitch") or {}
     problems = []
 
     if mode in ("trim", "full"):
         recording_path = state.get("recording_path")
+        recording_ok = False
         if not recording_path:
             problems.append("Main clip is not set.")
         elif not Path(recording_path).exists():
             problems.append(f"Main clip not found: {recording_path}")
+        else:
+            recording_ok = True
 
-        if state.get("raw_begin_offset") is None:
+        begin_ok = state.get("raw_begin_offset") is not None
+        if not begin_ok:
             problems.append("Sermon start is not set.")
         else:
             error = _check_timestamp(state["raw_begin_offset"], "Sermon start")
             if error:
                 problems.append(error)
-        if state.get("raw_end_offset") is None:
+                begin_ok = False
+        end_ok = state.get("raw_end_offset") is not None
+        if not end_ok:
             problems.append("Sermon end is not set.")
         else:
             error = _check_timestamp(state["raw_end_offset"], "Sermon end")
             if error:
                 problems.append(error)
+                end_ok = False
 
         error = _check_output_path(trim_cfg.get("output", "body_trimmed.mp4"), "Trimmed clip output path")
         if error:
             problems.append(error)
+
+        if recording_ok and begin_ok and end_ok:
+            error = _check_trim_range(state, recording_path, trim_cfg, stitch_cfg)
+            if error:
+                problems.append(error)
 
     if mode == "stitch":
         trimmed_path = state.get("trimmed_path")
@@ -2114,7 +2186,12 @@ def bulk_render(states_path: str, mode: str) -> int:
     started at all) if any fail — unlike a mid-run failure (which only
     skips that one entry, see above), a bad *input* is caught up front
     so a typo near the end of a long list doesn't waste every entry's
-    render time ahead of it before finally being discovered."""
+    render time ahead of it before finally being discovered. Each
+    entry's own "[bulk-render] status ..." line goes verifying ->
+    ready/check_console during this pass (the same live per-row Status
+    column feed the real trim/stitch loop below uses — see
+    BULK_ENTRY_STATUS_RE/BULK_STATUS_DISPLAY in gui.py), so a long list
+    doesn't just sit there indefinitely while every entry gets probed."""
     try:
         states = json.loads(Path(states_path).read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -2124,10 +2201,15 @@ def bulk_render(states_path: str, mode: str) -> int:
     if not states:
         sys.exit(f"{states_path!r} is empty — nothing to render.")
 
-    validation_failures = [
-        (i, problems) for i, state in enumerate(states)
-        if (problems := _validate_bulk_entry(state, mode))
-    ]
+    validation_failures: list[tuple[int, list[str]]] = []
+    for i, state in enumerate(states):
+        print(f"[bulk-render] status entry={i + 1} state=verifying")
+        problems = _validate_bulk_entry(state, mode)
+        if problems:
+            validation_failures.append((i, problems))
+            print(f"[bulk-render] status entry={i + 1} state=check_console")
+        else:
+            print(f"[bulk-render] status entry={i + 1} state=ready")
     if validation_failures:
         sys.exit(
             f"{len(validation_failures)}/{len(states)} entries failed validation — fix these and try "

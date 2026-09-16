@@ -166,18 +166,33 @@ def test_bulk_render_stitch_only_skips_entry_with_no_series(bulk_clips, series_n
     assert not (tmp_path / "final0.mp4").exists()
 
 
+def _add_series_with_missing_intro(bulk_clips) -> str:
+    """Appends a second series to sv.SERIES_PATH (already pointed at a
+    real file by the series_name fixture) whose intro file doesn't
+    exist — resolve_series() only checks the *name* against series.json
+    (see _check_series()), so this resolves fine at validation time, but
+    fails for real once stitch() itself tries to open that intro file.
+    A genuine mid-run-only failure — unlike a bad *input* (missing
+    recording, unresolvable series name, etc. — see
+    test_bulk_render_validates_every_entry_before_starting_anything),
+    which the upfront validation pass now catches before anything
+    starts. Returns the new series' name."""
+    series = json.loads(sv.SERIES_PATH.read_text())
+    series.append({
+        "name": "Bad Series", "intro": "/does/not/exist/intro.mp4", "intro_duration": 1.0,
+        "outro": bulk_clips["outro"], "outro_duration": 1.0,
+        "transition": "fade", "transition_duration": 0.2, "hidden": False,
+    })
+    sv.SERIES_PATH.write_text(json.dumps(series))
+    return "Bad Series"
+
+
 def test_bulk_render_tolerates_one_bad_entry_and_keeps_going(bulk_clips, series_name, tmp_path):
-    # A file that *exists* (so it passes the upfront validation pass —
-    # see test_bulk_render_validates_every_entry_before_starting_anything
-    # for that behavior) but isn't a real video, so ffmpeg itself fails
-    # once trim actually runs on it — a genuine mid-run failure, which
-    # (unlike a bad *input*) only skips this one entry.
-    corrupt_recording = tmp_path / "corrupt.mp4"
-    corrupt_recording.write_bytes(b"not a real video file" * 20)
+    bad_series = _add_series_with_missing_intro(bulk_clips)
     states_path = tmp_path / "states.json"
     states = [
         _make_state(series_name, tmp_path, 0, bulk_clips["rec1"]),
-        _make_state(series_name, tmp_path, 1, str(corrupt_recording)),
+        _make_state(bad_series, tmp_path, 1, bulk_clips["rec1"]),
         _make_state(series_name, tmp_path, 2, bulk_clips["rec2"]),
     ]
     states_path.write_text(json.dumps(states))
@@ -191,8 +206,11 @@ def test_bulk_render_tolerates_one_bad_entry_and_keeps_going(bulk_clips, series_
     assert (tmp_path / "final2.mp4").is_file()
     assert not (tmp_path / "final1.mp4").exists()
     saved = json.loads(states_path.read_text())
+    # Entry #2's trim succeeds fine — only its stitch (the missing intro
+    # file) fails, so unlike a trim-phase failure its trimmed_path *is*
+    # still recorded.
     assert saved[0]["trimmed_path"] is not None
-    assert saved[1]["trimmed_path"] is None
+    assert saved[1]["trimmed_path"] is not None
     assert saved[2]["trimmed_path"] is not None
 
 
@@ -201,17 +219,11 @@ def test_bulk_render_prints_per_entry_status_lines(bulk_clips, series_name, tmp_
     BULK_ENTRY_STATUS_RE/_handle_bulk_render_line() in gui.py) to drive
     its own per-row Status column — this is the wire format contract
     between the two, checked directly against real output here."""
-    # Same "exists but isn't a real video" trick as
-    # test_bulk_render_tolerates_one_bad_entry_and_keeps_going — a
-    # nonexistent recording_path would now be caught by the upfront
-    # validation pass before any status lines are printed at all, which
-    # isn't what this test is checking.
-    corrupt_recording = tmp_path / "corrupt.mp4"
-    corrupt_recording.write_bytes(b"not a real video file" * 20)
+    bad_series = _add_series_with_missing_intro(bulk_clips)
     states_path = tmp_path / "states.json"
     states = [
         _make_state(series_name, tmp_path, 0, bulk_clips["rec1"]),
-        _make_state(series_name, tmp_path, 1, str(corrupt_recording)),
+        _make_state(bad_series, tmp_path, 1, bulk_clips["rec1"]),
     ]
     states_path.write_text(json.dumps(states))
 
@@ -222,12 +234,24 @@ def test_bulk_render_prints_per_entry_status_lines(bulk_clips, series_name, tmp_
         line for line in capsys.readouterr().out.splitlines() if line.startswith("[bulk-render] status ")
     ]
     assert lines == [
+        # The upfront validation pass, across every entry, before any of
+        # them starts running (see
+        # test_bulk_render_validates_every_entry_before_starting_anything)
+        # — both entries pass it (a missing *intro* file isn't checked
+        # there), so both go straight to "ready".
+        "[bulk-render] status entry=1 state=verifying",
+        "[bulk-render] status entry=1 state=ready",
+        "[bulk-render] status entry=2 state=verifying",
+        "[bulk-render] status entry=2 state=ready",
+        # The real trim/stitch loop.
         "[bulk-render] status entry=1 state=trimming",
         "[bulk-render] status entry=1 state=trimmed",
         "[bulk-render] status entry=1 state=stitching",
         "[bulk-render] status entry=1 state=stitched",
         "[bulk-render] status entry=2 state=trimming",
-        "[bulk-render] status entry=2 state=failed_trim",
+        "[bulk-render] status entry=2 state=trimmed",
+        "[bulk-render] status entry=2 state=stitching",
+        "[bulk-render] status entry=2 state=failed_stitch",
     ]
 
 
@@ -255,6 +279,8 @@ def test_bulk_render_status_line_reports_failed_stitch_not_failed_trim(
         line for line in capsys.readouterr().out.splitlines() if line.startswith("[bulk-render] status ")
     ]
     assert lines == [
+        "[bulk-render] status entry=1 state=verifying",
+        "[bulk-render] status entry=1 state=ready",
         "[bulk-render] status entry=1 state=stitching",
         "[bulk-render] status entry=1 state=failed_stitch",
     ]
@@ -331,6 +357,78 @@ def test_validate_bulk_entry_trim_mode_passes_a_good_entry(bulk_clips, tmp_path)
         "trim": {"output": str(tmp_path / "trim.mp4")}, "stitch": {},
     }
     assert sv._validate_bulk_entry(state, "trim") == []
+
+
+def test_validate_bulk_entry_trim_mode_catches_end_past_the_main_clips_length(bulk_clips, tmp_path):
+    # bulk_clips["rec1"] is 6s long.
+    state = {
+        "recording_path": bulk_clips["rec1"], "raw_begin_offset": 1.0, "raw_end_offset": 100.0,
+        "trim": {"output": str(tmp_path / "trim.mp4")}, "stitch": {},
+    }
+    problems = sv._validate_bulk_entry(state, "trim")
+    assert any("outside the main clip's own length" in p for p in problems)
+
+
+def test_validate_bulk_entry_trim_mode_catches_start_after_end(bulk_clips, tmp_path):
+    state = {
+        "recording_path": bulk_clips["rec1"], "raw_begin_offset": 4.0, "raw_end_offset": 1.0,
+        "trim": {"output": str(tmp_path / "trim.mp4")}, "stitch": {},
+    }
+    problems = sv._validate_bulk_entry(state, "trim")
+    assert any("past itself" in p for p in problems)
+
+
+def test_validate_bulk_entry_trim_mode_catches_range_too_short_for_the_transition(
+    bulk_clips, series_name, tmp_path,
+):
+    # series_name's own transition_duration (see the fixture) is 0.2s;
+    # a 0.1s trim range is too short for it to crossfade.
+    state = {
+        "recording_path": bulk_clips["rec1"], "raw_begin_offset": 1.0, "raw_end_offset": 1.1,
+        "trim": {"output": str(tmp_path / "trim.mp4")},
+        "stitch": {"series": series_name, "output": str(tmp_path / "final.mp4")},
+    }
+    problems = sv._validate_bulk_entry(state, "trim")
+    assert any("too short for" in p and "transition" in p for p in problems)
+
+
+def test_validate_bulk_entry_trim_mode_skips_the_transition_check_with_no_series_set(
+    bulk_clips, tmp_path,
+):
+    # Same too-short range as above, but no series set — trim mode
+    # doesn't otherwise require one (only stitch/full do), so this can't
+    # be checked and isn't treated as a failure.
+    state = {
+        "recording_path": bulk_clips["rec1"], "raw_begin_offset": 1.0, "raw_end_offset": 1.1,
+        "trim": {"output": str(tmp_path / "trim.mp4")}, "stitch": {},
+    }
+    assert sv._validate_bulk_entry(state, "trim") == []
+
+
+def test_validate_bulk_entry_trim_mode_skips_the_transition_check_with_an_unresolvable_series(
+    bulk_clips, tmp_path,
+):
+    state = {
+        "recording_path": bulk_clips["rec1"], "raw_begin_offset": 1.0, "raw_end_offset": 1.1,
+        "trim": {"output": str(tmp_path / "trim.mp4")},
+        "stitch": {"series": "Not A Real Series", "output": str(tmp_path / "final.mp4")},
+    }
+    # mode="trim" alone never requires a series to resolve — only that
+    # this one extra check gets silently skipped when it doesn't.
+    assert sv._validate_bulk_entry(state, "trim") == []
+
+
+def test_validate_bulk_entry_full_mode_catches_range_too_short_for_the_transition(
+    bulk_clips, series_name, tmp_path,
+):
+    state = {
+        "recording_path": bulk_clips["rec1"], "raw_begin_offset": 1.0, "raw_end_offset": 1.1,
+        "trimmed_path": None,
+        "trim": {"output": str(tmp_path / "trim.mp4")},
+        "stitch": {"series": series_name, "output": str(tmp_path / "final.mp4")},
+    }
+    problems = sv._validate_bulk_entry(state, "full")
+    assert any("too short for" in p and "transition" in p for p in problems)
 
 
 def test_validate_bulk_entry_stitch_mode_catches_missing_trimmed_clip(series_name, tmp_path):

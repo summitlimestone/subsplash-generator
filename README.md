@@ -77,15 +77,20 @@ starter `config.json` next to the script on first run if none exists.
   Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
   start-end/Trim visually…, plus Advanced settings) minus the
   Trim/Stitch buttons themselves. Drag a row to reorder it. The Status
-  column updates live, color-coded, while a run is in progress (idle,
-  trimming/stitching, trimmed/stitched, failed (trim)/failed (stitch)).
-  Every entry is checked (Main clip/Trimmed clip exist, Sermon start/end
-  set, Series resolves, output paths are usable — whichever of these the
-  chosen mode actually needs) *before* anything starts, so a bad entry
-  anywhere in the list aborts the whole batch immediately instead of
-  discovering it only after burning time on every entry ahead of it; a
-  failure once a run is actually underway (an ffmpeg error, say) only
-  skips that one entry and keeps going. Trim/Stitch/Full Render always
+  column updates live, color-coded, while a run is in progress: idle,
+  verifying (blue), ready (plain), check console (yellow), trimming/
+  stitching (blue), trimmed/stitched (green), failed (trim)/failed
+  (stitch) (red). Every entry is checked (Main clip/Trimmed clip exist,
+  Sermon start/end set and inside the Main clip's own length with start
+  before end, the trimmed range long enough for the Series' transition
+  if one's set, Series resolves, output paths are usable — whichever of
+  these the chosen mode actually needs) *before* anything starts —
+  verifying while an entry's own checks run, then ready or check console
+  per entry — so a bad entry anywhere in the list aborts the whole batch
+  immediately (check the console for why) instead of discovering it only
+  after burning time on every entry ahead of it; a failure once a run is
+  actually underway (an ffmpeg error, say) only skips that one entry and
+  keeps going. Trim/Stitch/Full Render always
   run against the list's *current* in-GUI state (including any
   unsaved Add/Edit/reorder) via a throwaway snapshot — nothing is
   written back to an imported file unless you click Export.
@@ -299,17 +304,23 @@ next. Ignores `stitch.auto` on every mode — unlike `watch`/`render`, an
 explicit `bulk-render` invocation always does what its own `--mode` says.
 
 Every entry is validated up front, before any of them starts — `--mode
-trim`/`full` check that each entry's Main clip exists and Sermon
-start/end are set; `--mode stitch` checks that its Trimmed clip exists
-and its Series resolves; `--mode full` checks the same as `stitch`
-except Trimmed clip (it won't exist yet — trim produces it); every mode
-checks its own output path is usable. If any entry fails these checks,
-the whole run aborts immediately (nothing is started at all) with a
-summary of which entries and why. Once a run is actually underway, one
-entry failing at that point (a missing file that slipped past
-validation somehow, a bad ffmpeg run) doesn't abort the rest: it's
-reported and skipped, and the process exits non-zero only at the end,
-with a summary of which entries failed.
+trim`/`full` check that each entry's Main clip exists, Sermon start/end
+are set and land inside the Main clip's own length with start before
+end, and (only if a Series is set) that the resulting trimmed range is
+longer than that Series' own transition duration; `--mode stitch`
+checks that its Trimmed clip exists and its Series resolves; `--mode
+full` checks the same as `stitch` except Trimmed clip (it won't exist
+yet — trim produces it); every mode checks its own output path is
+usable. Each entry prints a "verifying" status line while its checks
+run, then "ready" or "check_console" depending on the result — the
+GUI's Bulk Render tab shows these live, color-coded, in its Status
+column. If any entry fails these checks, the whole run aborts
+immediately (nothing is started at all) with a summary of which entries
+and why. Once a run is actually underway, one entry failing at that
+point (a missing file that slipped past validation somehow, a bad
+ffmpeg run) doesn't abort the rest: it's reported and skipped, and the
+process exits non-zero only at the end, with a summary of which entries
+failed.
 
 ## Tests
 
