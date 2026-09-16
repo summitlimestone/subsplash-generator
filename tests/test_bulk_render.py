@@ -351,7 +351,10 @@ def test_validate_bulk_entry_stitch_mode_catches_unset_trimmed_clip(series_name,
     assert any("Trimmed clip is not set" in p for p in problems)
 
 
-def test_validate_bulk_entry_stitch_mode_catches_unknown_series(tmp_path):
+def test_validate_bulk_entry_stitch_mode_catches_unknown_series(series_name, tmp_path):
+    # series_name (not just bulk_clips) so a real series.json exists —
+    # otherwise this would hit resolve_series()'s "no series.json found"
+    # branch instead of its "name not found in it" one.
     trimmed = tmp_path / "trim.mp4"
     trimmed.write_bytes(b"x")
     state = {
