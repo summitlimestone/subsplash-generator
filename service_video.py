@@ -1967,6 +1967,106 @@ def _bulk_entry_step_total(mode: str, trim_cfg: dict, stitch_cfg: dict) -> int:
     return total
 
 
+def _check_output_path(path: str, label: str) -> str | None:
+    """A non-exiting probe of whether `path` is something trim_clip()/
+    stitch() could plausibly write to — reuses expand_output_path()
+    itself (the same strftime expansion + mkdir -p it really runs at
+    write time) so this can't drift from what actually happens at that
+    point, just catches its sys.exit() instead of letting it end the
+    whole process. Used by _validate_bulk_entry() to catch an obviously
+    bad output path for every entry up front, before any of them
+    starts running. Returns a problem description, or None if fine."""
+    if not path or not str(path).strip():
+        return f"{label} is blank."
+    try:
+        expand_output_path(path)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, str) else str(e.code)
+    return None
+
+
+def _check_timestamp(value, label: str) -> str | None:
+    """Same non-exiting-probe idea as _check_output_path(), for
+    parse_timestamp() (which sys.exit()s on a bad value rather than
+    raising)."""
+    try:
+        parse_timestamp(value)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, str) else str(e.code)
+    return None
+
+
+def _check_series(name: str) -> str | None:
+    """Same non-exiting-probe idea as _check_output_path(), for
+    resolve_series() (blank name / missing series.json / unknown name
+    all sys.exit() there rather than raising)."""
+    try:
+        resolve_series(name)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, str) else str(e.code)
+    return None
+
+
+def _validate_bulk_entry(state: dict, mode: str) -> list[str]:
+    """Basic input checks for one bulk_render() entry — see
+    bulk_render()'s own upfront validation pass, which runs this against
+    every entry before any of them starts, so a bad input anywhere in
+    the batch is caught immediately instead of only after burning time
+    on every entry ahead of it. Checks only what `mode` actually needs:
+    mode="trim" needs a real Main clip and populated Sermon start/end,
+    plus a usable Trimmed clip *output* path; mode="stitch" needs an
+    already-existing Trimmed clip (input this time, not output) and a
+    Series that actually resolves, plus a usable output path;
+    mode="full" is trim's checks plus stitch's, minus Trimmed clip
+    existing — it won't yet, since trim hasn't produced it (see
+    _stitch_from_state()). Returns a list of problem descriptions
+    (empty if the entry is fine for this mode)."""
+    trim_cfg = state.get("trim") or {}
+    stitch_cfg = state.get("stitch") or {}
+    problems = []
+
+    if mode in ("trim", "full"):
+        recording_path = state.get("recording_path")
+        if not recording_path:
+            problems.append("Main clip is not set.")
+        elif not Path(recording_path).exists():
+            problems.append(f"Main clip not found: {recording_path}")
+
+        if state.get("raw_begin_offset") is None:
+            problems.append("Sermon start is not set.")
+        else:
+            error = _check_timestamp(state["raw_begin_offset"], "Sermon start")
+            if error:
+                problems.append(error)
+        if state.get("raw_end_offset") is None:
+            problems.append("Sermon end is not set.")
+        else:
+            error = _check_timestamp(state["raw_end_offset"], "Sermon end")
+            if error:
+                problems.append(error)
+
+        error = _check_output_path(trim_cfg.get("output", "body_trimmed.mp4"), "Trimmed clip output path")
+        if error:
+            problems.append(error)
+
+    if mode == "stitch":
+        trimmed_path = state.get("trimmed_path")
+        if not trimmed_path:
+            problems.append("Trimmed clip is not set.")
+        elif not Path(trimmed_path).exists():
+            problems.append(f"Trimmed clip not found: {trimmed_path}")
+
+    if mode in ("stitch", "full"):
+        error = _check_series(stitch_cfg.get("series", ""))
+        if error:
+            problems.append(error)
+        error = _check_output_path(stitch_cfg.get("output", "final.mp4"), "Output path")
+        if error:
+            problems.append(error)
+
+    return problems
+
+
 def bulk_render(states_path: str, mode: str) -> int:
     """Runs trim and/or stitch (mode: "trim", "stitch", or "full") against
     every render-state dict in a JSON array at `states_path` — the Bulk
@@ -2007,7 +2107,14 @@ def bulk_render(states_path: str, mode: str) -> int:
     trimmed_path back to `states_path`, same as mode="trim": harmless
     (nothing reads it again this run) but keeps the file an accurate
     record of what was actually produced, same reasoning as trim's own
-    case."""
+    case.
+
+    Before any entry actually runs, every entry is checked against
+    _validate_bulk_entry() and the whole batch is aborted (nothing
+    started at all) if any fail — unlike a mid-run failure (which only
+    skips that one entry, see above), a bad *input* is caught up front
+    so a typo near the end of a long list doesn't waste every entry's
+    render time ahead of it before finally being discovered."""
     try:
         states = json.loads(Path(states_path).read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -2016,6 +2123,17 @@ def bulk_render(states_path: str, mode: str) -> int:
         sys.exit(f"{states_path!r} must contain a JSON array of render-state objects.")
     if not states:
         sys.exit(f"{states_path!r} is empty — nothing to render.")
+
+    validation_failures = [
+        (i, problems) for i, state in enumerate(states)
+        if (problems := _validate_bulk_entry(state, mode))
+    ]
+    if validation_failures:
+        sys.exit(
+            f"{len(validation_failures)}/{len(states)} entries failed validation — fix these and try "
+            "again (nothing was run):\n"
+            + "\n".join(f"  #{i + 1}: {'; '.join(problems)}" for i, problems in validation_failures)
+        )
 
     _reset_steps(sum(
         _bulk_entry_step_total(mode, s.get("trim", {}), s.get("stitch", {})) for s in states

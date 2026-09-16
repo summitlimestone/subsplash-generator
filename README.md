@@ -79,7 +79,13 @@ starter `config.json` next to the script on first run if none exists.
   Trim/Stitch buttons themselves. Drag a row to reorder it. The Status
   column updates live, color-coded, while a run is in progress (idle,
   trimming/stitching, trimmed/stitched, failed (trim)/failed (stitch)).
-  One entry failing doesn't stop the rest. Trim/Stitch/Full Render always
+  Every entry is checked (Main clip/Trimmed clip exist, Sermon start/end
+  set, Series resolves, output paths are usable — whichever of these the
+  chosen mode actually needs) *before* anything starts, so a bad entry
+  anywhere in the list aborts the whole batch immediately instead of
+  discovering it only after burning time on every entry ahead of it; a
+  failure once a run is actually underway (an ffmpeg error, say) only
+  skips that one entry and keeps going. Trim/Stitch/Full Render always
   run against the list's *current* in-GUI state (including any
   unsaved Add/Edit/reorder) via a throwaway snapshot — nothing is
   written back to an imported file unless you click Export.
@@ -291,9 +297,19 @@ current `trimmed_path`, whatever's already on record; an entry with none
 yet is skipped. `--mode full` does both, per entry, before moving to the
 next. Ignores `stitch.auto` on every mode — unlike `watch`/`render`, an
 explicit `bulk-render` invocation always does what its own `--mode` says.
-One entry failing (a missing file, a bad ffmpeg run) doesn't abort the
-rest: it's reported and skipped, and the process exits non-zero only at
-the end, with a summary of which entries failed.
+
+Every entry is validated up front, before any of them starts — `--mode
+trim`/`full` check that each entry's Main clip exists and Sermon
+start/end are set; `--mode stitch` checks that its Trimmed clip exists
+and its Series resolves; `--mode full` checks the same as `stitch`
+except Trimmed clip (it won't exist yet — trim produces it); every mode
+checks its own output path is usable. If any entry fails these checks,
+the whole run aborts immediately (nothing is started at all) with a
+summary of which entries and why. Once a run is actually underway, one
+entry failing at that point (a missing file that slipped past
+validation somehow, a bad ffmpeg run) doesn't abort the rest: it's
+reported and skipped, and the process exits non-zero only at the end,
+with a summary of which entries failed.
 
 ## Tests
 
