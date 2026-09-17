@@ -51,6 +51,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import queue
 import re
 import shutil
@@ -295,13 +296,28 @@ DEFAULT_IMAGE_DURATION = 5.0
 # out of a custom state_output entirely if you don't want it.
 DEFAULT_STATE_OUTPUT = "render_state_%Y%m%d_%H%M%S.json"
 
-# Mirrors gui.py's own SCRIPT_DIR/SERIES_PATH exactly — series.json is
-# owned/edited by the GUI's Series Manager tab, but resolve_series()
-# below needs to read it too, since a stitch config now only ever
-# carries a series *name* (never literal intro/outro paths) by the time
-# it reaches this module.
 SCRIPT_DIR = Path(__file__).resolve().parent
-SERIES_PATH = SCRIPT_DIR / "series.json"
+
+
+def _config_dir() -> Path:
+    """Mirrors gui.py's own _config_dir() exactly — hardcoded per OS
+    (see issue #17): %appdata%\\subsplash-generator on Windows,
+    ~/.config/subsplash-generator on Mac/Linux (the same XDG-style path
+    for both, not macOS's own ~/Library/Application Support
+    convention)."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "subsplash-generator"
+    return Path.home() / ".config" / "subsplash-generator"
+
+
+CONFIG_DIR = _config_dir()
+CONFIG_PATH = CONFIG_DIR / "config.json"
+# series.json is owned/edited by the GUI's Series Manager tab, but
+# resolve_series() below needs to read it too, since a stitch config now
+# only ever carries a series *name* (never literal intro/outro paths) by
+# the time it reaches this module.
+SERIES_PATH = CONFIG_DIR / "series.json"
 
 
 def is_image_file(path: str) -> bool:
@@ -2759,6 +2775,14 @@ def watch(cfg: dict, pp_cfg: dict, debug: bool = False):
 # --------------------------------------------------------------------------
 
 def main():
+    # Not assumed to already exist (a first-ever run, a fresh OS user
+    # profile, CLI-only use that's never launched the GUI) — created
+    # unconditionally, once, up front. This module never *writes*
+    # config.json/series.json itself (only reads them, erroring with a
+    # clear message if missing — see below/resolve_series()), but the
+    # directory existing means there's somewhere for a user to put one.
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2772,12 +2796,12 @@ def main():
     machine_progress_kwargs = dict(action="store_true")
 
     p_watch = sub.add_parser("watch", help="Watch ProPresenter+OBS live and keep a render-state file up to date; trim/stitch on request (stdin)")
-    p_watch.add_argument("-c", "--config", default="config.json", help="Path to config JSON file")
+    p_watch.add_argument("-c", "--config", default=str(CONFIG_PATH), help="Path to config JSON file")
     p_watch.add_argument("--debug", action="store_true", help="Print every raw message received from ProPresenter and OBS")
     p_watch.add_argument("--machine-progress", **machine_progress_kwargs)
 
     p_learn = sub.add_parser("learn", help="Print slide uid/text as you step through ProPresenter (no OBS needed)")
-    p_learn.add_argument("-c", "--config", default="config.json", help="Path to config JSON file")
+    p_learn.add_argument("-c", "--config", default=str(CONFIG_PATH), help="Path to config JSON file")
 
     p_render = sub.add_parser("render", help="Re-run just the trim+stitch step from a saved render-state file (no OBS/ProPresenter needed)")
     p_render.add_argument("state_json", help="Path to a render_state_*.json file written by a previous 'watch' run")
