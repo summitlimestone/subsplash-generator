@@ -42,6 +42,11 @@ def _row_y(app, iid):
     return bbox[1] + bbox[3] // 2
 
 
+def _select(app, *iids):
+    app.bulk_render_tree.selection_set(iids)
+    app.update()  # <<TreeviewSelect>> is dispatched via the event queue, not synchronously
+
+
 def _status_label(app, iid):
     """The overlay Label _sync_bulk_status_labels() places on top of a
     row's Status cell (see gui.py) — its text/foreground is where the
@@ -396,6 +401,169 @@ def test_a_plain_click_with_no_motion_does_not_reorder(app):
     app._on_bulk_render_drag_end(FakeEvent(_row_y(app, "0")))
 
     assert [s["recording_path"] for s in app.bulk_states] == original
+
+
+# -- Selection-driven Delete/Bulk Edit… buttons ------------------------------
+
+def test_delete_and_bulk_edit_buttons_start_disabled(app):
+    _load(app, _make_states(n=2))
+    assert str(app.bulk_delete_btn["state"]) == "disabled"
+    assert str(app.bulk_edit_selected_btn["state"]) == "disabled"
+
+
+def test_selecting_a_row_enables_delete_and_bulk_edit_buttons(app):
+    _load(app, _make_states(n=2))
+    _select(app, "0")
+    assert str(app.bulk_delete_btn["state"]) == "normal"
+    assert str(app.bulk_edit_selected_btn["state"]) == "normal"
+
+
+def test_clearing_the_selection_disables_them_again(app):
+    _load(app, _make_states(n=2))
+    _select(app, "0")
+    app.bulk_render_tree.selection_remove("0")
+    app.update()
+    assert str(app.bulk_delete_btn["state"]) == "disabled"
+    assert str(app.bulk_edit_selected_btn["state"]) == "disabled"
+
+
+def test_a_rebuild_clears_the_selection_and_redisables_the_buttons(app):
+    _load(app, _make_states(n=2))
+    _select(app, "0")
+    app._refresh_bulk_render_tree()
+    assert str(app.bulk_delete_btn["state"]) == "disabled"
+    assert str(app.bulk_edit_selected_btn["state"]) == "disabled"
+
+
+# -- Delete -------------------------------------------------------------------
+
+def test_delete_refuses_with_nothing_selected(app, monkeypatch):
+    _load(app, _make_states(n=2))
+    errors = []
+    monkeypatch.setattr(gui.messagebox, "showerror", lambda title, msg: errors.append(msg))
+    app._delete_selected_bulk_entries()
+    assert errors
+    assert len(app.bulk_states) == 2
+
+
+def test_delete_asks_for_confirmation_and_removes_selected_entries(app, monkeypatch):
+    _load(app, _make_states(n=3))
+    _select(app, "0", "2")
+    asked = []
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda title, msg: asked.append(msg) or True)
+
+    app._delete_selected_bulk_entries()
+
+    assert asked
+    assert len(app.bulk_states) == 1
+    assert app.bulk_states[0]["recording_path"] == "/rec1.mp4"
+
+
+def test_delete_cancelled_confirmation_leaves_entries_alone(app, monkeypatch):
+    _load(app, _make_states(n=2))
+    _select(app, "0")
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda title, msg: False)
+
+    app._delete_selected_bulk_entries()
+
+    assert len(app.bulk_states) == 2
+
+
+def test_delete_preserves_the_status_of_surviving_rows(app, monkeypatch):
+    _load(app, _make_states(n=3))
+    app._handle_bulk_render_line("[bulk-render] status entry=3 state=stitched")
+    _select(app, "0")
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda title, msg: True)
+
+    app._delete_selected_bulk_entries()
+
+    # The surviving two entries shift down to iids "0"/"1" — the one
+    # that was #3 (stitched) is now "1" and should still read stitched.
+    assert app.bulk_render_tree.item("1", "values")[-1] == "stitched"
+
+
+# -- Bulk Edit… -----------------------------------------------------------
+
+def test_bulk_edit_refuses_with_nothing_selected(app, monkeypatch):
+    _load(app, _make_states(n=2))
+    errors = []
+    monkeypatch.setattr(gui.messagebox, "showerror", lambda title, msg: errors.append(msg))
+    app._open_bulk_edit()
+    assert errors
+
+
+def test_bulk_edit_opens_for_the_selected_entries(app):
+    _load(app, _make_states(n=3))
+    _select(app, "0", "2")
+
+    app._open_bulk_edit()
+
+    editors = [w for w in app.winfo_children() if isinstance(w, gui.BulkEditWindow)]
+    assert len(editors) == 1
+    assert editors[0].indices == [0, 2]
+
+
+def test_bulk_edit_only_applies_fields_actually_touched(app):
+    _load(app, _make_states(n=2))
+    _select(app, "0", "1")
+    app._open_bulk_edit()
+    editor = next(w for w in app.winfo_children() if isinstance(w, gui.BulkEditWindow))
+
+    editor.series_var.set("New Series")
+    editor._save()
+
+    assert app.bulk_states[0]["stitch"]["series"] == "New Series"
+    assert app.bulk_states[1]["stitch"]["series"] == "New Series"
+    # Output was never touched — each entry keeps its own original value.
+    assert app.bulk_states[0]["stitch"]["output"] == "/final0.mp4"
+    assert app.bulk_states[1]["stitch"]["output"] == "/final1.mp4"
+
+
+def test_bulk_edit_crf_applies_to_both_trim_and_stitch(app):
+    _load(app, _make_states(n=2))
+    _select(app, "0", "1")
+    app._open_bulk_edit()
+    editor = next(w for w in app.winfo_children() if isinstance(w, gui.BulkEditWindow))
+
+    editor.crf_var.set(35)
+    editor._save()
+
+    for state in app.bulk_states:
+        assert state["trim"]["crf"] == 35
+        assert state["stitch"]["crf"] == 35
+
+
+def test_bulk_edit_with_nothing_touched_shows_a_message_and_stays_open(app, monkeypatch):
+    _load(app, _make_states(n=2))
+    _select(app, "0", "1")
+    app._open_bulk_edit()
+    editor = next(w for w in app.winfo_children() if isinstance(w, gui.BulkEditWindow))
+    infos = []
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, msg: infos.append(msg))
+
+    editor._save()
+
+    assert infos
+    assert editor.winfo_exists()
+    assert app.bulk_states[0]["stitch"]["output"] == "/final0.mp4"
+
+
+def test_bulk_edit_preserves_status_and_leaves_unselected_entries_alone(app):
+    _load(app, _make_states(n=3))
+    app._handle_bulk_render_line("[bulk-render] status entry=1 state=stitched")
+    app._handle_bulk_render_line("[bulk-render] status entry=3 state=failed_stitch")
+    _select(app, "0")
+    app._open_bulk_edit()
+    editor = next(w for w in app.winfo_children() if isinstance(w, gui.BulkEditWindow))
+
+    editor.series_var.set("New Series")
+    editor._save()
+
+    assert app.bulk_states[0]["stitch"]["series"] == "New Series"
+    # Entry #2 wasn't selected — untouched.
+    assert app.bulk_states[1]["stitch"]["series"] == "Some Series"
+    assert app.bulk_render_tree.item("0", "values")[-1] == "stitched"
+    assert app.bulk_render_tree.item("2", "values")[-1] == "failed (stitch)"
 
 
 # -- Running --------------------------------------------------------------

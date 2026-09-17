@@ -80,7 +80,14 @@ starter `config.json` next to the script on first run if none exists.
   or double-clicking a row opens an editor with the same fields as the
   Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
   start-end/Trim visually…, plus Advanced settings) minus the
-  Trim/Stitch buttons themselves. Drag a row to reorder it. The list
+  Trim/Stitch buttons themselves. Select one or more rows (click, or
+  Ctrl/Shift-click for more than one) to enable "Delete" (removes them,
+  after confirming) and "Bulk Edit…" (Series/Trimmed clip/Output
+  path/Advanced settings for every selected entry at once, in a window
+  with no Main clip/Sermon start-end/Trim visually…/Load-Export of its
+  own — only a field you actually change gets applied; anything left
+  alone keeps each entry's own current value). Drag a row to reorder it
+  (a plain drag; Ctrl/Shift-click is how you multi-select instead). The list
   shows Main clip/Output as just their filename (not the full path) and
   a Series column between Output and Status. The Status column updates
   live, color-coded, while a run is in progress: idle,

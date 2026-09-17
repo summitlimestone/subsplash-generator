@@ -2186,7 +2186,7 @@ class App(tk.Tk):
 
         self.bulk_render_tree = ttk.Treeview(
             frame, columns=("index", "recording", "output", "series", "status"),
-            show="headings", selectmode="browse",
+            show="headings", selectmode="extended",
         )
         self.bulk_render_tree.heading("index", text="#", anchor="w")
         self.bulk_render_tree.heading("recording", text="Main clip", anchor="w")
@@ -2203,6 +2203,7 @@ class App(tk.Tk):
         self.bulk_render_tree.bind("<ButtonPress-1>", self._on_bulk_render_drag_start)
         self.bulk_render_tree.bind("<B1-Motion>", self._on_bulk_render_drag_motion)
         self.bulk_render_tree.bind("<ButtonRelease-1>", self._on_bulk_render_drag_end)
+        self.bulk_render_tree.bind("<<TreeviewSelect>>", self._update_bulk_entry_action_buttons)
         # ttk.Treeview tags recolor an entire row, which would tint the
         # #/Recording/Output columns' text along with Status — instead a
         # small tk.Label is overlaid on top of just each row's Status
@@ -2216,9 +2217,17 @@ class App(tk.Tk):
         self._bulk_drag_iid: str | None = None
         self._bulk_drag_moved = False
 
-        ttk.Button(frame, text="+ Add entry…", command=self._add_bulk_entry).grid(
-            row=3, column=0, sticky="w", pady=(6, 0)
+        entry_btn_row = ttk.Frame(frame)
+        entry_btn_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Button(entry_btn_row, text="+ Add entry…", command=self._add_bulk_entry).pack(side="left")
+        self.bulk_delete_btn = ttk.Button(
+            entry_btn_row, text="Delete", command=self._delete_selected_bulk_entries, state="disabled",
         )
+        self.bulk_delete_btn.pack(side="left", padx=(8, 0))
+        self.bulk_edit_selected_btn = ttk.Button(
+            entry_btn_row, text="Bulk Edit…", command=self._open_bulk_edit, state="disabled",
+        )
+        self.bulk_edit_selected_btn.pack(side="left", padx=(8, 0))
 
         btn_row = ttk.Frame(frame)
         btn_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
@@ -2294,6 +2303,10 @@ class App(tk.Tk):
         # internally.
         self.bulk_render_tree.configure(height=max(1, len(self.bulk_states)))
         self._update_bulk_render_buttons()
+        # A full rebuild always drops the prior selection, so Delete/Bulk
+        # Edit… need re-disabling too — not just left to <<TreeviewSelect>>,
+        # which isn't guaranteed to fire from delete()/insert() alone.
+        self._update_bulk_entry_action_buttons()
         self._sync_bulk_status_labels()
 
     def _sync_bulk_status_labels(self):
@@ -2326,6 +2339,11 @@ class App(tk.Tk):
         state = "normal" if self.bulk_states else "disabled"
         for btn in (self.bulk_trim_btn, self.bulk_stitch_btn, self.bulk_full_btn):
             btn.configure(state=state)
+
+    def _update_bulk_entry_action_buttons(self, _event=None):
+        state = "normal" if self.bulk_render_tree.selection() else "disabled"
+        self.bulk_delete_btn.configure(state=state)
+        self.bulk_edit_selected_btn.configure(state=state)
 
     def _import_bulk_states(self):
         path = filedialog.askopenfilename(
@@ -2367,6 +2385,29 @@ class App(tk.Tk):
     def _add_bulk_entry(self):
         BulkEntryEditWindow(self, None, _blank_bulk_entry(self))
 
+    def _delete_selected_bulk_entries(self):
+        selected = sorted(int(iid) for iid in self.bulk_render_tree.selection())
+        if not selected:
+            messagebox.showerror("Delete", "Select at least one entry first.")
+            return
+        noun = "entry" if len(selected) == 1 else "entries"
+        if not messagebox.askyesno("Delete", f"Delete {len(selected)} selected {noun}?"):
+            return
+        # Highest index first, so removing one doesn't shift the
+        # position of any other index still queued for removal.
+        for i in reversed(selected):
+            del self.bulk_states[i]
+            if i < len(self._bulk_run_status):
+                del self._bulk_run_status[i]
+        self._refresh_bulk_render_tree(preserve_status=True)
+
+    def _open_bulk_edit(self):
+        selected = sorted(int(iid) for iid in self.bulk_render_tree.selection())
+        if not selected:
+            messagebox.showerror("Bulk Edit", "Select at least one entry first.")
+            return
+        BulkEditWindow(self, selected)
+
     def _on_bulk_render_double_click(self, event):
         iid = self.bulk_render_tree.identify_row(event.y)
         if not iid:
@@ -2382,11 +2423,17 @@ class App(tk.Tk):
         if not self._bulk_drag_iid:
             return
         target = self.bulk_render_tree.identify_row(event.y)
-        if not target or target == self._bulk_drag_iid:
-            return
-        children = list(self.bulk_render_tree.get_children())
-        self.bulk_render_tree.move(self._bulk_drag_iid, "", children.index(target))
-        self._bulk_drag_moved = True
+        if target and target != self._bulk_drag_iid:
+            children = list(self.bulk_render_tree.get_children())
+            self.bulk_render_tree.move(self._bulk_drag_iid, "", children.index(target))
+            self._bulk_drag_moved = True
+        # "extended" selectmode's own default binding for a plain
+        # (unmodified) drag is to rubber-band-select every row passed
+        # over — the same gesture reordering uses, so without this
+        # they'd both fire on every drag. A Ctrl/Shift-modified click is
+        # a distinct event Tk never routes here, so multi-select by
+        # those still works untouched.
+        return "break"
 
     def _on_bulk_render_drag_end(self, _event):
         # Only a genuine drag (real motion between two different rows)
@@ -4207,6 +4254,253 @@ class BulkEntryEditWindow(tk.Toplevel):
         if not path:
             return
         Path(path).write_text(json.dumps(state, indent=2))
+
+
+class BulkEditWindow(tk.Toplevel):
+    """"Bulk Edit…" for the Bulk Render tab (see
+    App._open_bulk_edit()) — applies a shared set of changes across
+    every currently-selected row in one go, rather than opening
+    BulkEntryEditWindow once per entry. Same general shape as that
+    window (Series/Trimmed clip/Output path/Advanced options), but
+    deliberately without Main clip/Sermon start-end/Trim visually… (all
+    per-entry-only concepts that don't make sense to set identically
+    across a whole selection) or its own Load/Export (this only ever
+    writes into app.bulk_states, never a file).
+
+    Only a field the user actually touches during this session gets
+    applied to the selected entries on Save — every other field is left
+    exactly as each entry's own current value. Tracked via self._dirty,
+    a set of field names populated by a "write" trace registered on
+    each Tk variable right after its own initial value is set (so that
+    initial set itself is never mistaken for a touch)."""
+
+    def __init__(self, app: App, indices: list[int]):
+        super().__init__(app)
+        self.app = app
+        self.indices = indices
+        noun = "entry" if len(indices) == 1 else "entries"
+        self.title(f"Bulk edit {len(indices)} {noun}")
+        self.configure(bg=PALETTE["bg"])
+        self.resizable(False, False)
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self._dirty: set[str] = set()
+
+        def track(field: str):
+            return lambda *_args: self._dirty.add(field)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Only fields you change here are applied to the selected entries — "
+            "anything left alone keeps each entry's own current value.",
+            style="Muted.TLabel", wraplength=420, justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        # Every field's starting value — never shown as "this is what's
+        # currently set" (the selection can span entries with different
+        # values), just something sensible to seed the widgets with;
+        # self._dirty is what actually decides what Save touches, not
+        # whether a value differs from this.
+        defaults = _blank_bulk_entry(app)
+        trim_cfg, stitch_cfg = defaults["trim"], defaults["stitch"]
+
+        app.vars.setdefault("bulk_multi_edit_series", tk.StringVar())
+        self.series_var = app.vars["bulk_multi_edit_series"]
+        self.series_var.set("")
+        ttk.Label(frame, text="Series", style="Header.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        series_combo = ttk.Combobox(
+            frame, textvariable=self.series_var, values=app._series_names(), width=37,
+        )
+        series_combo.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
+        app._make_series_combobox_searchable(series_combo, "bulk_multi_edit_series")
+        self.series_var.trace_add("write", track("series"))
+
+        self.trimmed_var = tk.StringVar(value="")
+        ttk.Label(frame, text="Trimmed clip", style="Header.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        ttk.Entry(frame, textvariable=self.trimmed_var, width=40).grid(
+            row=2, column=1, columnspan=2, sticky="ew", pady=3
+        )
+        ttk.Button(
+            frame, text="Browse…", command=lambda: self._browse(self.trimmed_var, VIDEO_FILETYPES, save=True),
+        ).grid(row=2, column=3, sticky="w", padx=(4, 0), pady=3)
+        self.trimmed_var.trace_add("write", track("trimmed_path"))
+
+        self.output_var = tk.StringVar(value="")
+        ttk.Label(frame, text="Output path", style="Header.TLabel").grid(
+            row=3, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        ttk.Entry(frame, textvariable=self.output_var, width=40).grid(
+            row=3, column=1, columnspan=2, sticky="ew", pady=3
+        )
+        ttk.Button(
+            frame, text="Browse…", command=lambda: self._browse(self.output_var, VIDEO_FILETYPES, save=True),
+        ).grid(row=3, column=3, sticky="w", padx=(4, 0), pady=3)
+        self.output_var.trace_add("write", track("output"))
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=4, column=0, columnspan=4, sticky="ew", pady=(12, 8)
+        )
+        ttk.Label(frame, text="Advanced options", style="Header.TLabel").grid(
+            row=5, column=0, columnspan=4, sticky="w", pady=(0, 3)
+        )
+
+        self.crf_var = tk.IntVar(value=trim_cfg["crf"])
+        ttk.Label(frame, text="CRF (quality)", style="Header.TLabel").grid(
+            row=6, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        crf_inner = ttk.Frame(frame)
+        crf_inner.grid(row=6, column=1, columnspan=3, sticky="ew", pady=3)
+        crf_inner.columnconfigure(0, weight=1)
+        crf_scale = ttk.Scale(
+            crf_inner, from_=0, to=51, orient="horizontal", variable=self.crf_var,
+            command=lambda raw: self.crf_var.set(round(float(raw))),
+        )
+        crf_scale.grid(row=0, column=0, sticky="ew")
+        ttk.Label(crf_inner, textvariable=self.crf_var, style="Muted.TLabel", width=3).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+        self.crf_var.trace_add("write", track("crf"))
+
+        self.subsplash_preset_var = tk.BooleanVar(value=stitch_cfg["subsplash_preset"])
+        subsplash_cb = ttk.Checkbutton(
+            frame, text="Subsplash On-Demand (1080p) preset", variable=self.subsplash_preset_var,
+        )
+        subsplash_cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(subsplash_cb, SUBSPLASH_PRESET_HELP, font=app.ui_font)
+        self.subsplash_preset_var.trace_add(
+            "write",
+            lambda *_args: crf_scale.configure(state="disabled" if self.subsplash_preset_var.get() else "normal"),
+        )
+        self.subsplash_preset_var.trace_add("write", track("subsplash_preset"))
+
+        self.fast_copy_var = tk.BooleanVar(value=trim_cfg["fast_copy"])
+        fast_copy_cb = ttk.Checkbutton(frame, text="Fast copy (recommended)", variable=self.fast_copy_var)
+        fast_copy_cb.grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(fast_copy_cb, FAST_COPY_HELP, font=app.ui_font)
+        self.fast_copy_var.trace_add("write", track("fast_copy"))
+
+        self.normalize_audio_var = tk.BooleanVar(value=trim_cfg["normalize_audio"])
+        normalize_cb = ttk.Checkbutton(
+            frame, text="Normalize audio (recommended)", variable=self.normalize_audio_var,
+        )
+        normalize_cb.grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(normalize_cb, NORMALIZE_AUDIO_HELP, font=app.ui_font)
+        self.normalize_audio_var.trace_add("write", track("normalize_audio"))
+
+        self.normalize_target_lufs_var = tk.StringVar(value=str(trim_cfg["normalize_target_lufs"]))
+        ttk.Label(frame, text="Target LUFS", style="Header.TLabel").grid(
+            row=10, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        lufs_entry = ttk.Entry(frame, textvariable=self.normalize_target_lufs_var, width=8)
+        lufs_entry.grid(row=10, column=1, sticky="w", pady=3)
+        Tooltip(lufs_entry, NORMALIZE_TARGET_HELP, font=app.ui_font)
+        self.normalize_target_lufs_var.trace_add("write", track("normalize_target_lufs"))
+
+        self.encoder_var = tk.StringVar(value=trim_cfg["encoder"])
+        ttk.Label(frame, text="Encoder", style="Header.TLabel").grid(
+            row=11, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        encoder_combo = ttk.Combobox(
+            frame, textvariable=self.encoder_var, values=ENCODER_CHOICES, state="readonly", width=14,
+        )
+        encoder_combo.grid(row=11, column=1, sticky="w", pady=3)
+        Tooltip(encoder_combo, ENCODER_HELP, font=app.ui_font)
+
+        self.encoder_preset_var = tk.StringVar(value=trim_cfg["encoder_preset"] or "")
+        ttk.Label(frame, text="Encoder preset", style="Header.TLabel").grid(
+            row=12, column=0, sticky="w", padx=(0, 6), pady=3
+        )
+        preset_combo = ttk.Combobox(
+            frame, textvariable=self.encoder_preset_var, values=[], state="readonly", width=14,
+        )
+        preset_combo.grid(row=12, column=1, sticky="w", pady=3)
+        Tooltip(preset_combo, ENCODER_PRESET_HELP, font=app.ui_font)
+
+        def refresh_presets(*_args):
+            choices = ENCODER_PRESET_CHOICES.get(self.encoder_var.get(), [])
+            preset_combo.configure(values=choices)
+            if self.encoder_preset_var.get() not in choices:
+                self.encoder_preset_var.set(ENCODER_DEFAULT_PRESETS.get(self.encoder_var.get(), ""))
+        self.encoder_var.trace_add("write", refresh_presets)
+        refresh_presets()
+        # Registered *after* the initial refresh_presets() call above, so
+        # that call's own (here, a no-op) encoder_preset_var.set() isn't
+        # mistaken for the user having touched it.
+        self.encoder_var.trace_add("write", track("encoder"))
+        self.encoder_preset_var.trace_add("write", track("encoder_preset"))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=13, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=(0, 8))
+
+        self.transient(app)
+        self.grab_set()
+
+    def _browse(self, var: tk.StringVar, filetypes, save: bool = False):
+        if save:
+            path = filedialog.asksaveasfilename(filetypes=filetypes, initialdir=str(SCRIPT_DIR))
+        else:
+            path = filedialog.askopenfilename(filetypes=filetypes, initialdir=str(SCRIPT_DIR))
+        if path:
+            var.set(path)
+
+    def _save(self):
+        if not self._dirty:
+            messagebox.showinfo("Bulk edit", "Nothing was changed — no fields were touched.")
+            return
+        try:
+            normalize_target_lufs = (
+                to_float(self.normalize_target_lufs_var.get().strip() or "-16.0", "Normalize target LUFS")
+                if "normalize_target_lufs" in self._dirty else None
+            )
+        except ValueError as e:
+            messagebox.showerror("Bulk edit", str(e))
+            return
+
+        for i in self.indices:
+            state = self.app.bulk_states[i]
+            trim_cfg = state.setdefault("trim", {})
+            stitch_cfg = state.setdefault("stitch", {})
+            if "series" in self._dirty:
+                stitch_cfg["series"] = self.series_var.get().strip()
+            if "trimmed_path" in self._dirty:
+                state["trimmed_path"] = self.trimmed_var.get().strip() or None
+            if "output" in self._dirty:
+                stitch_cfg["output"] = self.output_var.get().strip() or "final.mp4"
+            if "crf" in self._dirty:
+                trim_cfg["crf"] = self.crf_var.get()
+                stitch_cfg["crf"] = self.crf_var.get()
+            if "subsplash_preset" in self._dirty:
+                stitch_cfg["subsplash_preset"] = bool(self.subsplash_preset_var.get())
+            if "fast_copy" in self._dirty:
+                trim_cfg["fast_copy"] = bool(self.fast_copy_var.get())
+            if "normalize_audio" in self._dirty:
+                trim_cfg["normalize_audio"] = bool(self.normalize_audio_var.get())
+            if "normalize_target_lufs" in self._dirty:
+                trim_cfg["normalize_target_lufs"] = normalize_target_lufs
+            if "encoder" in self._dirty:
+                trim_cfg["encoder"] = self.encoder_var.get()
+                stitch_cfg["encoder"] = self.encoder_var.get()
+            if "encoder_preset" in self._dirty:
+                preset = self.encoder_preset_var.get() or None
+                trim_cfg["encoder_preset"] = preset
+                stitch_cfg["encoder_preset"] = preset
+
+        # preserve_status=True: bulk-editing doesn't run anything, same
+        # as the single-entry editor (see BulkEntryEditWindow._save()) —
+        # only an actual job run changes a row's Status.
+        self.app._refresh_bulk_render_tree(preserve_status=True)
+        self.destroy()
 
 
 # InteractiveTrimWindow layout constants — a fixed-size filmstrip made of
