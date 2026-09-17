@@ -68,13 +68,45 @@ starter `config.json` next to the script on first run if none exists.
   fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
   "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
   (and its Target LUFS), and Encoder settings.
-- **Bulk Render**: trim and/or stitch every entry in a JSON array of
-  render-state objects (the same self-contained shape a `watch` run or
-  Offline's "Export to JSON" writes) in one pass — Trim, Stitch, and Full
-  Render (both, per entry) mirror `bulk-render`'s own `--mode` below. One
-  entry failing doesn't stop the rest; Trim/Full Render write each
-  entry's resolved Trimmed clip back into the file as they go, so a
-  later Stitch pass (a separate run) picks it up.
+- **Bulk Render**: an editable list of render-state entries (the same
+  self-contained shape a `watch` run or Offline's "Export to JSON"
+  writes), trimmed and/or stitched in one pass — Trim, Stitch, and Full
+  Render (both, per entry) mirror `bulk-render`'s own `--mode` below.
+  "Import…"/"Export…" load/save the whole list as JSON — an imported
+  entry only needs to specify the fields it actually cares about;
+  anything left out (a whole `trim`/`stitch` section included) is
+  filled in from the currently loaded config.json, the same defaults a
+  blank "+ Add entry…" starts with. "+ Add entry…"
+  or double-clicking a row opens an editor with the same fields as the
+  Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
+  start-end/Trim visually…, plus Advanced settings) minus the
+  Trim/Stitch buttons themselves. Select one or more rows (click, or
+  Ctrl/Shift-click for more than one) to enable "Delete" (removes them,
+  after confirming) and "Bulk Edit…" (Series/Trimmed clip/Output
+  path/Advanced settings for every selected entry at once, in a window
+  with no Main clip/Sermon start-end/Trim visually…/Load-Export of its
+  own — only a field you actually change gets applied; anything left
+  alone keeps each entry's own current value). Drag a row to reorder it
+  (a plain drag; Ctrl/Shift-click is how you multi-select instead). The list
+  shows Main clip/Output as just their filename (not the full path) and
+  a Series column between Output and Status. The Status column updates
+  live, color-coded, while a run is in progress: idle,
+  verifying (blue), ready (plain), check console (yellow), trimming/
+  stitching (blue), trimmed/stitched (green), failed (trim)/failed
+  (stitch) (red). Every entry is checked (Main clip/Trimmed clip exist,
+  Sermon start/end set and inside the Main clip's own length with start
+  before end, the trimmed range long enough for the Series' transition
+  if one's set, Series resolves, output paths are usable — whichever of
+  these the chosen mode actually needs) *before* anything starts —
+  verifying while an entry's own checks run, then ready or check console
+  per entry — so a bad entry anywhere in the list aborts the whole batch
+  immediately (check the console for why) instead of discovering it only
+  after burning time on every entry ahead of it; a failure once a run is
+  actually underway (an ffmpeg error, say) only skips that one entry and
+  keeps going. Trim/Stitch/Full Render always
+  run against the list's *current* in-GUI state (including any
+  unsaved Add/Edit/reorder) via a throwaway snapshot — nothing is
+  written back to an imported file unless you click Export.
 - **Series Manager**: named intro/outro/transition bundles (a name, an
   intro clip + duration, an outro clip + duration, a transition type +
   duration) — set one up once per sermon series, then just pick it from
@@ -283,9 +315,25 @@ current `trimmed_path`, whatever's already on record; an entry with none
 yet is skipped. `--mode full` does both, per entry, before moving to the
 next. Ignores `stitch.auto` on every mode — unlike `watch`/`render`, an
 explicit `bulk-render` invocation always does what its own `--mode` says.
-One entry failing (a missing file, a bad ffmpeg run) doesn't abort the
-rest: it's reported and skipped, and the process exits non-zero only at
-the end, with a summary of which entries failed.
+
+Every entry is validated up front, before any of them starts — `--mode
+trim`/`full` check that each entry's Main clip exists, Sermon start/end
+are set and land inside the Main clip's own length with start before
+end, and (only if a Series is set) that the resulting trimmed range is
+longer than that Series' own transition duration; `--mode stitch`
+checks that its Trimmed clip exists and its Series resolves; `--mode
+full` checks the same as `stitch` except Trimmed clip (it won't exist
+yet — trim produces it); every mode checks its own output path is
+usable. Each entry prints a "verifying" status line while its checks
+run, then "ready" or "check_console" depending on the result — the
+GUI's Bulk Render tab shows these live, color-coded, in its Status
+column. If any entry fails these checks, the whole run aborts
+immediately (nothing is started at all) with a summary of which entries
+and why. Once a run is actually underway, one entry failing at that
+point (a missing file that slipped past validation somehow, a bad
+ffmpeg run) doesn't abort the rest: it's reported and skipped, and the
+process exits non-zero only at the end, with a summary of which entries
+failed.
 
 ## Tests
 

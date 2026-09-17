@@ -68,3 +68,28 @@ def test_close_cleans_up_temp_directory(trim_window):
     assert tmpdir.exists()
     trim_window._close()
     assert not tmpdir.exists()
+
+
+def test_apply_calls_a_custom_on_apply_callback(app, sample_video, pump):
+    """InteractiveTrimWindow no longer hardcodes writing to the Offline
+    tab's own st_start/st_end (see the default callback
+    App._open_interactive_trim() passes, covered by
+    test_apply_writes_back_to_offline_fields_and_closes above) — this is
+    what lets BulkEntryEditWindow reuse the same window for its own,
+    unrelated local start/end vars."""
+    captured = {}
+    win = gui.InteractiveTrimWindow(
+        app, sample_video, 0.0, 0.0,
+        on_apply=lambda s, e: captured.update(start=s, end=e),
+    )
+    pump(lambda: win.duration is not None and len(win._thumb_images) == gui.TRIM_THUMBS, timeout=30)
+    win.start, win.end = 3.0, 7.0
+
+    win._apply()
+
+    assert captured == {"start": 3.0, "end": 7.0}
+    assert win.winfo_exists() == 0
+    # The default (Offline tab) behavior is a completely separate
+    # callback — this custom one must not also touch st_start/st_end,
+    # which should still show their untouched default.
+    assert app.vars["st_start"].get() == "00:00:00.000"
