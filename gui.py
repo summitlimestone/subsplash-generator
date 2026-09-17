@@ -2247,11 +2247,17 @@ class App(tk.Tk):
     def _refresh_bulk_render_tree(self, preserve_status: bool = False):
         """Rebuilds the Bulk Render tab's Treeview from self.bulk_states —
         call after any change to it (Import, Add/Edit/reorder, or a run
-        finishing). `preserve_status=True` (only passed right after a run
-        completes — see _on_process_exit()) restyles each row from
-        self._bulk_run_status instead of resetting it to plain "idle";
-        every other caller means the data genuinely changed, so any
-        earlier run's status no longer applies."""
+        finishing). `preserve_status=True` restyles each row from
+        self._bulk_run_status instead of resetting it to plain "idle" —
+        passed by everything except Import (see _import_bulk_states()):
+        Add/Edit (BulkEntryEditWindow._save()), reorder
+        (_on_bulk_render_drag_end()), and a run finishing
+        (_on_process_exit()) all leave a row's Status exactly as it was;
+        only an actual job run (or importing a different list entirely,
+        which makes any prior status meaningless) changes it. A row past
+        the end of self._bulk_run_status (a newly Added entry, or one a
+        just-finished run never got to) simply has no prior status to
+        preserve and comes back idle."""
         self.bulk_render_tree.delete(*self.bulk_render_tree.get_children())
         if not preserve_status:
             self._bulk_run_status = []
@@ -4135,7 +4141,14 @@ class BulkEntryEditWindow(tk.Toplevel):
             self.app.bulk_states.append(state)
         else:
             self.app.bulk_states[self.index] = state
-        self.app._refresh_bulk_render_tree()
+        # preserve_status=True: editing (or adding) an entry doesn't run
+        # anything, so every other row's Status should read exactly as
+        # it did before — only an actual job run changes it. A newly
+        # appended entry (self.index is None) has no prior status to
+        # preserve and naturally comes back idle (see
+        # _refresh_bulk_render_tree()'s own padding for a row past the
+        # end of self._bulk_run_status).
+        self.app._refresh_bulk_render_tree(preserve_status=True)
         self.destroy()
 
     def _export_to_json(self):

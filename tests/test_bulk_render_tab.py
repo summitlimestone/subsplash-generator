@@ -206,6 +206,39 @@ def test_editing_and_saving_updates_the_entry_and_tree(app):
     assert app.bulk_render_tree.item("0", "values")[2] == "/edited_final.mp4"
 
 
+def test_editing_an_entry_does_not_change_any_rows_status(app):
+    _load(app, _make_states(n=3))
+    app._handle_bulk_render_line("[bulk-render] status entry=1 state=stitched")
+    app._handle_bulk_render_line("[bulk-render] status entry=2 state=failed_stitch")
+    app.update()
+    app._on_bulk_render_double_click(FakeEvent(_row_y(app, "0")))
+    editor = next(w for w in app.winfo_children() if isinstance(w, gui.BulkEntryEditWindow))
+
+    editor.output_var.set("/edited_final.mp4")
+    editor._save()
+
+    # The edited row's own status, and every other row's, is untouched —
+    # only an actual job run changes Status, never an edit.
+    assert app.bulk_render_tree.item("0", "values")[-1] == "stitched"
+    assert app.bulk_render_tree.item("1", "values")[-1] == "failed (stitch)"
+    assert app.bulk_render_tree.item("2", "values")[-1] == "idle"
+
+
+def test_adding_an_entry_leaves_existing_rows_status_alone(app):
+    _load(app, _make_states(n=2))
+    app._handle_bulk_render_line("[bulk-render] status entry=1 state=trimmed")
+
+    app._add_bulk_entry()
+    editor = next(w for w in app.winfo_children() if isinstance(w, gui.BulkEntryEditWindow))
+    editor.recording_var.set("/new_rec.mp4")
+    editor._save()
+
+    assert app.bulk_render_tree.item("0", "values")[-1] == "trimmed"
+    assert app.bulk_render_tree.item("1", "values")[-1] == "idle"
+    # The brand-new third row has no prior run to reflect, so it's idle.
+    assert app.bulk_render_tree.item("2", "values")[-1] == "idle"
+
+
 def test_double_click_outside_any_row_does_nothing(app):
     _load(app, _make_states(n=1))
     app.update()
