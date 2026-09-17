@@ -160,6 +160,16 @@ BULK_STATUS_DISPLAY = {
     "failed_stitch": ("failed (stitch)", "danger"),
 }
 
+
+def _bulk_filename(path: str | None) -> str:
+    """Just the filename for the Bulk Render tab's Main clip/Output
+    columns — the list is meant to be scanned at a glance, and a run of
+    entries usually shares the same directory anyway, so the full path
+    is mostly noise there (still the real value used for the actual
+    run/validation/editor — this is display-only, see
+    _refresh_bulk_render_tree())."""
+    return Path(path).name if path else ""
+
 # service_video.py's internal state machine names, relabeled for display —
 # names not listed here (WAIT_RECORD_START etc.) show as-is.
 WATCH_STATE_LABELS = {
@@ -2175,15 +2185,18 @@ class App(tk.Tk):
         ttk.Button(load_export_row, text="Export…", command=self._export_bulk_states).pack(side="left", padx=(8, 0))
 
         self.bulk_render_tree = ttk.Treeview(
-            frame, columns=("index", "recording", "output", "status"), show="headings", selectmode="browse",
+            frame, columns=("index", "recording", "output", "series", "status"),
+            show="headings", selectmode="browse",
         )
         self.bulk_render_tree.heading("index", text="#", anchor="w")
-        self.bulk_render_tree.heading("recording", text="Recording", anchor="w")
+        self.bulk_render_tree.heading("recording", text="Main clip", anchor="w")
         self.bulk_render_tree.heading("output", text="Output", anchor="w")
+        self.bulk_render_tree.heading("series", text="Series", anchor="w")
         self.bulk_render_tree.heading("status", text="Status", anchor="w")
         self.bulk_render_tree.column("index", width=36, anchor="center")
-        self.bulk_render_tree.column("recording", width=300, anchor="w")
-        self.bulk_render_tree.column("output", width=220, anchor="w")
+        self.bulk_render_tree.column("recording", width=200, anchor="w")
+        self.bulk_render_tree.column("output", width=160, anchor="w")
+        self.bulk_render_tree.column("series", width=140, anchor="w")
         self.bulk_render_tree.column("status", width=110, anchor="w")
         self.bulk_render_tree.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.bulk_render_tree.bind("<Double-1>", self._on_bulk_render_double_click)
@@ -2266,11 +2279,12 @@ class App(tk.Tk):
             status_label, _status_key = (
                 self._bulk_run_status[i] if preserve_status and i < len(self._bulk_run_status) else idle
             )
+            stitch_cfg = state.get("stitch") or {}
             self.bulk_render_tree.insert(
                 "", "end", iid=str(i),
                 values=(
-                    i + 1, state.get("recording_path") or "",
-                    (state.get("stitch") or {}).get("output") or "", status_label,
+                    i + 1, _bulk_filename(state.get("recording_path")),
+                    _bulk_filename(stitch_cfg.get("output")), stitch_cfg.get("series") or "", status_label,
                 ),
             )
         # Treeview's own height is in rows, not pixels, with no built-in

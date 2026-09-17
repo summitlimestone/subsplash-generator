@@ -80,8 +80,10 @@ starter `config.json` next to the script on first run if none exists.
   or double-clicking a row opens an editor with the same fields as the
   Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
   start-end/Trim visually…, plus Advanced settings) minus the
-  Trim/Stitch buttons themselves. Drag a row to reorder it. The Status
-  column updates live, color-coded, while a run is in progress: idle,
+  Trim/Stitch buttons themselves. Drag a row to reorder it. The list
+  shows Main clip/Output as just their filename (not the full path) and
+  a Series column between Output and Status. The Status column updates
+  live, color-coded, while a run is in progress: idle,
   verifying (blue), ready (plain), check console (yellow), trimming/
   stitching (blue), trimmed/stitched (green), failed (trim)/failed
   (stitch) (red). Every entry is checked (Main clip/Trimmed clip exist,

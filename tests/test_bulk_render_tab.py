@@ -66,12 +66,19 @@ def test_loading_states_populates_the_tree_and_enables_buttons(app):
 
     rows = [app.bulk_render_tree.item(iid, "values") for iid in app.bulk_render_tree.get_children()]
     assert rows == [
-        ("1", "/rec0.mp4", "/final0.mp4", "idle"),
-        ("2", "/rec1.mp4", "/final1.mp4", "idle"),
+        ("1", "rec0.mp4", "final0.mp4", "Some Series", "idle"),
+        ("2", "rec1.mp4", "final1.mp4", "Some Series", "idle"),
     ]
     assert str(app.bulk_trim_btn["state"]) == "normal"
     assert str(app.bulk_stitch_btn["state"]) == "normal"
     assert str(app.bulk_full_btn["state"]) == "normal"
+
+
+def test_recording_and_output_columns_show_filename_only_not_full_path(app):
+    _load(app, _make_states(n=1))
+    values = app.bulk_render_tree.item("0", "values")
+    assert values[1] == "rec0.mp4"
+    assert values[2] == "final0.mp4"
 
 
 def test_tree_height_matches_row_count(app):
@@ -82,7 +89,17 @@ def test_tree_height_matches_row_count(app):
 
 
 def test_tree_has_no_trimmed_clip_column(app):
-    assert app.bulk_render_tree.cget("columns") == ("index", "recording", "output", "status")
+    assert app.bulk_render_tree.cget("columns") == ("index", "recording", "output", "series", "status")
+
+
+def test_recording_column_is_labeled_main_clip(app):
+    assert app.bulk_render_tree.heading("recording", "text") == "Main clip"
+
+
+def test_series_column_sits_between_output_and_status(app):
+    columns = app.bulk_render_tree.cget("columns")
+    assert columns.index("series") == columns.index("output") + 1
+    assert columns.index("status") == columns.index("series") + 1
 
 
 def test_status_is_the_last_column(app):
@@ -266,7 +283,7 @@ def test_editing_and_saving_updates_the_entry_and_tree(app):
     editor._save()
 
     assert app.bulk_states[0]["stitch"]["output"] == "/edited_final.mp4"
-    assert app.bulk_render_tree.item("0", "values")[2] == "/edited_final.mp4"
+    assert app.bulk_render_tree.item("0", "values")[2] == "edited_final.mp4"
 
 
 def test_editing_an_entry_does_not_change_any_rows_status(app):
@@ -367,7 +384,7 @@ def test_dragging_a_row_reorders_bulk_states(app):
     assert [s["recording_path"] for s in app.bulk_states] == ["/rec1.mp4", "/rec2.mp4", "/rec0.mp4"]
     # iids realign with the new list positions after a drag.
     assert list(app.bulk_render_tree.get_children()) == ["0", "1", "2"]
-    assert app.bulk_render_tree.item("0", "values")[1] == "/rec1.mp4"
+    assert app.bulk_render_tree.item("0", "values")[1] == "rec1.mp4"
 
 
 def test_a_plain_click_with_no_motion_does_not_reorder(app):
@@ -450,8 +467,8 @@ def test_status_color_coding_does_not_bleed_into_other_columns(app):
     _load(app, _make_states(n=1))
     app._handle_bulk_render_line("[bulk-render] status entry=1 state=failed_stitch")
     values = app.bulk_render_tree.item("0", "values")
-    assert values[1] == "/rec0.mp4"
-    assert values[2] == "/final0.mp4"
+    assert values[1] == "rec0.mp4"
+    assert values[2] == "final0.mp4"
     # Nothing about the tree row itself carries a foreground tag any more.
     assert app.bulk_render_tree.item("0", "tags") in ((), "")
 
