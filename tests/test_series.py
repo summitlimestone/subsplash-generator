@@ -205,15 +205,14 @@ def test_collect_config_carries_no_series_or_literal_fields(app):
         assert key not in cfg["stitch"], f"config.json's stitch section must not carry {key!r}"
 
 
-def test_load_config_does_not_touch_series_selection(app, tmp_path):
+def test_load_config_does_not_touch_series_selection(app):
     _make_series(app, "B")
     app.vars["stitch_series"].set("B")
     cfg = app.collect_config()
-    config_path = tmp_path / "roundtrip_config.json"
-    config_path.write_text(json.dumps(cfg))
+    gui.CONFIG_PATH.write_text(json.dumps(cfg))
 
     app.vars["stitch_series"].set("")
-    app.load_config(str(config_path))
+    app.load_config()
 
     # Nothing to restore — config.json never carried it — so the
     # dropdown simply stays however it already was (blank here).
