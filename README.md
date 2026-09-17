@@ -72,7 +72,11 @@ starter `config.json` next to the script on first run if none exists.
   self-contained shape a `watch` run or Offline's "Export to JSON"
   writes), trimmed and/or stitched in one pass — Trim, Stitch, and Full
   Render (both, per entry) mirror `bulk-render`'s own `--mode` below.
-  "Import…"/"Export…" load/save the whole list as JSON; "+ Add entry…"
+  "Import…"/"Export…" load/save the whole list as JSON — an imported
+  entry only needs to specify the fields it actually cares about;
+  anything left out (a whole `trim`/`stitch` section included) is
+  filled in from the currently loaded config.json, the same defaults a
+  blank "+ Add entry…" starts with. "+ Add entry…"
   or double-clicking a row opens an editor with the same fields as the
   Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
   start-end/Trim visually…, plus Advanced settings) minus the

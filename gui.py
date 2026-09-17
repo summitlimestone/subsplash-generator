@@ -2327,7 +2327,11 @@ class App(tk.Tk):
         if not (isinstance(data, list) and all(isinstance(s, dict) for s in data)):
             messagebox.showerror("Import", f"{path} must contain a JSON array of render-state objects.")
             return
-        self.bulk_states = data
+        # Each entry only needs to specify what it actually cares about —
+        # anything left out (a whole "trim"/"stitch" section included)
+        # is filled in from the currently loaded config.json, same as a
+        # blank "+ Add entry…" would use (see _fill_bulk_entry_defaults()).
+        self.bulk_states = [_fill_bulk_entry_defaults(self, s) for s in data]
         self._bulk_states_path = path
         self._refresh_bulk_render_tree()
         self._log(f"[gui] imported {len(data)} bulk render entries from {path}")
@@ -3807,6 +3811,31 @@ def _blank_bulk_entry(app: "App") -> dict:
             "fast_copy": False, "encoder": encoder, "encoder_preset": encoder_preset,
         },
     }
+
+
+def _fill_bulk_entry_defaults(app: "App", entry: dict) -> dict:
+    """Fills whatever a single imported bulk-render entry leaves out
+    with the same config.json-derived defaults "+ Add entry…" starts a
+    blank one with (see _blank_bulk_entry()) — used by
+    App._import_bulk_states() so a hand-written or trimmed-down import
+    file only has to specify the fields it actually cares about. A
+    field the entry *does* set always wins, including an explicit null
+    (e.g. trimmed_path: null really does mean "not trimmed yet", same
+    as a blank entry's own default there) — only a field missing
+    entirely gets filled in. trim/stitch are merged key by key, not
+    replaced wholesale, so leaving out just one of their fields (say
+    "crf") doesn't also lose a sibling one the entry *did* set (say
+    "encoder")."""
+    defaults = _blank_bulk_entry(app)
+    merged = dict(defaults)
+    for key in ("recording_path", "raw_begin_offset", "raw_end_offset", "trimmed_path"):
+        if key in entry:
+            merged[key] = entry[key]
+    for section in ("trim", "stitch"):
+        merged_section = dict(defaults[section])
+        merged_section.update(entry.get(section) or {})
+        merged[section] = merged_section
+    return merged
 
 
 class BulkEntryEditWindow(tk.Toplevel):

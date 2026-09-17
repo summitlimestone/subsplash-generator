@@ -107,6 +107,69 @@ def test_import_populates_the_list(app, tmp_path, monkeypatch):
     assert app._bulk_states_path == str(path)
 
 
+def test_import_fills_missing_fields_from_the_currently_loaded_config(app, tmp_path, monkeypatch):
+    app.vars["trim_crf"].set(17)
+    app.vars["encoder"].set("libx264")
+    app.vars["trim_fast_copy"].set(False)
+    app.vars["stitch_output"].set("configured_final.mp4")
+
+    path = tmp_path / "states.json"
+    # A hand-written, deliberately sparse entry — no trim section at
+    # all, and a stitch section that only sets series/output.
+    path.write_text(json.dumps([{
+        "recording_path": "/rec0.mp4", "raw_begin_offset": 1.0, "raw_end_offset": 4.0,
+        "stitch": {"series": "Some Series"},
+    }]))
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **_k: str(path))
+
+    app._import_bulk_states()
+
+    entry = app.bulk_states[0]
+    # Explicitly set fields are kept as-is.
+    assert entry["recording_path"] == "/rec0.mp4"
+    assert entry["stitch"]["series"] == "Some Series"
+    # Missing ones come from the currently loaded config, not a
+    # hardcoded fallback.
+    assert entry["trim"]["crf"] == 17
+    assert entry["trim"]["encoder"] == "libx264"
+    assert entry["trim"]["fast_copy"] is False
+    assert entry["stitch"]["crf"] == 17
+    # stitch.output was left unset by the import too — falls back to
+    # config's stitch_output, not _blank_bulk_entry()'s own literal
+    # "final.mp4" default.
+    assert entry["stitch"]["output"] == "configured_final.mp4"
+
+
+def test_import_does_not_override_fields_the_entry_actually_sets(app, tmp_path, monkeypatch):
+    app.vars["trim_crf"].set(17)
+
+    path = tmp_path / "states.json"
+    path.write_text(json.dumps([{
+        "recording_path": "/rec0.mp4", "raw_begin_offset": 1.0, "raw_end_offset": 4.0,
+        "trim": {"crf": 40}, "stitch": {"series": "Some Series"},
+    }]))
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **_k: str(path))
+
+    app._import_bulk_states()
+
+    # The entry's own crf (40) wins over the config's (17) — only a
+    # field left out entirely gets the config default.
+    assert app.bulk_states[0]["trim"]["crf"] == 40
+
+
+def test_import_keeps_an_explicit_null_rather_than_defaulting_it(app, tmp_path, monkeypatch):
+    path = tmp_path / "states.json"
+    path.write_text(json.dumps([{
+        "recording_path": None, "raw_begin_offset": None, "raw_end_offset": None,
+        "trimmed_path": None, "trim": {}, "stitch": {},
+    }]))
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **_k: str(path))
+
+    app._import_bulk_states()
+
+    assert app.bulk_states[0]["recording_path"] is None
+
+
 def test_import_cancelled_dialog_leaves_state_alone(app, monkeypatch):
     monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **_k: "")
     app._import_bulk_states()
@@ -464,3 +527,30 @@ def test_blank_bulk_entry_reads_defaults_from_app_vars(app):
     assert entry["trim"]["encoder"] == "libx264"
     assert entry["stitch"]["encoder"] == "libx264"
     assert entry["trim"]["fast_copy"] is False
+
+
+# -- _fill_bulk_entry_defaults() ---------------------------------------------
+
+def test_fill_bulk_entry_defaults_fills_missing_sections_entirely(app):
+    app.vars["trim_crf"].set(17)
+    entry = gui._fill_bulk_entry_defaults(app, {"recording_path": "/rec.mp4"})
+    assert entry["trim"]["crf"] == 17
+    assert entry["stitch"]["crf"] == 17
+    assert entry["recording_path"] == "/rec.mp4"
+
+
+def test_fill_bulk_entry_defaults_merges_a_partial_section(app):
+    app.vars["trim_crf"].set(17)
+    app.vars["encoder"].set("libx264")
+    entry = gui._fill_bulk_entry_defaults(app, {"trim": {"crf": 40}})
+    # crf came from the import; encoder (left out) came from config.
+    assert entry["trim"]["crf"] == 40
+    assert entry["trim"]["encoder"] == "libx264"
+
+
+def test_fill_bulk_entry_defaults_keeps_an_explicit_null(app):
+    # Same result as leaving it out (the default is None too), but
+    # exercises the "key present with a null value" branch specifically
+    # rather than the "key missing entirely" one.
+    entry = gui._fill_bulk_entry_defaults(app, {"recording_path": None})
+    assert entry["recording_path"] is None
