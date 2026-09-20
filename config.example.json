@@ -2,8 +2,7 @@
   "api": {
     "enabled": false,
     "host": "127.0.0.1",
-    "port": 8765,
-    "password": ""
+    "port": 8765
   },
   "propresenter": {
     "host": "192.168.1.50",

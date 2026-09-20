@@ -101,7 +101,7 @@ def default_config() -> dict:
             "enabled": False,
             "host": "127.0.0.1",
             "port": 8765,
-            "password": "",
+            "token": secrets.token_urlsafe(24),
         },
         "propresenter": {
             "host": "",
@@ -583,16 +583,17 @@ TIMESTAMP_HELP = (
 
 
 API_HELP = (
-    "Optional HTTP API for marking start/end remotely. Runs only during Watch; "
-    "docs at /swagger. Requires pip install fastapi uvicorn."
+    "Optional HTTP API and web control panel — the same five buttons as Mini "
+    "controls, loadable as an OBS custom browser dock. Docs at /swagger. "
+    "Requires pip install fastapi uvicorn."
 )
 
-API_PASSWORD_HELP = (
-    "HTTP Basic Auth password required on every request — any username is "
-    "accepted, only the password is checked (there's no user management "
-    "here). Leave blank to run with no authentication at all; anyone who "
-    "can reach host:port could mark start/end — a clear warning is logged "
-    "each time Watch starts with this blank."
+API_TOKEN_HELP = (
+    "Secret required on every request — sent as an Authorization: Bearer "
+    "header, or as ?token=... in the URL (what a browser dock needs). "
+    "Generated automatically; Regenerate replaces it (Apply to take "
+    "effect, then Copy dock URL again). \"Copy dock URL\" puts the full "
+    "control-panel address, token included, on the clipboard."
 )
 
 LIVE_TRIM_HELP = (
@@ -763,30 +764,111 @@ class ProcessRunner:
                 pass
 
 
+DOCK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Service Video</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 12px; background: __BG__; color: __TEXT__;
+         font: 14px system-ui, sans-serif; }
+  #status { font-size: 22px; font-weight: 700; margin: 0 0 12px; min-height: 1.3em; }
+  button, select { width: 100%; box-sizing: border-box; padding: 10px; margin: 0 0 8px;
+         font: inherit; color: __TEXT__; background: __SURFACE__; border: 1px solid __BORDER__;
+         border-radius: 4px; cursor: pointer; }
+  button.accent { background: __ACCENT__; color: __ACCENT_CONTRAST__; font-weight: 700; }
+  button:disabled { background: __DISABLED__; color: __MUTED__; cursor: default; }
+  label { display: block; margin: 8px 0 4px; font-weight: 600; }
+  #error { color: __DANGER__; min-height: 1.2em; margin-top: 4px; }
+</style></head><body>
+<div id="status">…</div>
+<button id="watch" class="accent" data-post="/watch/start">Start Watch</button>
+<button id="mark_start" data-post="/mark/start">Mark Sermon Start</button>
+<button id="mark_end" data-post="/mark/end">Mark Sermon End</button>
+<button id="trim" data-post="/trim">Trim</button>
+<label for="series">Series</label>
+<select id="series"></select>
+<button id="stitch" data-post="/stitch">Stitch</button>
+<div id="error"></div>
+<script>
+const token = new URLSearchParams(location.search).get("token") || "";
+const headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+const $ = id => document.getElementById(id);
+const setError = msg => { $("error").textContent = msg || ""; };
+
+async function api(method, path, body) {
+  const resp = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  if (resp.status === 401) throw new Error("Missing or incorrect token — copy the dock URL from Config > API again.");
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.detail || ("HTTP " + resp.status));
+  return data;
+}
+
+let lastSeries = "";
+async function refresh() {
+  try {
+    const s = await api("GET", "/state");
+    if (!s.buttons) return;
+    $("status").textContent = s.status;
+    $("status").style.color = s.status_color;
+    for (const id of ["watch", "mark_start", "mark_end", "trim", "stitch"]) $(id).disabled = !s.buttons[id];
+    const sel = $("series"), key = s.series.join("\\n");
+    if (key !== lastSeries) {
+      lastSeries = key;
+      sel.innerHTML = "";
+      for (const name of ["", ...s.series]) {
+        const o = document.createElement("option"); o.value = name; o.textContent = name || "(select a series)"; sel.appendChild(o);
+      }
+    }
+    if (document.activeElement !== sel) sel.value = s.selected_series;
+    setError("");
+  } catch (e) { setError(e.message); }
+}
+
+for (const btn of document.querySelectorAll("button[data-post]")) {
+  btn.addEventListener("click", async () => {
+    try { await api("POST", btn.dataset.post); setError(""); } catch (e) { setError(e.message); }
+    refresh();
+  });
+}
+$("series").addEventListener("change", async () => {
+  try { await api("PUT", "/series", { name: $("series").value }); setError(""); } catch (e) { setError(e.message); }
+  refresh();
+});
+refresh();
+setInterval(refresh, 1000);
+</script></body></html>
+""".replace("__BG__", PALETTE["bg"]).replace("__TEXT__", PALETTE["text"]).replace(
+    "__SURFACE__", PALETTE["surface"]).replace("__BORDER__", PALETTE["border"]).replace(
+    "__ACCENT__", PALETTE["accent"]).replace("__ACCENT_CONTRAST__", PALETTE["accent_contrast"]).replace(
+    "__DISABLED__", PALETTE["button_disabled_bg"]).replace("__MUTED__", PALETTE["muted"]).replace(
+    "__DANGER__", PALETTE["danger"])
+
+
 def _build_api_app(app: "App"):
     """Builds the FastAPI app backing the control API — see App's own
     _start_api()/_stop_api()/_sync_api_to_config(). Runs all the time
     the "Enabled" checkbox (Config > API) is on, independent of any one
-    `watch` subprocess: POST /mark/start, POST /mark/end, and GET /state
-    proxy to whichever `watch` subprocess (if any) is currently running,
-    the same way the GUI's own Mark Sermon Start/End buttons already do.
-    Interactive Swagger docs are served at /swagger.
+    `watch` subprocess. Every action here is the same one a Live tab /
+    Mini controls button already performs — each endpoint checks that
+    button's own enabled state (the single source of truth for "is this
+    valid right now") and then calls the exact same handler, so the API
+    and the GUI can never disagree about what's allowed. GET / serves a
+    small web control panel over these endpoints (see DOCK_HTML), meant
+    to be loaded as an OBS custom browser dock. Interactive Swagger docs
+    are served at /swagger.
 
-    Marks are synchronous: each is validated against the GUI's own live-
-    tracked state (App._live_mark_applicable(), the same conditions that
-    already enable/disable the Mark Sermon Start/End buttons themselves)
-    before being sent, and the HTTP response reflects the real outcome —
-    200 once actually applied, 409 if there's no active watch session or
-    the mark doesn't apply in the current state (e.g. end before start)
-    — rather than always succeeding and leaving the caller to separately
-    poll GET /state to find out.
+    Actions are synchronous: each returns 200 once actually applied, or
+    409 if it doesn't apply in the current state — rather than always
+    succeeding and leaving the caller to separately poll GET /state to
+    find out. (If a handler needs to pop a modal dialog in the GUI — e.g.
+    a validation error — the request times out with 503 instead, and the
+    dialog waits for whoever's at the GUI.)
 
-    HTTP Basic Auth, gated on api_password alone (no separate username —
-    only a single shared password was asked for, not real user
-    management): every route requires it via the app-level
-    `dependencies` UNLESS the password is empty, in which case nothing
-    here is protected at all — logged loudly once, since that's a real
-    thing to know about an API with a network listener.
+    Token auth (replaces the old HTTP Basic password): every route
+    requires the shared token from api.token, either as an
+    `Authorization: Bearer <token>` header or a `?token=<token>` query
+    parameter (which is what a browser dock, unable to set headers on
+    its first page load, needs) via the app-level `dependencies`.
 
     FastAPI's own auto-generated docs/OpenAPI-schema routes are exempt
     from app-level `dependencies` (a known FastAPI quirk, confirmed by
@@ -794,35 +876,37 @@ def _build_api_app(app: "App"):
     with app-level dependencies set), so both are disabled here
     (docs_url=None, openapi_url=None) and reimplemented as plain routes
     of our own below, which aren't exempt."""
-    from fastapi import Depends, FastAPI, HTTPException
+    from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.openapi.docs import get_swagger_ui_html
     from fastapi.openapi.utils import get_openapi
-    from fastapi.security import HTTPBasic, HTTPBasicCredentials
+    from fastapi.responses import HTMLResponse
+    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+    from pydantic import BaseModel
 
-    password = app.vars["api_password"].get()
-    security = HTTPBasic()
+    token = app.vars["api_token"].get().strip()
+    bearer = HTTPBearer(auto_error=False)
 
-    def require_password(credentials: HTTPBasicCredentials = Depends(security)):
+    def supplied_token(request: Request, credentials: HTTPAuthorizationCredentials | None) -> str:
+        return (credentials.credentials if credentials else None) or request.query_params.get("token") or ""
+
+    def require_token(
+        request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    ):
         # secrets.compare_digest(), not ==, so a wrong guess can't be
-        # narrowed down by how long the comparison took to fail.
-        if not secrets.compare_digest(credentials.password, password):
-            raise HTTPException(status_code=401, detail="Incorrect password", headers={"WWW-Authenticate": "Basic"})
-
-    if password:
-        app_dependencies = [Depends(require_password)]
-    else:
-        app_dependencies = []
-        app._log(
-            "[gui] api_password is empty — the control API is running with NO "
-            "authentication; anyone who can reach it can mark start/end. Set "
-            "Config > API > Password to require one."
-        )
+        # narrowed down by how long the comparison took to fail. Bytes,
+        # since compare_digest rejects non-ASCII str. An empty configured
+        # token never matches anything (not even an empty guess).
+        supplied = supplied_token(request, credentials)
+        if not token or not secrets.compare_digest(supplied.encode(), token.encode()):
+            raise HTTPException(
+                status_code=401, detail="Missing or incorrect token", headers={"WWW-Authenticate": "Bearer"},
+            )
 
     fastapi_app = FastAPI(
         title="sclc-subsplash-generator control API",
-        description="Mark the sermon's start/end and check the live watch state.",
+        description="Drive the Live tab's workflow and check the live watch state.",
         docs_url=None, openapi_url=None, redoc_url=None,
-        dependencies=app_dependencies,
+        dependencies=[Depends(require_token)],
     )
 
     @fastapi_app.get("/openapi.json", include_in_schema=False)
@@ -833,8 +917,20 @@ def _build_api_app(app: "App"):
         )
 
     @fastapi_app.get("/swagger", include_in_schema=False)
-    def swagger_ui():
-        return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{fastapi_app.title} — Swagger UI")
+    def swagger_ui(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
+        # The page itself fetches /openapi.json with no headers, so the
+        # token it was loaded with rides along in that URL.
+        supplied = supplied_token(request, credentials)
+        return get_swagger_ui_html(
+            openapi_url=f"/openapi.json?token={supplied}", title=f"{fastapi_app.title} — Swagger UI",
+        )
+
+    @fastapi_app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    def dock_page():
+        return DOCK_HTML
+
+    def enabled(btn) -> bool:
+        return str(btn["state"]) == "normal"
 
     def do_mark(which: str) -> dict:
         """Runs on Tk's main thread (see App._call_on_main_thread()):
@@ -851,13 +947,16 @@ def _build_api_app(app: "App"):
             app._mark_sermon_end()
         return {"ok": True}
 
-    def handle_mark(which: str):
-        result = app._call_on_main_thread(lambda: do_mark(which))
+    def run_on_main(action) -> dict:
+        result = app._call_on_main_thread(action)
         if result is None:
             raise HTTPException(status_code=503, detail="could not confirm — try GET /state")
         if not result["ok"]:
             raise HTTPException(status_code=409, detail=result["reason"])
         return {"status": "applied"}
+
+    def handle_mark(which: str):
+        return run_on_main(lambda: do_mark(which))
 
     @fastapi_app.post("/mark/start", summary="Mark sermon start")
     def mark_start():
@@ -874,13 +973,89 @@ def _build_api_app(app: "App"):
         before a start has ever been marked."""
         return handle_mark("end")
 
+    @fastapi_app.post("/watch/start", summary="Start Watch")
+    def watch_start():
+        """Equivalent to clicking the GUI's "Start Watch" button. 409 if
+        that button is disabled (a run is already in progress)."""
+        def action():
+            if not enabled(app.start_watch_btn):
+                return {"ok": False, "reason": "Start Watch isn't available right now (a run is in progress?)"}
+            app._run_watch()
+            return {"ok": True}
+        return run_on_main(action)
+
+    @fastapi_app.post("/trim", summary="Trim")
+    def trim():
+        """Equivalent to clicking the GUI's Live-tab "Trim" button. 409
+        if it's disabled (no end marked yet, or a Trim is already
+        running)."""
+        def action():
+            if not enabled(app.live_trim_btn):
+                return {"ok": False, "reason": "Trim isn't available right now (mark an end first)"}
+            app._trim_live()
+            return {"ok": True}
+        return run_on_main(action)
+
+    class SeriesBody(BaseModel):
+        name: str
+
+    class StitchBody(BaseModel):
+        series: str | None = None
+
+    def select_series(name: str) -> str | None:
+        """Main-thread: sets the Live tab's Series dropdown. Returns an
+        error message, or None if `name` was applied."""
+        if name not in app._series_names():
+            return f"unknown series {name!r}" if name else "select a series first"
+        app.vars["stitch_series"].set(name)
+        return None
+
+    @fastapi_app.get("/series", summary="Selectable series")
+    def get_series():
+        """Series names the Live tab's dropdown offers (hidden ones
+        excluded), plus which one is currently selected."""
+        return app._call_on_main_thread(
+            lambda: {"series": app._series_names(), "selected": app.vars["stitch_series"].get()}
+        ) or {}
+
+    @fastapi_app.put("/series", summary="Select a series")
+    def put_series(body: SeriesBody):
+        """Sets the Live tab's Series dropdown (what Stitch uses), same
+        as picking it in the GUI. 409 for an unknown name."""
+        def action():
+            error = select_series(body.name)
+            return {"ok": False, "reason": error} if error else {"ok": True}
+        return run_on_main(action)
+
+    @fastapi_app.post("/stitch", summary="Stitch")
+    def stitch(body: StitchBody | None = None):
+        """Equivalent to clicking the GUI's Live-tab "Stitch" button,
+        using whichever series is currently selected there — or, if
+        `series` is given, selecting it first. 409 if Stitch is disabled
+        (Trim hasn't produced a clip yet) or no valid series is
+        selected."""
+        def action():
+            if not enabled(app.live_stitch_btn):
+                return {"ok": False, "reason": "Stitch isn't available right now (run Trim first)"}
+            if body and body.series is not None:
+                error = select_series(body.series)
+            else:
+                error = select_series(app.vars["stitch_series"].get().strip())
+            if error:
+                return {"ok": False, "reason": error}
+            app._stitch_live()
+            return {"ok": True}
+        return run_on_main(action)
+
     @fastapi_app.get("/state", summary="Current watch state")
     def get_state():
         """A snapshot of what the GUI currently knows: the state-machine
         state ("idle" if no watch run is active), whether OBS is
         actively recording, whether begin/end have been marked, the
-        latest Trim/Stitch status (idle/running/done/failed), and the
-        render-state file's path."""
+        latest Trim/Stitch status (idle/running/done/failed), the
+        render-state file's path — plus what the web control panel
+        needs: the status line's text and color, which of the five
+        buttons are currently enabled, and the series list/selection."""
         def snapshot():
             raw_state = app._live_raw_state
             return {
@@ -891,6 +1066,17 @@ def _build_api_app(app: "App"):
                 "trim_status": app._live_trim_status,
                 "stitch_status": app._live_stitch_status,
                 "render_state_path": app.render_state_var.get(),
+                "status": app.watch_state_var.get(),
+                "status_color": str(app.watch_status_label.cget("foreground")),
+                "buttons": {
+                    "watch": enabled(app.start_watch_btn),
+                    "mark_start": enabled(app.mark_start_btn),
+                    "mark_end": enabled(app.mark_end_btn),
+                    "trim": enabled(app.live_trim_btn),
+                    "stitch": enabled(app.live_stitch_btn),
+                },
+                "series": app._series_names(),
+                "selected_series": app.vars["stitch_series"].get(),
             }
         return app._call_on_main_thread(snapshot) or {}
 
@@ -2685,10 +2871,10 @@ class App(tk.Tk):
         Config > API's current fields — called by api_enabled's own
         trace (so ticking/unticking the checkbox takes effect
         immediately) and after every config save/autosave (so an edited
-        host/port/password takes effect without needing an explicit
+        host/port/token takes effect without needing an explicit
         untick-retick)."""
         if self.vars["api_enabled"].get():
-            self._stop_api()  # restart-in-place if already running, picking up new host/port/password
+            self._stop_api()  # restart-in-place if already running, picking up new host/port/token
             self._start_api()
         else:
             self._stop_api()
@@ -2708,7 +2894,34 @@ class App(tk.Tk):
         self._api_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
         self._api_thread = threading.Thread(target=self._api_server.run, daemon=True)
         self._api_thread.start()
-        self._log(f"[gui] control API listening on http://{host}:{port} — Swagger UI: http://{host}:{port}/swagger")
+        self._log(
+            f"[gui] control API listening on http://{host}:{port} — web control panel "
+            "(OBS dock): Config > API > Copy dock URL; Swagger UI: /swagger (token required)"
+        )
+
+    def _api_dock_url(self) -> str:
+        """The web control panel's full address, token included — what
+        Config > API's "Copy dock URL" puts on the clipboard, for pasting
+        into OBS's Docks > Custom Browser Docks. A wildcard bind address
+        (0.0.0.0/::) isn't itself a connectable host, so it's swapped for
+        loopback."""
+        host = self.vars["api_host"].get().strip() or "127.0.0.1"
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
+        if ":" in host:
+            host = f"[{host}]"
+        port = self.vars["api_port"].get().strip() or "8765"
+        return f"http://{host}:{port}/?token={self.vars['api_token'].get().strip()}"
+
+    def _copy_api_dock_url(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._api_dock_url())
+        self._log("[gui] copied the web control panel URL (token included) to the clipboard")
+
+    def _regenerate_api_token(self):
+        # Just sets the field — takes effect on Apply/OK like any other
+        # Config change, at which point the API restarts with it.
+        self.vars["api_token"].set(secrets.token_urlsafe(24))
 
     def _stop_api(self):
         if self._api_server is not None:
@@ -2777,14 +2990,25 @@ class App(tk.Tk):
         trim = cfg.get("trim", {})
         stitch = cfg.get("stitch", {})
 
-        # host/port/password set *before* enabled: enabled has a trace
+        # An older config.json (which had api.password instead) or a
+        # hand-written one has no token yet — generate one and persist it
+        # right away, rather than leaving the API either unauthenticated
+        # or with an empty token nothing could ever match. Written before
+        # the fields below are populated so it's part of the "last
+        # saved" baseline, not a phantom unsaved change.
+        if not str(api.get("token") or "").strip():
+            api["token"] = secrets.token_urlsafe(24)
+            cfg["api"] = api
+            CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+        # host/port/token set *before* enabled: enabled has a trace
         # (see _sync_api_to_config()) that starts/restarts the API using
         # whatever these three currently hold, so they need to already be
         # this config's values by the time that fires, not the previous
         # config's (or a fresh window's defaults).
         self.vars["api_host"].set(api.get("host", "127.0.0.1"))
         self.vars["api_port"].set(str(api.get("port", 8765)))
-        self.vars["api_password"].set(api.get("password", ""))
+        self.vars["api_token"].set(api["token"])
         self.vars["api_enabled"].set(bool(api.get("enabled", False)))
 
         self.vars["pp_host"].set(pp.get("host", ""))
@@ -2886,7 +3110,7 @@ class App(tk.Tk):
                 "enabled": bool(v["api_enabled"].get()),
                 "host": v["api_host"].get().strip() or "127.0.0.1",
                 "port": to_int(v["api_port"].get().strip() or "8765", "API port"),
-                "password": v["api_password"].get(),
+                "token": v["api_token"].get().strip(),
             },
             "propresenter": {
                 # Host (and everything else here) is optional — see
@@ -5540,10 +5764,20 @@ class ConfigWindow(tk.Toplevel):
         app._labeled_entry(frame, 2, "Port", "api_port", width=10, col=2)
         app.vars["api_port"].set("8765")
 
-        api_pw_entry = app._labeled_entry(
-            frame, 3, "Password", "api_password", show="•", help_text=API_PASSWORD_HELP,
+        api_token_entry = app._labeled_entry(
+            frame, 3, "Token", "api_token", show="•", colspan=3, help_text=API_TOKEN_HELP,
         )
-        app._pw_entries.append(api_pw_entry)
+        # Read-only: the token is generated, never typed — a blank or
+        # hand-mangled one would either lock everything out or be trivially
+        # guessable. Still selectable/copyable.
+        api_token_entry.configure(state="readonly")
+        app._pw_entries.append(api_token_entry)
+        token_btns = ttk.Frame(frame)
+        token_btns.grid(row=4, column=1, columnspan=3, sticky="w", pady=3)
+        ttk.Button(token_btns, text="Regenerate", command=app._regenerate_api_token).pack(side="left")
+        ttk.Button(token_btns, text="Copy dock URL", command=app._copy_api_dock_url).pack(
+            side="left", padx=(6, 0)
+        )
 
     # -- ProPresenter tab: connection + slide matching + Learn -------------
 
