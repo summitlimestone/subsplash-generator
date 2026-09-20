@@ -33,9 +33,10 @@ python gui.py
 ```
 
 Runs the same `service_video.py` CLI as a subprocess per action; the
-console pane shows its output (also mirrored to a log file, see Config >
-General), with a progress bar tracking ffmpeg's own steps. Creates a
-starter `config.json` next to the script on first run if none exists.
+console pane shows its output (also mirrored to a log file — see
+"Config reference" below for where), with a progress bar tracking
+ffmpeg's own steps. Creates a starter `config.json` on first run if none
+exists yet at its hardcoded location (see "Config reference" below).
 
 **Main window**: Live/Offline/Bulk Render/Series Manager tabs plus the console.
 - **Live**: a Series dropdown in place of typing intro/outro paths (see
@@ -68,13 +69,45 @@ starter `config.json` next to the script on first run if none exists.
   fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
   "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
   (and its Target LUFS), and Encoder settings.
-- **Bulk Render**: trim and/or stitch every entry in a JSON array of
-  render-state objects (the same self-contained shape a `watch` run or
-  Offline's "Export to JSON" writes) in one pass — Trim, Stitch, and Full
-  Render (both, per entry) mirror `bulk-render`'s own `--mode` below. One
-  entry failing doesn't stop the rest; Trim/Full Render write each
-  entry's resolved Trimmed clip back into the file as they go, so a
-  later Stitch pass (a separate run) picks it up.
+- **Bulk Render**: an editable list of render-state entries (the same
+  self-contained shape a `watch` run or Offline's "Export to JSON"
+  writes), trimmed and/or stitched in one pass — Trim, Stitch, and Full
+  Render (both, per entry) mirror `bulk-render`'s own `--mode` below.
+  "Import…"/"Export…" load/save the whole list as JSON — an imported
+  entry only needs to specify the fields it actually cares about;
+  anything left out (a whole `trim`/`stitch` section included) is
+  filled in from the currently loaded config.json, the same defaults a
+  blank "+ Add entry…" starts with. "+ Add entry…"
+  or double-clicking a row opens an editor with the same fields as the
+  Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
+  start-end/Trim visually…, plus Advanced settings) minus the
+  Trim/Stitch buttons themselves. Select one or more rows (click, or
+  Ctrl/Shift-click for more than one) to enable "Delete" (removes them,
+  after confirming) and "Bulk Edit…" (Series/Trimmed clip/Output
+  path/Advanced settings for every selected entry at once, in a window
+  with no Main clip/Sermon start-end/Trim visually…/Load-Export of its
+  own — only a field you actually change gets applied; anything left
+  alone keeps each entry's own current value). Drag a row to reorder it
+  (a plain drag; Ctrl/Shift-click is how you multi-select instead). The list
+  shows Main clip/Output as just their filename (not the full path) and
+  a Series column between Output and Status. The Status column updates
+  live, color-coded, while a run is in progress: idle,
+  verifying (blue), ready (plain), check console (yellow), trimming/
+  stitching (blue), trimmed/stitched (green), failed (trim)/failed
+  (stitch) (red). Every entry is checked (Main clip/Trimmed clip exist,
+  Sermon start/end set and inside the Main clip's own length with start
+  before end, the trimmed range long enough for the Series' transition
+  if one's set, Series resolves, output paths are usable — whichever of
+  these the chosen mode actually needs) *before* anything starts —
+  verifying while an entry's own checks run, then ready or check console
+  per entry — so a bad entry anywhere in the list aborts the whole batch
+  immediately (check the console for why) instead of discovering it only
+  after burning time on every entry ahead of it; a failure once a run is
+  actually underway (an ffmpeg error, say) only skips that one entry and
+  keeps going. Trim/Stitch/Full Render always
+  run against the list's *current* in-GUI state (including any
+  unsaved Add/Edit/reorder) via a throwaway snapshot — nothing is
+  written back to an imported file unless you click Export.
 - **Series Manager**: named intro/outro/transition bundles (a name, an
   intro clip + duration, an outro clip + duration, a transition type +
   duration) — set one up once per sermon series, then just pick it from
@@ -90,8 +123,9 @@ starter `config.json` next to the script on first run if none exists.
   e.g. one you don't run anymore but an old render-state file still
   references — without deleting it; it still shows (greyed out) in the
   Series Manager list so it can be un-hidden or edited later. Saved to
-  `series.json` next to the script (auto-created empty on first run, not
-  committed — these are real local file paths specific to one setup).
+  `series.json` in the same hardcoded config directory as `config.json`
+  (see "Config reference" below; auto-created empty on first run) — real
+  local file paths specific to one setup, so not committed.
   Editing a series that's currently selected on the Offline tab updates
   that tab's own intro/outro/transition immediately; deleting one that's
   currently selected clears the selection instead of leaving it pointed
@@ -102,13 +136,18 @@ starter `config.json` next to the script on first run if none exists.
   Stitch fails outright with no series selected, rather than falling
   back to some blank/default intro-outro.
 
-**Config window** (the main window's "Config" button): General (console
-log path), API (the control API below: Enabled, Host/Port, Password),
-ProPresenter (connection + slide matching + Learn mode), OBS (connection),
-and Render (the trim/stitch defaults the Live tab's Trim/Stitch buttons
-use, same fields as Offline's Advanced). Starting Watch or Learn
-auto-saves both windows' fields to the config path shown here first.
-`watch` disconnects ProPresenter the moment Trim is triggered and OBS the
+**Config window** (the main window's "Config" button): General
+(currently empty — reserved for future settings), API (the control API
+below: Enabled, Host/Port, Password), ProPresenter (connection + slide
+matching + Learn mode), OBS (connection), and Render (the trim/stitch
+defaults the Live tab's Trim/Stitch buttons use, same fields as
+Offline's Advanced). OK writes `config.json` and closes; Apply writes
+and leaves the window open; Cancel — or just closing the window — reverts
+any unsaved changes back to what's on disk, asking "You have unsaved
+changes. Cancel anyways?" first if there actually are any. Starting
+Watch or Learn auto-saves both windows' fields first, same as
+OK/Apply, just without needing an explicit click. `watch` disconnects
+ProPresenter the moment Trim is triggered and OBS the
 moment Trim resolves or recording stops (whichever's first), then exits
 once Trim has actually resolved — nothing live is left to do by then.
 Click Stop or press Ctrl+C to end it early instead, before that point.
@@ -161,10 +200,11 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 
 `intro`/`outro` can each be a video or a still image (jpg/png/bmp/tif/
 webp); `main` must be a video. Output paths (here, `trim.output`/
-`stitch.output`, `trim.state_output`, and the GUI's `general.log_path`)
-accept strftime placeholders anywhere in the path, directories included
-— e.g. `recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory
-that doesn't already exist yet is created automatically.
+`stitch.output`/`trim.state_output`, and internally the GUI's own
+console log filename) accept strftime placeholders anywhere in the
+path, directories included — e.g.
+`recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory that
+doesn't already exist yet is created automatically.
 
 **Fast copy**: re-encodes only the two crossfade windows and stream-
 copies the untouched middle instead of re-encoding everything, which is
@@ -198,8 +238,11 @@ full re-encode runs instead if both are set.
 ### `watch`: the live pipeline
 
 ```
-python service_video.py watch -c config.json [--debug]
+python service_video.py watch [--debug]
 ```
+
+(`-c`/`--config` overrides where `config.json` is read from, if you
+don't want the hardcoded default — see "Config reference" below.)
 
 Needs OBS (obs-websocket v5, built into OBS 28+) to know when recording
 starts/stops. ProPresenter's legacy stage-display API is optional; leave
@@ -242,7 +285,7 @@ is (see "Series Manager" above — Stitch always needs a series).
 ### `learn`: find your begin/end slide UIDs
 
 ```
-python service_video.py learn -c config.json
+python service_video.py learn
 ```
 
 Connects to ProPresenter only. Step through your slides and it prints
@@ -283,9 +326,25 @@ current `trimmed_path`, whatever's already on record; an entry with none
 yet is skipped. `--mode full` does both, per entry, before moving to the
 next. Ignores `stitch.auto` on every mode — unlike `watch`/`render`, an
 explicit `bulk-render` invocation always does what its own `--mode` says.
-One entry failing (a missing file, a bad ffmpeg run) doesn't abort the
-rest: it's reported and skipped, and the process exits non-zero only at
-the end, with a summary of which entries failed.
+
+Every entry is validated up front, before any of them starts — `--mode
+trim`/`full` check that each entry's Main clip exists, Sermon start/end
+are set and land inside the Main clip's own length with start before
+end, and (only if a Series is set) that the resulting trimmed range is
+longer than that Series' own transition duration; `--mode stitch`
+checks that its Trimmed clip exists and its Series resolves; `--mode
+full` checks the same as `stitch` except Trimmed clip (it won't exist
+yet — trim produces it); every mode checks its own output path is
+usable. Each entry prints a "verifying" status line while its checks
+run, then "ready" or "check_console" depending on the result — the
+GUI's Bulk Render tab shows these live, color-coded, in its Status
+column. If any entry fails these checks, the whole run aborts
+immediately (nothing is started at all) with a summary of which entries
+and why. Once a run is actually underway, one entry failing at that
+point (a missing file that slipped past validation somehow, a bad
+ffmpeg run) doesn't abort the rest: it's reported and skipped, and the
+process exits non-zero only at the end, with a summary of which entries
+failed.
 
 ## Tests
 
@@ -318,29 +377,43 @@ checks and lints it (see `ci.yml`'s `lint` job).
 3. *(Optional; skip to step 6 for manual marking only.)* In
    ProPresenter: **Preferences → Network**, enable the network API, note
    the port (and password, if set).
-4. Copy `config.example.json` → `config.json` and fill in
-   `propresenter`/`obs` host, port, password (leave `propresenter.host`
-   blank to skip it). Skip this if using `gui.py`, which creates a starter
-   config on first run.
+4. Copy `config.example.json` to `config.json` at the hardcoded config
+   location for your OS (see "Config reference" below —
+   `%appdata%\subsplash-generator\config.json` on Windows,
+   `~/.config/subsplash-generator/config.json` on Mac/Linux; create the
+   folder first if it doesn't exist yet) and fill in `propresenter`/`obs`
+   host, port, password (leave `propresenter.host` blank to skip it).
+   Skip this if using `gui.py`, which creates a starter config there on
+   first run.
 5. *(Optional, requires step 3)* Find your begin/end slide UIDs:
    ```
-   python service_video.py learn -c config.json
+   python service_video.py learn
    ```
    Copy the two UIDs into `begin_slide.uid` / `end_slide.uid`.
 6. Fill in `stitch.intro` / `stitch.outro` with your intro/outro paths (or,
    in the GUI, set up a series on the Series Manager tab and pick it from
    the Live tab's Series dropdown instead).
-7. Before a real service, dry-run `watch -c config.json --debug` and
-   confirm begin/end are detected correctly (or that manual marking
-   works, if not using ProPresenter).
+7. Before a real service, dry-run `watch --debug` and confirm begin/end
+   are detected correctly (or that manual marking works, if not using
+   ProPresenter).
 
 ## Config reference (`config.json`)
 
+`config.json` and `series.json` always live in the same hardcoded,
+per-user config directory — not configurable, in the GUI or otherwise:
+
+| OS | Config dir (`config.json`, `series.json`) | Logs dir (console logs) |
+|---|---|---|
+| Windows | `%appdata%\subsplash-generator\` | `%localappdata%\subsplash-generator\` |
+| Mac/Linux | `$HOME/.config/subsplash-generator/` | `$HOME/.local/share/subsplash-generator/` |
+
+Both directories are created automatically if they don't exist yet.
+Console logs use the filename `%Y%m%d%H%M%S.log`, one new file per GUI
+session (there's no way to turn file logging off any more — the console
+pane itself always shows the same output regardless).
+
 ```jsonc
 {
-  "general": {                            // GUI-only
-    "log_path": "console_%Y%m%d_%H%M%S.log" // optional, default shown; "" turns off file logging
-  },
   "api": {                                // GUI-only, entirely optional; see "Control API" above
     "enabled": false,                     // optional, default false
     "host": "127.0.0.1",                  // optional, default shown

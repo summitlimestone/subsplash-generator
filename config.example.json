@@ -1,7 +1,4 @@
 {
-  "general": {
-    "log_path": "console_%Y%m%d_%H%M%S.log"
-  },
   "api": {
     "enabled": false,
     "host": "127.0.0.1",
