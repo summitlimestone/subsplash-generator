@@ -33,9 +33,10 @@ python gui.py
 ```
 
 Runs the same `service_video.py` CLI as a subprocess per action; the
-console pane shows its output (also mirrored to a log file, see Config >
-General), with a progress bar tracking ffmpeg's own steps. Creates a
-starter `config.json` next to the script on first run if none exists.
+console pane shows its output (also mirrored to a log file — see
+"Config reference" below for where), with a progress bar tracking
+ffmpeg's own steps. Creates a starter `config.json` on first run if none
+exists yet at its hardcoded location (see "Config reference" below).
 
 **Main window**: Live/Offline/Bulk Render/Series Manager tabs plus the console.
 - **Live**: a Series dropdown in place of typing intro/outro paths (see
@@ -122,8 +123,9 @@ starter `config.json` next to the script on first run if none exists.
   e.g. one you don't run anymore but an old render-state file still
   references — without deleting it; it still shows (greyed out) in the
   Series Manager list so it can be un-hidden or edited later. Saved to
-  `series.json` next to the script (auto-created empty on first run, not
-  committed — these are real local file paths specific to one setup).
+  `series.json` in the same hardcoded config directory as `config.json`
+  (see "Config reference" below; auto-created empty on first run) — real
+  local file paths specific to one setup, so not committed.
   Editing a series that's currently selected on the Offline tab updates
   that tab's own intro/outro/transition immediately; deleting one that's
   currently selected clears the selection instead of leaving it pointed
@@ -134,13 +136,18 @@ starter `config.json` next to the script on first run if none exists.
   Stitch fails outright with no series selected, rather than falling
   back to some blank/default intro-outro.
 
-**Config window** (the main window's "Config" button): General (console
-log path), API (the control API below: Enabled, Host/Port, Password),
-ProPresenter (connection + slide matching + Learn mode), OBS (connection),
-and Render (the trim/stitch defaults the Live tab's Trim/Stitch buttons
-use, same fields as Offline's Advanced). Starting Watch or Learn
-auto-saves both windows' fields to the config path shown here first.
-`watch` disconnects ProPresenter the moment Trim is triggered and OBS the
+**Config window** (the main window's "Config" button): General
+(currently empty — reserved for future settings), API (the control API
+below: Enabled, Host/Port, Password), ProPresenter (connection + slide
+matching + Learn mode), OBS (connection), and Render (the trim/stitch
+defaults the Live tab's Trim/Stitch buttons use, same fields as
+Offline's Advanced). OK writes `config.json` and closes; Apply writes
+and leaves the window open; Cancel — or just closing the window — reverts
+any unsaved changes back to what's on disk, asking "You have unsaved
+changes. Cancel anyways?" first if there actually are any. Starting
+Watch or Learn auto-saves both windows' fields first, same as
+OK/Apply, just without needing an explicit click. `watch` disconnects
+ProPresenter the moment Trim is triggered and OBS the
 moment Trim resolves or recording stops (whichever's first), then exits
 once Trim has actually resolved — nothing live is left to do by then.
 Click Stop or press Ctrl+C to end it early instead, before that point.
@@ -193,10 +200,11 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 
 `intro`/`outro` can each be a video or a still image (jpg/png/bmp/tif/
 webp); `main` must be a video. Output paths (here, `trim.output`/
-`stitch.output`, `trim.state_output`, and the GUI's `general.log_path`)
-accept strftime placeholders anywhere in the path, directories included
-— e.g. `recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory
-that doesn't already exist yet is created automatically.
+`stitch.output`/`trim.state_output`, and internally the GUI's own
+console log filename) accept strftime placeholders anywhere in the
+path, directories included — e.g.
+`recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory that
+doesn't already exist yet is created automatically.
 
 **Fast copy**: re-encodes only the two crossfade windows and stream-
 copies the untouched middle instead of re-encoding everything, which is
@@ -230,8 +238,11 @@ full re-encode runs instead if both are set.
 ### `watch`: the live pipeline
 
 ```
-python service_video.py watch -c config.json [--debug]
+python service_video.py watch [--debug]
 ```
+
+(`-c`/`--config` overrides where `config.json` is read from, if you
+don't want the hardcoded default — see "Config reference" below.)
 
 Needs OBS (obs-websocket v5, built into OBS 28+) to know when recording
 starts/stops. ProPresenter's legacy stage-display API is optional; leave
@@ -274,7 +285,7 @@ is (see "Series Manager" above — Stitch always needs a series).
 ### `learn`: find your begin/end slide UIDs
 
 ```
-python service_video.py learn -c config.json
+python service_video.py learn
 ```
 
 Connects to ProPresenter only. Step through your slides and it prints
@@ -366,29 +377,43 @@ checks and lints it (see `ci.yml`'s `lint` job).
 3. *(Optional; skip to step 6 for manual marking only.)* In
    ProPresenter: **Preferences → Network**, enable the network API, note
    the port (and password, if set).
-4. Copy `config.example.json` → `config.json` and fill in
-   `propresenter`/`obs` host, port, password (leave `propresenter.host`
-   blank to skip it). Skip this if using `gui.py`, which creates a starter
-   config on first run.
+4. Copy `config.example.json` to `config.json` at the hardcoded config
+   location for your OS (see "Config reference" below —
+   `%appdata%\subsplash-generator\config.json` on Windows,
+   `~/.config/subsplash-generator/config.json` on Mac/Linux; create the
+   folder first if it doesn't exist yet) and fill in `propresenter`/`obs`
+   host, port, password (leave `propresenter.host` blank to skip it).
+   Skip this if using `gui.py`, which creates a starter config there on
+   first run.
 5. *(Optional, requires step 3)* Find your begin/end slide UIDs:
    ```
-   python service_video.py learn -c config.json
+   python service_video.py learn
    ```
    Copy the two UIDs into `begin_slide.uid` / `end_slide.uid`.
 6. Fill in `stitch.intro` / `stitch.outro` with your intro/outro paths (or,
    in the GUI, set up a series on the Series Manager tab and pick it from
    the Live tab's Series dropdown instead).
-7. Before a real service, dry-run `watch -c config.json --debug` and
-   confirm begin/end are detected correctly (or that manual marking
-   works, if not using ProPresenter).
+7. Before a real service, dry-run `watch --debug` and confirm begin/end
+   are detected correctly (or that manual marking works, if not using
+   ProPresenter).
 
 ## Config reference (`config.json`)
 
+`config.json` and `series.json` always live in the same hardcoded,
+per-user config directory — not configurable, in the GUI or otherwise:
+
+| OS | Config dir (`config.json`, `series.json`) | Logs dir (console logs) |
+|---|---|---|
+| Windows | `%appdata%\subsplash-generator\` | `%localappdata%\subsplash-generator\` |
+| Mac/Linux | `$HOME/.config/subsplash-generator/` | `$HOME/.local/share/subsplash-generator/` |
+
+Both directories are created automatically if they don't exist yet.
+Console logs use the filename `%Y%m%d%H%M%S.log`, one new file per GUI
+session (there's no way to turn file logging off any more — the console
+pane itself always shows the same output regardless).
+
 ```jsonc
 {
-  "general": {                            // GUI-only
-    "log_path": "console_%Y%m%d_%H%M%S.log" // optional, default shown; "" turns off file logging
-  },
   "api": {                                // GUI-only, entirely optional; see "Control API" above
     "enabled": false,                     // optional, default false
     "host": "127.0.0.1",                  // optional, default shown

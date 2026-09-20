@@ -35,6 +35,7 @@ tk` / `sudo apt install python3-tk`).
 
 import ast
 import json
+import os
 import queue
 import re
 import secrets
@@ -52,7 +53,32 @@ from tkinter import filedialog, messagebox, ttk
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SERVICE_SCRIPT = SCRIPT_DIR / "service_video.py"
-DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
+
+
+def _config_dir() -> Path:
+    """Where config.json/series.json live — hardcoded per OS (see issue
+    #17), not user-configurable any more: %appdata%\\subsplash-generator
+    on Windows, ~/.config/subsplash-generator on Mac/Linux (the issue
+    specifies the same XDG-style path for both, not macOS's own
+    ~/Library/Application Support convention)."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "subsplash-generator"
+    return Path.home() / ".config" / "subsplash-generator"
+
+
+def _logs_dir() -> Path:
+    """Where console log files live — same hardcoding as _config_dir(),
+    a separate directory per issue #17: %localappdata%\\subsplash-generator
+    on Windows, ~/.local/share/subsplash-generator on Mac/Linux."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "subsplash-generator"
+    return Path.home() / ".local" / "share" / "subsplash-generator"
+
+
+CONFIG_DIR = _config_dir()
+CONFIG_PATH = CONFIG_DIR / "config.json"
 # Named intro/outro bundles ("series" — see issue #12) — a separate file
 # from config.json since they're reusable across configs/instances, not
 # connection settings for one. Purely a GUI convenience layer:
@@ -60,7 +86,8 @@ DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 # intro/outro paths — the GUI resolves a selected series to those before
 # ever building a command line or render-state file (see
 # App._wire_series_selector()).
-SERIES_PATH = SCRIPT_DIR / "series.json"
+SERIES_PATH = CONFIG_DIR / "series.json"
+LOGS_DIR = _logs_dir()
 
 
 def default_config() -> dict:
@@ -70,9 +97,6 @@ def default_config() -> dict:
     clip paths) — not example.json's fake example values, which could be
     mistaken for already being configured."""
     return {
-        "general": {
-            "log_path": DEFAULT_LOG_PATH,
-        },
         "api": {
             "enabled": False,
             "host": "127.0.0.1",
@@ -177,7 +201,6 @@ WATCH_STATE_LABELS = {
 }
 
 JSON_FILETYPES = [("JSON files", "*.json"), ("All files", "*.*")]
-LOG_FILETYPES = [("Log files", "*.log *.txt"), ("All files", "*.*")]
 VIDEO_FILETYPES = [("Video files", "*.mp4 *.mov *.mkv *.m4v *.avi"), ("All files", "*.*")]
 # Intro/outro can be either a video or a still image (see IMAGE_DURATION_HELP) —
 # their Browse buttons use this instead of VIDEO_FILETYPES.
@@ -190,9 +213,11 @@ DEFAULT_IMAGE_DURATION = 5.0
 # rather than imported, same as format_timestamp()/parse_timestamp().
 DEFAULT_STATE_OUTPUT = "render_state_%Y%m%d_%H%M%S.json"
 # GUI-only (service_video.py has no console of its own to log) — see
-# App._sync_log_file(). Same %Y%m%d_%H%M%S timestamp convention as
-# DEFAULT_STATE_OUTPUT, expanded via expand_output_path() below.
-DEFAULT_LOG_PATH = "console_%Y%m%d_%H%M%S.log"
+# App._open_log_file(). Hardcoded per issue #17 (no longer a config.json
+# field a user can point elsewhere or turn off): always LOGS_DIR, always
+# this filename pattern, expanded via expand_output_path() below exactly
+# once per session, same as every other strftime-placeholder path.
+LOG_PATH_PATTERN = str(LOGS_DIR / "%Y%m%d%H%M%S.log")
 
 # Matches the Summit Limestone brand palette used by the companion
 # subsplash-form site (summitlimestone.github.io/subsplash-form) — its
@@ -320,15 +345,15 @@ def to_timestamp(text: str, field: str) -> float:
 def expand_output_path(path: str) -> str:
     """Duplicated from service_video.py's function of the same name
     (rather than imported — this script only ever runs service_video.py
-    as a subprocess, never imports it) so App._sync_log_file() can expand
-    general.log_path itself, the same way every other output-path field
+    as a subprocess, never imports it) so App._open_log_file() can expand
+    LOG_PATH_PATTERN itself, the same way every other output-path field
     in this GUI is expanded by service_video.py once it's handed the raw
     string. Expands strftime placeholders anywhere in the path —
     filename and any directory components — and creates any directory
     component that doesn't exist yet; see service_video.py's own copy
     for the full reasoning. Unlike that copy, a failure creating the
     directory doesn't sys.exit() the whole GUI over a log file — it's
-    left to raise a plain OSError, which _sync_log_file() already
+    left to raise a plain OSError, which _open_log_file() already
     catches around its own open() call the same way."""
     expanded = datetime.now().strftime(path)
     Path(expanded).parent.mkdir(parents=True, exist_ok=True)
@@ -544,13 +569,6 @@ TIMESTAMP_HELP = (
     "is expanded, not any folder in the path."
 )
 
-LOG_PATH_HELP = (
-    TIMESTAMP_HELP + " The timestamp (if any) is filled in once, the "
-    "first time this app opens the file — not re-expanded on every line "
-    "written — so a whole session's console output lands in one file. "
-    "Leave blank to turn off file logging entirely; the console pane "
-    "itself is unaffected either way."
-)
 
 API_HELP = (
     "Optional HTTP API for marking start/end remotely. Runs only during Watch; "
@@ -959,15 +977,18 @@ class App(tk.Tk):
         # loaded one — cleaned up in _on_process_exit() once that run
         # finishes, whichever way.
         self._temp_render_state_path: str | None = None
-        # The open console-log file handle (see _sync_log_file()/_log()),
-        # None while file logging is off (general.log_path blank, or it
-        # failed to open). _log_path_raw is the unexpanded general.log_path
-        # value the currently-open handle was last opened for, so
-        # _sync_log_file() only actually reopens (and re-expands any
-        # timestamp) when that setting has genuinely changed, rather than
-        # on every config save/autosave.
+        # The open console-log file handle (see _open_log_file()/_log()) —
+        # None if it failed to open; there's no more "off" state to be in
+        # otherwise (see issue #17: logging is always-on, hardcoded to
+        # LOGS_DIR, not a config.json field any more).
         self._log_file = None
-        self._log_path_raw: str | None = None
+        # collect_config()'s own output as of the last successful load or
+        # write to CONFIG_PATH — what ConfigWindow's OK/Cancel/Apply
+        # compare a fresh collect_config() against to know whether
+        # anything's actually changed (see App._config_is_dirty()). None
+        # means "unknown" (collect_config() itself failed last time,
+        # e.g. an invalid slide regex) and is always treated as dirty.
+        self._last_saved_config: dict | None = {}
         self._queue: "queue.Queue" = queue.Queue()
         self.runner = ProcessRunner(
             on_line=lambda line: self._queue.put(("line", line)),
@@ -983,7 +1004,11 @@ class App(tk.Tk):
                 "same folder as service_video.py.",
             )
 
-        self.config_path_var = tk.StringVar(value=str(DEFAULT_CONFIG_PATH))
+        # Directories aren't assumed to exist (a first-ever run, a fresh
+        # OS user profile, ...) — created unconditionally, once, up front,
+        # before anything below tries to read or write into either one.
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
         # Series (see SERIES_PATH/issue #12) — loaded before _build_body()
         # since the Live/Offline tabs' own Series dropdowns need
@@ -1022,17 +1047,19 @@ class App(tk.Tk):
         # load_config(), not just the user clicking the checkbox by hand.
         self.vars["api_enabled"].trace_add("write", lambda *_args: self._sync_api_to_config())
 
-        if not DEFAULT_CONFIG_PATH.is_file():
-            DEFAULT_CONFIG_PATH.write_text(json.dumps(default_config(), indent=2))
+        self._open_log_file()
+
+        if not CONFIG_PATH.is_file():
+            CONFIG_PATH.write_text(json.dumps(default_config(), indent=2))
             self._log(
-                f"[gui] no config.json found next to this script — created a "
-                f"starter one at {DEFAULT_CONFIG_PATH} with sensible defaults. "
-                "Open Config and fill in the OBS host before running Watch — "
-                "ProPresenter is optional (Config > ProPresenter) and only "
-                "needed if you want slides to auto-mark start/end instead of "
-                "the Mark Start/Mark End buttons."
+                f"[gui] no config.json found — created a starter one at "
+                f"{CONFIG_PATH} with sensible defaults. Open Config and fill "
+                "in the OBS host before running Watch — ProPresenter is "
+                "optional (Config > ProPresenter) and only needed if you "
+                "want slides to auto-mark start/end instead of the Mark "
+                "Start/Mark End buttons."
             )
-        self.load_config(str(DEFAULT_CONFIG_PATH))
+        self.load_config()
 
         self.after(50, self._drain_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2577,37 +2604,22 @@ class App(tk.Tk):
                 # stop trying to write to a file that's stopped working.
                 self._log_file = None
 
-    def _sync_log_file(self):
-        """(Re)opens the console log file at general.log_path if that
-        setting has actually changed since the last time this ran —
-        called wherever a changed log_path takes effect: after loading a
-        config, after Save Config, and after the autosave a run does
-        before starting. A blank path turns file logging off. The path is
-        expanded (any timestamp placeholder filled in) once, right here,
-        rather than on every line _log() writes — so a whole session's
-        console output lands in one file instead of a new one per line —
-        which is also why this only reopens on an actual change rather
-        than every time one of those callers runs, even with an unchanged
-        path: reopening on every autosave (before every single run) would
-        otherwise mean a session's output gets fragmented across a new
-        timestamped file per run instead of staying in one place."""
-        raw = self.vars["log_path"].get().strip()
-        if raw == self._log_path_raw and (self._log_file or not raw):
-            return
-        if self._log_file:
-            try:
-                self._log_file.close()
-            except OSError:
-                pass
-            self._log_file = None
-        self._log_path_raw = raw
-        if not raw:
-            return
+    def _open_log_file(self):
+        """Opens the console log file at LOG_PATH_PATTERN — called once,
+        from __init__, since there's no more user-editable setting to
+        react to (see issue #17: logging is always-on, hardcoded, not a
+        config.json field any more). The path is expanded (any timestamp
+        placeholder filled in) exactly once, right here, rather than on
+        every line _log() writes — so a whole session's console output
+        lands in one file instead of a new one per line. A failure here
+        just means _log_file stays None (every _log() call still writes
+        to the console pane, just not to a file) rather than blocking
+        startup."""
         try:
-            expanded = expand_output_path(raw)
+            expanded = expand_output_path(LOG_PATH_PATTERN)
             self._log_file = open(expanded, "a", encoding="utf-8")
         except OSError as e:
-            self._log(f"[gui] couldn't open log file {raw!r}: {e}")
+            self._log(f"[gui] couldn't open log file {LOG_PATH_PATTERN!r}: {e}")
 
     # ------------------------------------------------------------------
     # Control API — hosted here in the GUI itself (see _build_api_app()),
@@ -2694,33 +2706,27 @@ class App(tk.Tk):
     # ConfigWindow; this state and the load/save logic live here on App).
     # ------------------------------------------------------------------
 
-    def _browse_config(self):
-        path = filedialog.askopenfilename(
-            title="Select config JSON", filetypes=JSON_FILETYPES, initialdir=str(SCRIPT_DIR)
-        )
-        if path:
-            self.config_path_var.set(path)
-            self.load_config(path)
-
-    def load_config(self, path=None):
-        path = Path(path or self.config_path_var.get().strip())
-        if not path.is_file():
-            messagebox.showerror("Load config", f"File not found: {path}")
+    def load_config(self):
+        """Populates every Config-window field from CONFIG_PATH — the
+        only place that path can be, now (see issue #17: no more
+        user-editable config_path_var/Browse/Load). Called once at
+        startup, and again by ConfigWindow's Cancel/window-close (see
+        App._config_is_dirty()) to revert any unsaved in-memory edits
+        back to whatever's actually on disk."""
+        if not CONFIG_PATH.is_file():
+            messagebox.showerror("Load config", f"File not found: {CONFIG_PATH}")
             return
         try:
-            cfg = json.loads(path.read_text())
+            cfg = json.loads(CONFIG_PATH.read_text())
         except json.JSONDecodeError as e:
             messagebox.showerror("Load config", f"Invalid JSON: {e}")
             return
 
-        general = cfg.get("general", {})
         api = cfg.get("api", {})
         pp = cfg.get("propresenter", {})
         obs = cfg.get("obs", {})
         trim = cfg.get("trim", {})
         stitch = cfg.get("stitch", {})
-
-        self.vars["log_path"].set(general.get("log_path", DEFAULT_LOG_PATH))
 
         # host/port/password set *before* enabled: enabled has a trace
         # (see _sync_api_to_config()) that starts/restarts the API using
@@ -2772,9 +2778,16 @@ class App(tk.Tk):
         self.vars["stitch_output"].set(stitch.get("output", "final.mp4"))
         self.vars["stitch_subsplash_preset"].set(bool(stitch.get("subsplash_preset", False)))
 
-        self.config_path_var.set(str(path))
-        self._sync_log_file()
-        self._log(f"[gui] loaded config from {path}")
+        try:
+            self._last_saved_config = self.collect_config()
+        except ValueError:
+            # A hand-edited config.json can load fine into the fields
+            # above (they're not individually validated on load) but
+            # still fail to round-trip through collect_config() (e.g. an
+            # invalid slide regex) — treat that the same as "unknown",
+            # always dirty until it's fixed, rather than crashing here.
+            self._last_saved_config = None
+        self._log(f"[gui] loaded config from {CONFIG_PATH}")
 
     def _load_slide(self, slide_cfg: dict, prefix: str):
         if slide_cfg.get("uid"):
@@ -2820,14 +2833,6 @@ class App(tk.Tk):
     def collect_config(self) -> dict:
         v = self.vars
         return {
-            "general": {
-                # Unlike the output-path fields below, blank here is a
-                # real, meaningful value (file logging off — see
-                # LOG_PATH_HELP) rather than "unset, use the default", so
-                # this doesn't fall back to DEFAULT_LOG_PATH the way those
-                # do.
-                "log_path": v["log_path"].get().strip(),
-            },
             "api": {
                 "enabled": bool(v["api_enabled"].get()),
                 "host": v["api_host"].get().strip() or "127.0.0.1",
@@ -2877,35 +2882,41 @@ class App(tk.Tk):
             },
         }
 
-    def _save_config_clicked(self):
-        try:
-            cfg = self.collect_config()
-        except ValueError as e:
-            messagebox.showerror("Config error", str(e))
-            return
-        path = Path(self.config_path_var.get().strip() or str(DEFAULT_CONFIG_PATH))
-        path.write_text(json.dumps(cfg, indent=2))
-        self._sync_log_file()
-        self._sync_api_to_config()
-        self._log(f"[gui] saved config -> {path}")
-        messagebox.showinfo("Config saved", f"Saved to {path}")
-
-    def _autosave_for_run(self) -> bool:
-        """Save the current form values (across both windows) to the config
-        path before watch/learn, so the subprocess always sees what's on
-        screen without requiring a separate manual Save click first."""
+    def _write_config(self) -> bool:
+        """Collects and writes the current fields to CONFIG_PATH, no
+        popups — the shared logic ConfigWindow's OK/Apply
+        (_on_config_ok()/_on_config_apply()) and _autosave_for_run() all
+        need. Returns False (after showing an error dialog) if the
+        current fields can't even be collected (e.g. an invalid slide
+        regex) — same failure handling collect_config()'s other callers
+        already use."""
         try:
             cfg = self.collect_config()
         except ValueError as e:
             messagebox.showerror("Config error", str(e))
             return False
-        path = Path(self.config_path_var.get().strip() or str(DEFAULT_CONFIG_PATH))
-        path.write_text(json.dumps(cfg, indent=2))
-        self.config_path_var.set(str(path))
-        self._sync_log_file()
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
         self._sync_api_to_config()
-        self._log(f"[gui] saved config -> {path}")
+        self._last_saved_config = cfg
+        self._log(f"[gui] saved config -> {CONFIG_PATH}")
         return True
+
+    def _config_is_dirty(self) -> bool:
+        """Whether the Config window's fields have changed since the
+        last load or write to CONFIG_PATH — what OK/Cancel/Apply use to
+        decide whether Cancel needs to confirm (see issue #17)."""
+        try:
+            current = self.collect_config()
+        except ValueError:
+            return True
+        return current != self._last_saved_config
+
+    def _autosave_for_run(self) -> bool:
+        """Save the current form values (across both windows) to
+        CONFIG_PATH before watch/learn, so the subprocess always sees
+        what's on screen without requiring an explicit OK/Apply click
+        first."""
+        return self._write_config()
 
     # ------------------------------------------------------------------
     # Process control
@@ -3333,12 +3344,12 @@ class App(tk.Tk):
     def _run_learn(self):
         if not self._autosave_for_run():
             return
-        self._start("learn", ["learn", "-c", self.config_path_var.get().strip()])
+        self._start("learn", ["learn", "-c", str(CONFIG_PATH)])
 
     def _run_watch(self):
         if not self._autosave_for_run():
             return
-        args = ["watch", "-c", self.config_path_var.get().strip()]
+        args = ["watch", "-c", str(CONFIG_PATH)]
         if self.watch_debug_var.get():
             args.append("--debug")
         self._live_begin_marked = False
@@ -5314,18 +5325,27 @@ class InteractiveTrimWindow(tk.Toplevel):
 
 
 class ConfigWindow(tk.Toplevel):
-    """Everything that's set once and rarely touched again: the config file
-    path, general app-wide settings (currently just the console log path),
-    ProPresenter connection + slide matching (with Learn mode folded in,
-    since discovering slide UIDs is a ProPresenter-configuration task),
-    OBS connection, and the trim/auto-stitch settings a live Watch run uses
-    afterward. Built once at App startup and hidden with withdraw()/
-    deiconify() rather than destroyed on close, so state and widgets persist
-    and reopening it (via the main window's "Config" button) is instant.
+    """General app-wide settings (currently empty — reserved for future
+    use), ProPresenter connection + slide matching (with Learn mode
+    folded in, since discovering slide UIDs is a ProPresenter-
+    configuration task), OBS connection, and the trim/auto-stitch
+    settings a live Watch run uses afterward. Built once at App startup
+    and hidden with withdraw()/deiconify() rather than destroyed on
+    close, so state and widgets persist and reopening it (via the main
+    window's "Config" button) is instant.
 
-    All actual state (app.vars, app.config_path_var) and the subprocess/
-    console machinery live on the main App; this window just hosts widgets
-    bound to that state, plus its own Learn-results table."""
+    config.json itself always lives at the hardcoded CONFIG_PATH (see
+    issue #17 — no more user-editable path/Browse/Load) — OK/Cancel/
+    Apply at the bottom replace what used to be a top Save button:
+    OK writes and closes, Apply writes and stays open (neither pops a
+    dialog), Cancel reverts any unsaved edits back to what's on disk,
+    confirming first if there actually are any (see
+    App._config_is_dirty()) — and the window's own close button
+    ([X]/WM_DELETE_WINDOW) behaves exactly like Cancel.
+
+    All actual state (app.vars) and the subprocess/console machinery
+    live on the main App; this window just hosts widgets bound to that
+    state, plus its own Learn-results table."""
 
     def __init__(self, app: App):
         super().__init__(app)
@@ -5334,11 +5354,15 @@ class ConfigWindow(tk.Toplevel):
         self.geometry("640x760")
         self.minsize(560, 560)
         self.configure(bg=PALETTE["bg"])
-        # Hide, don't destroy, so reopening via the main window's button
-        # doesn't need to rebuild anything.
-        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+        # Closing the window (the OS [X], Alt+F4, etc.) behaves exactly
+        # like clicking Cancel — see _on_cancel().
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
-        self._build_path_bar()
+        # Packed before the notebook so it reserves its space at the
+        # bottom first; the notebook's own fill="both", expand=True
+        # then absorbs the rest, same as the old top path bar did from
+        # the opposite edge.
+        self._build_bottom_bar()
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -5350,20 +5374,36 @@ class ConfigWindow(tk.Toplevel):
 
         self.withdraw()
 
-    def _build_path_bar(self):
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill="x")
-        ttk.Label(top, text="Config file:").pack(side="left")
-        ttk.Entry(top, textvariable=self.app.config_path_var).pack(
-            side="left", padx=4, fill="x", expand=True
-        )
-        ttk.Button(top, text="Browse…", command=self.app._browse_config).pack(side="left", padx=2)
-        ttk.Button(top, text="Load", command=lambda: self.app.load_config()).pack(side="left", padx=2)
+    def _build_bottom_bar(self):
+        bottom = ttk.Frame(self, padding=8)
+        bottom.pack(side="bottom", fill="x")
+        # Packed Apply, then Cancel, then OK — each side="right" lands
+        # just left of the one before it, so reading left-to-right this
+        # ends up "OK  Cancel  Apply", the order the issue itself lists
+        # them in.
+        ttk.Button(bottom, text="Apply", command=self._on_apply).pack(side="right")
+        ttk.Button(bottom, text="Cancel", command=self._on_cancel).pack(side="right", padx=(0, 6))
         ttk.Button(
-            top, text="Save", style="Accent.TButton", command=self.app._save_config_clicked
-        ).pack(side="left", padx=(6, 0))
+            bottom, text="OK", style="Accent.TButton", command=self._on_ok
+        ).pack(side="right", padx=(0, 6))
+
+    def _on_ok(self):
+        if self.app._write_config():
+            self.withdraw()
+
+    def _on_apply(self):
+        self.app._write_config()
+
+    def _on_cancel(self):
+        if self.app._config_is_dirty():
+            if not messagebox.askyesno("Unsaved changes", "You have unsaved changes. Cancel anyways?"):
+                return
+        self.app.load_config()  # revert any unsaved edits back to what's on disk
+        self.withdraw()
 
     # -- General tab: app-wide settings not specific to any one action ----
+    # (currently empty — config.json/series.json/log paths are all
+    # hardcoded now, not settings any more; kept for future use)
 
     def _build_general_tab(self, notebook):
         app = self.app
@@ -5376,9 +5416,6 @@ class ConfigWindow(tk.Toplevel):
             text="App-wide settings.",
             style="Muted.TLabel", wraplength=540, justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
-
-        app._labeled_entry(frame, 1, "Console log path", "log_path", colspan=3, help_text=LOG_PATH_HELP)
-        app._add_browse(frame, 1, "log_path", save=True, filetypes=LOG_FILETYPES, col=3)
 
     # -- API tab: optional HTTP control API (mark start/end, get state) ---
 
