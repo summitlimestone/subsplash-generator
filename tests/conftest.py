@@ -92,13 +92,20 @@ def sample_video(tmp_path_factory) -> str:
 @pytest.fixture
 def app(monkeypatch, tmp_path):
     """A real App() instance, withdrawn (never shown). Redirects
-    DEFAULT_CONFIG_PATH/SERIES_PATH into a throwaway tmp_path first —
-    App() writes a starter config.json/series.json next to gui.py on
-    first run if neither exists, and tests have no business touching (or
-    depending on) whatever a real contributor's own actual config.json/
-    series.json contains."""
-    monkeypatch.setattr(gui, "DEFAULT_CONFIG_PATH", tmp_path / "config.json")
-    monkeypatch.setattr(gui, "SERIES_PATH", tmp_path / "series.json")
+    CONFIG_DIR/CONFIG_PATH/SERIES_PATH/LOGS_DIR/LOG_PATH_PATTERN into a
+    throwaway tmp_path first — App() writes a starter config.json/
+    series.json and opens a log file at these hardcoded-per-OS locations
+    (see issue #17) on construction, and tests have no business touching
+    (or depending on) whatever a real contributor's own actual
+    ~/.config/subsplash-generator or ~/.local/share/subsplash-generator
+    contains."""
+    config_dir = tmp_path / "config"
+    logs_dir = tmp_path / "logs"
+    monkeypatch.setattr(gui, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(gui, "CONFIG_PATH", config_dir / "config.json")
+    monkeypatch.setattr(gui, "SERIES_PATH", config_dir / "series.json")
+    monkeypatch.setattr(gui, "LOGS_DIR", logs_dir)
+    monkeypatch.setattr(gui, "LOG_PATH_PATTERN", str(logs_dir / "%Y%m%d%H%M%S.log"))
     application = gui.App()
     application.withdraw()
     yield application
