@@ -1,8 +1,16 @@
-"""Series Manager (issue #12): named intro/outro bundles, selectable from
-the Live/Offline tabs instead of typing intro/outro paths by hand every
-run. Needs a real (or Xvfb) display — see conftest.py's `app` fixture,
-which already redirects SERIES_PATH into a throwaway tmp_path so these
-never touch a real contributor's own series.json."""
+"""Series Manager (issue #12): named intro/outro/transition bundles,
+selectable from the Live/Offline tabs instead of typing intro/outro
+paths by hand every run. Needs a real (or Xvfb) display — see
+conftest.py's `app` fixture, which already redirects SERIES_PATH into a
+throwaway tmp_path so these never touch a real contributor's own
+series.json.
+
+series/intro/outro/intro_duration/outro_duration/transition/
+transition_duration no longer exist in config.json or render-state files
+— only a series *name* does (resolved server-side by
+service_video.py's resolve_series()) — so these tests check the GUI's
+own vars/config/render-state shapes reflect that, not literal
+intro/outro values living in config.json or a render-state file."""
 
 import json
 
@@ -10,13 +18,15 @@ import gui
 
 
 def _make_series(app, name, intro="/a_intro.mp4", outro="/a_outro.mp4", intro_duration=5.0, outro_duration=5.0,
-                  hidden=False):
+                  transition="fade", transition_duration=1.0, hidden=False):
     win = gui.SeriesEditWindow(app, series=None)
     win.name_var.set(name)
     win.intro_var.set(intro)
     win.intro_duration_var.set(str(intro_duration))
     win.outro_var.set(outro)
     win.outro_duration_var.set(str(outro_duration))
+    win.transition_var.set(transition)
+    win.transition_duration_var.set(str(transition_duration))
     win.hidden_var.set(hidden)
     win._save()
     return win
@@ -28,41 +38,50 @@ def test_starts_empty(app):
 
 
 def test_new_series_persists_to_disk(app):
-    _make_series(app, "Fall 2026", intro="/videos/fall_intro.mp4", outro="/videos/fall_outro.mp4")
+    _make_series(app, "Fall 2026", intro="/videos/fall_intro.mp4", outro="/videos/fall_outro.mp4",
+                 transition="wipeleft", transition_duration=2.0)
     assert app.series == [{
         "name": "Fall 2026", "intro": "/videos/fall_intro.mp4", "intro_duration": 5.0,
-        "outro": "/videos/fall_outro.mp4", "outro_duration": 5.0, "hidden": False,
+        "outro": "/videos/fall_outro.mp4", "outro_duration": 5.0,
+        "transition": "wipeleft", "transition_duration": 2.0, "hidden": False,
     }]
     assert gui.SERIES_PATH.is_file()
     assert json.loads(gui.SERIES_PATH.read_text()) == app.series
 
 
-def test_selecting_series_populates_live_tab_vars(app):
-    _make_series(app, "Fall 2026", intro="/i.mp4", outro="/o.mp4", intro_duration=3.0, outro_duration=4.0)
+def test_selecting_series_on_live_tab_only_tracks_last_valid(app):
+    # The Live tab's own Series dropdown wires no intro/outro/transition
+    # target vars any more (see _build_live_tab()) — resolving those now
+    # happens server-side (service_video.py's resolve_series()), not in
+    # the GUI. Selecting a series here should still be tracked (for
+    # delete-clearing/rename-carry-forward — see _wire_series_selector())
+    # without creating any stitch_intro-style var.
+    _make_series(app, "Fall 2026", intro="/i.mp4", outro="/o.mp4")
     app.vars["stitch_series"].set("Fall 2026")
-    assert app.vars["stitch_intro"].get() == "/i.mp4"
-    assert app.vars["stitch_intro_duration"].get() == "3.0"
-    assert app.vars["stitch_outro"].get() == "/o.mp4"
-    assert app.vars["stitch_outro_duration"].get() == "4.0"
+    assert app._series_last_valid["stitch_series"] == "Fall 2026"
+    assert "stitch_intro" not in app.vars
+    assert "stitch_outro" not in app.vars
 
 
 def test_selecting_series_populates_offline_tab_vars(app):
-    _make_series(app, "Fall 2026", intro="/i.mp4", outro="/o.mp4")
+    _make_series(app, "Fall 2026", intro="/i.mp4", outro="/o.mp4", transition="dissolve", transition_duration=2.5)
     app.vars["st_series"].set("Fall 2026")
     assert app.vars["st_intro"].get() == "/i.mp4"
     assert app.vars["st_outro"].get() == "/o.mp4"
+    assert app.vars["st_transition"].get() == "dissolve"
+    assert app.vars["st_duration"].get() == "2.5"
 
 
-def test_editing_selected_series_propagates_live(app):
+def test_editing_selected_series_propagates_on_offline_tab(app):
     _make_series(app, "Fall 2026", intro="/old_intro.mp4")
-    app.vars["stitch_series"].set("Fall 2026")
-    assert app.vars["stitch_intro"].get() == "/old_intro.mp4"
+    app.vars["st_series"].set("Fall 2026")
+    assert app.vars["st_intro"].get() == "/old_intro.mp4"
 
     edit = gui.SeriesEditWindow(app, series=app._find_series("Fall 2026"))
     edit.intro_var.set("/new_intro.mp4")
     edit._save()
 
-    assert app.vars["stitch_intro"].get() == "/new_intro.mp4"
+    assert app.vars["st_intro"].get() == "/new_intro.mp4"
 
 
 def test_renaming_selected_series_carries_the_selection_forward(app):
@@ -101,18 +120,17 @@ def test_delete_removes_only_the_targeted_series(app):
     assert app._series_names() == ["B"]
 
 
-def test_deleting_the_selected_series_clears_dropdown_and_vars(app):
+def test_deleting_the_selected_series_clears_dropdowns(app):
     _make_series(app, "A", intro="/i.mp4")
     app.vars["stitch_series"].set("A")
     app.vars["st_series"].set("A")
-    assert app.vars["stitch_intro"].get() == "/i.mp4"
+    assert app.vars["st_intro"].get() == "/i.mp4"
 
     app.series_tree.selection_set("A")
     _confirm_yes(app)
 
     assert app._series_names() == []
     assert app.vars["stitch_series"].get() == ""
-    assert app.vars["stitch_intro"].get() == ""
     assert app.vars["st_series"].get() == ""
     assert app.vars["st_intro"].get() == ""
 
@@ -120,12 +138,12 @@ def test_deleting_the_selected_series_clears_dropdown_and_vars(app):
 def test_deleting_an_unselected_series_leaves_other_selections_alone(app):
     _make_series(app, "A", intro="/a.mp4")
     _make_series(app, "B", intro="/b.mp4")
-    app.vars["stitch_series"].set("A")
+    app.vars["st_series"].set("A")
     app.series_tree.selection_set("B")
     _confirm_yes(app)
     assert app._series_names() == ["A"]
-    assert app.vars["stitch_series"].get() == "A"
-    assert app.vars["stitch_intro"].get() == "/a.mp4"
+    assert app.vars["st_series"].get() == "A"
+    assert app.vars["st_intro"].get() == "/a.mp4"
 
 
 def _confirm_yes(app):
@@ -177,45 +195,33 @@ def test_blank_intro_rejected(app):
     assert app._series_names() == []
 
 
-# -- config.json / render-state round-tripping ------------------------------
+# -- config.json: no series/intro/outro/transition data at all --------------
 
-def test_config_json_round_trip_restores_series_selection(app, tmp_path):
+def test_collect_config_carries_no_series_or_literal_fields(app):
     _make_series(app, "B", intro="/b_intro.mp4")
-    app.vars["stitch_series"].set("B")
-
+    app.vars["st_series"].set("B")  # only the Offline tab has intro/outro vars to leak from
     cfg = app.collect_config()
-    assert cfg["stitch"]["series"] == "B"
-    assert cfg["stitch"]["intro"] == "/b_intro.mp4"
+    for key in ("series", "intro", "outro", "intro_duration", "outro_duration", "transition", "transition_duration"):
+        assert key not in cfg["stitch"], f"config.json's stitch section must not carry {key!r}"
 
-    config_path = tmp_path / "roundtrip_config.json"
-    config_path.write_text(json.dumps(cfg))
+
+def test_load_config_does_not_touch_series_selection(app):
+    _make_series(app, "B")
+    app.vars["stitch_series"].set("B")
+    cfg = app.collect_config()
+    gui.CONFIG_PATH.write_text(json.dumps(cfg))
 
     app.vars["stitch_series"].set("")
-    app.vars["stitch_intro"].set("")
-    app.load_config(str(config_path))
+    app.load_config()
 
-    assert app.vars["stitch_series"].get() == "B"
-    assert app.vars["stitch_intro"].get() == "/b_intro.mp4"
-
-
-def test_config_json_falls_back_when_saved_series_no_longer_exists(app, tmp_path):
-    _make_series(app, "B", intro="/b_intro.mp4")
-    app.vars["stitch_series"].set("B")
-    cfg = app.collect_config()
-    config_path = tmp_path / "roundtrip_config.json"
-    config_path.write_text(json.dumps(cfg))
-
-    app.series_tree.selection_set("B")
-    _confirm_yes(app)
-    app.load_config(str(config_path))
-
+    # Nothing to restore — config.json never carried it — so the
+    # dropdown simply stays however it already was (blank here).
     assert app.vars["stitch_series"].get() == ""
-    assert app.vars["stitch_intro"].get() == "/b_intro.mp4", (
-        "should fall back to the config's own raw intro value once the named series is gone"
-    )
 
 
-def test_render_state_json_round_trip_restores_offline_series_selection(app, tmp_path):
+# -- render-state files: series name only, never literal fields -------------
+
+def test_render_state_json_only_carries_the_series_name(app, tmp_path):
     _make_series(app, "A", intro="/a_intro.mp4")
     app.vars["st_series"].set("A")
     app.vars["st_main"].set("/recording.mp4")
@@ -226,7 +232,8 @@ def test_render_state_json_round_trip_restores_offline_series_selection(app, tmp
     assert f is not None and f["series"] == "A"
     render_state = app._build_render_state(f, "trimmed.mp4", "state.json")
     assert render_state["stitch"]["series"] == "A"
-    assert render_state["stitch"]["intro"] == "/a_intro.mp4"
+    for key in ("intro", "outro", "intro_duration", "outro_duration", "transition", "transition_duration"):
+        assert key not in render_state["stitch"], f"render-state's stitch section must not carry {key!r}"
 
     state_path = tmp_path / "roundtrip_state.json"
     state_path.write_text(json.dumps(render_state))
@@ -239,11 +246,35 @@ def test_render_state_json_round_trip_restores_offline_series_selection(app, tmp
     assert app.vars["st_intro"].get() == "/a_intro.mp4"
 
 
+def test_load_render_state_json_clears_offline_fields_when_series_gone(app, tmp_path):
+    _make_series(app, "A", intro="/a_intro.mp4")
+    app.vars["st_series"].set("A")
+    app.vars["st_main"].set("/recording.mp4")
+    app.vars["st_start"].set("00:00:01.000")
+    app.vars["st_end"].set("00:00:05.000")
+    f = app._collect_offline_fields(error_title="test")
+    render_state = app._build_render_state(f, "trimmed.mp4", "state.json")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(render_state))
+
+    app.series_tree.selection_set("A")
+    _confirm_yes(app)
+    app._load_render_state_json(str(state_path))
+
+    # The saved series name no longer resolves to anything — there's no
+    # literal intro/outro to fall back to any more (unlike before this
+    # change), so the Offline tab's fields are cleared instead.
+    assert app.vars["st_series"].get() == ""
+    assert app.vars["st_intro"].get() == ""
+    assert app.vars["st_outro"].get() == ""
+
+
 # -- Actually used by Stitch --------------------------------------------
 
 def test_run_stitch_uses_the_selected_series(app, monkeypatch):
     _make_series(app, "Fall 2026 Series", intro="/videos/fall_intro.mp4", intro_duration=3.0,
-                 outro="/videos/fall_outro.mp4", outro_duration=4.0)
+                 outro="/videos/fall_outro.mp4", outro_duration=4.0,
+                 transition="wipeleft", transition_duration=2.0)
     app.vars["st_series"].set("Fall 2026 Series")
     # Stitch always reads Trimmed clip (see #8), never Main clip directly.
     app.vars["st_trimmed"].set("/videos/body_trimmed.mp4")
@@ -255,8 +286,95 @@ def test_run_stitch_uses_the_selected_series(app, monkeypatch):
 
     args = captured["args"]
     assert args[0:4] == ["stitch", "/videos/fall_intro.mp4", "/videos/body_trimmed.mp4", "/videos/fall_outro.mp4"]
+    assert args[args.index("-t") + 1] == "wipeleft"
+    assert args[args.index("-d") + 1] == "2.0"
     assert args[args.index("--intro-duration") + 1] == "3.0"
     assert args[args.index("--outro-duration") + 1] == "4.0"
+
+
+def test_run_stitch_fails_with_no_series_selected(app, monkeypatch):
+    app.vars["st_series"].set("")
+    app.vars["st_trimmed"].set("/videos/body_trimmed.mp4")
+
+    started = []
+    monkeypatch.setattr(app, "_start", lambda *a: started.append(a))
+    errors = []
+    import tkinter.messagebox as messagebox
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg: errors.append(msg))
+
+    app._run_stitch()
+
+    assert not started
+    assert errors and "series" in errors[0].lower()
+
+
+def test_stitch_live_fails_with_no_series_selected(app, monkeypatch):
+    app.vars["stitch_series"].set("")
+    sent = []
+    monkeypatch.setattr(app.runner, "send_line", lambda line: sent.append(line))
+    monkeypatch.setattr(app.runner, "running", lambda: True)
+    errors = []
+    import tkinter.messagebox as messagebox
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg: errors.append(msg))
+
+    app._stitch_live()
+
+    assert not sent
+    assert errors and "series" in errors[0].lower()
+
+
+def test_stitch_live_sends_the_currently_selected_series(app, monkeypatch):
+    _make_series(app, "Fall 2026 Series")
+    app.vars["stitch_series"].set("Fall 2026 Series")
+    sent = []
+    monkeypatch.setattr(app.runner, "send_line", lambda line: sent.append(line))
+    monkeypatch.setattr(app.runner, "running", lambda: True)
+
+    app._stitch_live()
+
+    assert sent == ["stitch Fall 2026 Series"]
+
+
+def test_stitch_live_post_exit_uses_the_live_tabs_own_current_selection(app, monkeypatch, tmp_path):
+    """Regression: watch() exits after a live Trim, with no series ever
+    selected live — the render-state file's stitch.series (and so
+    Offline's own st_series, restored from it — see
+    _load_render_state_json()) stays blank. Selecting a series *only* on
+    the Live tab's own dropdown and clicking Stitch used to still fail
+    (post-exit Stitch called _run_stitch(), which checked Offline's own
+    st_series — never touched — instead of the Live tab's stitch_series
+    the user actually just set)."""
+    _make_series(app, "Fall Series", intro="/videos/intro.mp4", outro="/videos/outro.mp4")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "recording_path": "/rec.mp4", "raw_begin_offset": 1.0, "raw_end_offset": 4.0,
+        "trimmed_path": "/videos/body_trimmed.mp4",
+        "trim": {"output": "/videos/body_trimmed.mp4"},
+        "stitch": {"auto": True, "series": "", "output": "final.mp4"},
+    }))
+    app.render_state_var.set(str(state_path))
+    app._load_render_state_json(str(state_path))
+    assert app.vars["st_series"].get() == ""  # confirms the bug's precondition
+
+    app.vars["stitch_series"].set("Fall Series")
+    app.vars["stitch_output"].set("live_final.mp4")
+    monkeypatch.setattr(app.runner, "running", lambda: False)
+    captured = {}
+    monkeypatch.setattr(app, "_start", lambda name, args: captured.setdefault("args", args))
+    errors = []
+    import tkinter.messagebox as messagebox
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg: errors.append(msg))
+
+    app._stitch_live()
+
+    assert errors == []
+    args = captured["args"]
+    assert args[0:4] == ["stitch", "/videos/intro.mp4", "/videos/body_trimmed.mp4", "/videos/outro.mp4"]
+    assert args[args.index("-o") + 1] == "live_final.mp4"
+    assert app.vars["st_series"].get() == "Fall Series"
+    saved = json.loads(state_path.read_text())
+    assert saved["stitch"]["series"] == "Fall Series"
+    assert saved["stitch"]["output"] == "live_final.mp4"
 
 
 # -- Fuzzy search -------------------------------------------------------
@@ -331,7 +449,6 @@ def test_committing_text_narrowed_to_one_match_selects_it(app):
     combo.event_generate("<FocusOut>")
     combo.update()
     assert app.vars["stitch_series"].get() == "Fall 2026 Series"
-    assert app.vars["stitch_intro"].get() == "/a_intro.mp4"
 
 
 # -- Hide from dropdowns -------------------------------------------------
@@ -379,11 +496,11 @@ def test_hiding_the_currently_selected_series_does_not_clear_its_selection(app):
     (e.g. an old render-state file that named it), not silently lose its
     resolved intro/outro."""
     _make_series(app, "A", intro="/a.mp4")
-    app.vars["stitch_series"].set("A")
+    app.vars["st_series"].set("A")
     app.series_tree.selection_set("A")
     app._toggle_series_hidden()
-    assert app.vars["stitch_series"].get() == "A"
-    assert app.vars["stitch_intro"].get() == "/a.mp4"
+    assert app.vars["st_series"].get() == "A"
+    assert app.vars["st_intro"].get() == "/a.mp4"
 
 
 def test_series_tree_sorts_visible_first_then_alphabetically(app):

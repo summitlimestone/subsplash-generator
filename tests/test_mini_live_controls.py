@@ -24,6 +24,13 @@ def test_mini_buttons_drive_the_same_workflow_as_the_live_tab(app, monkeypatch):
     self._start, self._run_trim/_run_stitch — all looked up fresh on
     every call), and drives each mini button to confirm the real
     workflow methods actually ran, in order."""
+    # Stitch needs a series selected (issue #16) — without one it pops
+    # a modal error dialog instead of reaching _run_stitch().
+    app.series = [{
+        "name": "Test Series", "intro": "/i.mp4", "intro_duration": 5.0, "outro": "/o.mp4",
+        "outro_duration": 5.0, "transition": "fade", "transition_duration": 1.0, "hidden": False,
+    }]
+    app.vars["stitch_series"].set("Test Series")
     calls = []
     monkeypatch.setattr(app.runner, "send_line", lambda line: calls.append(("send_line", line)))
     monkeypatch.setattr(app.runner, "running", lambda: False)
