@@ -1,30 +1,60 @@
 # sclc-subsplash-generator
 
-Produces a service recording: watches for a "begin" and "end" moment,
-correlates those against an OBS recording, trims it down to the body
-clip, and stitches it together with an intro and outro (crossfade at each
-join). Begin/end can come from ProPresenter slide detection or be marked
-by hand. ProPresenter is entirely optional; OBS is the only connection
-actually required.
+Turns a live OBS recording into a finished service video: detects the
+sermon's start and end, trims the recording to that range, and
+crossfades it with an intro and outro. Start and end can come from
+ProPresenter slide detection or be marked by hand.
 
-Everything lives in `service_video.py`, with four subcommands. `gui.py`
-is an optional desktop GUI over the same four subcommands.
+Everything runs through `service_video.py`, a command line tool with
+five subcommands. `gui.py` is an optional desktop GUI over the same
+functionality.
+
+## Features
+
+- Live pipeline: watches OBS and (optionally) ProPresenter, marks the
+  sermon's start and end automatically, and trims and stitches once
+  it's over.
+- Offline trim and stitch: rework a recording by hand, including a
+  visual trim tool with an embedded video preview.
+- Bulk render: trim and stitch many recordings in one pass from an
+  editable list, with per entry validation and live status.
+- Series Manager: save named intro/outro/transition bundles and pick
+  them from a dropdown instead of re-entering paths every run.
+- Optional HTTP control API for marking start and end, or checking
+  state, from outside the app.
+
+## Quickstart
+
+1. Install [ffmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` must
+   be on your PATH).
+2. `pip install -r requirements.txt`
+3. In OBS: **Tools > WebSocket Server Settings**, enable it, and note
+   the port and password.
+4. Run `python gui.py`. It creates a starter `config.json` in the
+   config directory for your OS (see "Configuration" below) the first
+   time it runs.
+5. In Config > OBS, enter the host, port, and password from step 3.
+6. On the Series Manager tab, add a series with your intro and outro
+   clips.
+7. On the Live tab, pick that series, then click Start Watch. Use Mark
+   Sermon Start and Mark Sermon End to mark the recording by hand, or
+   configure ProPresenter in Config > ProPresenter to do it
+   automatically.
+
+For command line only use, see "Command line" below instead of steps
+4 to 7.
 
 ## Requirements
 
 - `ffmpeg` and `ffprobe` on PATH.
 - Python 3.10+.
-- `pip install -r requirements.txt`: only needed for `watch`/`learn`.
-  `stitch` and `render` only need ffmpeg. `fastapi`/`uvicorn` (also in
-  there) are only needed for `gui.py`'s optional control API
-  (Config > API's "Enabled" checkbox; see "Control API" below) — nothing
-  in `service_video.py` itself needs them.
-- For `gui.py`: a Tk-enabled Python (`sudo pacman -S tk` /
-  `sudo apt install python3-tk` on Linux; bundled on Windows/Mac).
-- `ffplay` (ships with the full ffmpeg suite, separate from `ffmpeg`/
-  `ffprobe` in some minimal installs) is optional — only needed for
-  audio in the Offline tab's "Trim visually…" window's embedded player;
-  video-only playback there still works without it.
+- `pip install -r requirements.txt` for `watch` and `learn`. `stitch`
+  and `render` only need ffmpeg. `fastapi` and `uvicorn` are only
+  needed for the GUI's optional control API.
+- For the GUI: a Tk enabled Python (`sudo pacman -S tk` or
+  `sudo apt install python3-tk` on Linux; bundled on Windows and Mac).
+- `ffplay` is optional, for audio in the Offline tab's visual trim
+  preview. Video plays without it.
 
 ## GUI
 
@@ -32,158 +62,77 @@ is an optional desktop GUI over the same four subcommands.
 python gui.py
 ```
 
-Runs the same `service_video.py` CLI as a subprocess per action; the
-console pane shows its output (also mirrored to a log file — see
-"Config reference" below for where), with a progress bar tracking
-ffmpeg's own steps. Creates a starter `config.json` on first run if none
-exists yet at its hardcoded location (see "Config reference" below).
+The console pane at the bottom mirrors everything the underlying
+`service_video.py` process prints, plus a progress bar for the current
+ffmpeg step.
 
-**Main window**: Live/Offline/Bulk Render/Series Manager tabs plus the console.
-- **Live**: a Series dropdown in place of typing intro/outro paths (see
-  Series Manager below), output field, Start Watch, Mark Sermon
-  Start/Mark Sermon End (the only way to run without ProPresenter, or to
-  override it live), Trim once an end is marked (works even before
-  recording stops; nothing renders automatically), and the render-state
-  file path, shown as soon as Watch starts and kept current throughout.
-  Trim disconnects ProPresenter (begin/end are decided by then) and, once
-  it resolves, disconnects OBS and ends the Watch run — from there Stitch
-  (and a retried Trim, if it failed) work the same way the Offline tab's
-  own buttons do, straight off the render-state file this run wrote.
-  "Mini controls…" opens a small window with just these five buttons and
-  the status, stacked vertically, for keeping the live workflow in view
-  without the full main window.
-- **Offline**: crossfade a Series' intro/outro with a trimmed clip by
-  hand via separate Trim and Stitch buttons, or "Load from JSON" a
-  render-state file (even one still in progress) to redo one; this also
-  enables Sermon start/end fields so Trim re-trims Main clip (the raw
-  recording) to those exact points, writing the result to Trimmed clip —
-  Stitch always reads from there, not Main clip, so it's greyed out until
-  Trimmed clip actually points at something, whether that's a fresh Trim
-  result, `trimmed_path` from a loaded render-state file, or one picked
-  by hand. "Trim visually…" (next to Sermon start/end) sets those fields
-  by dragging a filmstrip instead of typing timestamps, mobile-photo-app
-  style — drag the two handles for a rough cut, Left/Right nudges the
-  last-touched one for precision (Shift for a finer step). Playback (the
-  Play/Pause button, or "Play selection" to preview just the trim range)
-  is embedded right in the window with a seekbar, starting at an
-  accurate, frame-exact position rather than the nearest keyframe — video
-  plays inline; audio plays too as long as `ffplay` is on PATH (video-
-  only otherwise). "Export to JSON" builds a render-state file from the
-  fields as-is. "Advanced…" holds CRF, the Subsplash preset (see
-  "Subsplash preset" under `stitch` below), Fast copy, Normalize audio
-  (and its Target LUFS), and Encoder settings.
-- **Bulk Render**: an editable list of render-state entries (the same
-  self-contained shape a `watch` run or Offline's "Export to JSON"
-  writes), trimmed and/or stitched in one pass — Trim, Stitch, and Full
-  Render (both, per entry) mirror `bulk-render`'s own `--mode` below.
-  "Import…"/"Export…" load/save the whole list as JSON — an imported
-  entry only needs to specify the fields it actually cares about;
-  anything left out (a whole `trim`/`stitch` section included) is
-  filled in from the currently loaded config.json, the same defaults a
-  blank "+ Add entry…" starts with. "+ Add entry…"
-  or double-clicking a row opens an editor with the same fields as the
-  Offline tab (Series/Main clip/Trimmed clip/Output path/Sermon
-  start-end/Trim visually…, plus Advanced settings) minus the
-  Trim/Stitch buttons themselves. Select one or more rows (click, or
-  Ctrl/Shift-click for more than one) to enable "Delete" (removes them,
-  after confirming) and "Bulk Edit…" (Series/Trimmed clip/Output
-  path/Advanced settings for every selected entry at once, in a window
-  with no Main clip/Sermon start-end/Trim visually…/Load-Export of its
-  own — only a field you actually change gets applied; anything left
-  alone keeps each entry's own current value). Drag a row to reorder it
-  (a plain drag; Ctrl/Shift-click is how you multi-select instead). The list
-  shows Main clip/Output as just their filename (not the full path) and
-  a Series column between Output and Status. The Status column updates
-  live, color-coded, while a run is in progress: idle,
-  verifying (blue), ready (plain), check console (yellow), trimming/
-  stitching (blue), trimmed/stitched (green), failed (trim)/failed
-  (stitch) (red). Every entry is checked (Main clip/Trimmed clip exist,
-  Sermon start/end set and inside the Main clip's own length with start
-  before end, the trimmed range long enough for the Series' transition
-  if one's set, Series resolves, output paths are usable — whichever of
-  these the chosen mode actually needs) *before* anything starts —
-  verifying while an entry's own checks run, then ready or check console
-  per entry — so a bad entry anywhere in the list aborts the whole batch
-  immediately (check the console for why) instead of discovering it only
-  after burning time on every entry ahead of it; a failure once a run is
-  actually underway (an ffmpeg error, say) only skips that one entry and
-  keeps going. Trim/Stitch/Full Render always
-  run against the list's *current* in-GUI state (including any
-  unsaved Add/Edit/reorder) via a throwaway snapshot — nothing is
-  written back to an imported file unless you click Export.
-- **Series Manager**: named intro/outro/transition bundles (a name, an
-  intro clip + duration, an outro clip + duration, a transition type +
-  duration) — set one up once per sermon series, then just pick it from
-  the Series dropdown on the Live/Offline tabs instead of setting these
-  by hand every run. New…/Edit…/Duplicate/Hide-Show/Delete manage the
-  list; double-click a row to edit it. Both Series dropdowns are
-  type-ahead: typing fuzzy-matches against the series names (subsequence
-  match, like a command palette — "f26s" finds "Fall 2026 Series"),
-  narrowing the dropdown as you type; leaving the field with text that
-  doesn't resolve to a real series snaps back to whatever was last
-  selected. A series can be marked Hidden (in its Edit dialog, or via
-  the Hide/Show button) to keep it out of the Live/Offline dropdowns —
-  e.g. one you don't run anymore but an old render-state file still
-  references — without deleting it; it still shows (greyed out) in the
-  Series Manager list so it can be un-hidden or edited later. Saved to
-  `series.json` in the same hardcoded config directory as `config.json`
-  (see "Config reference" below; auto-created empty on first run) — real
-  local file paths specific to one setup, so not committed.
-  Editing a series that's currently selected on the Offline tab updates
-  that tab's own intro/outro/transition immediately; deleting one that's
-  currently selected clears the selection instead of leaving it pointed
-  at something gone. `service_video.py` itself resolves a series *name*
-  to these fields (see `resolve_series()`) at the moment a stitch
-  actually runs — config.json and render-state files only ever carry the
-  name, never literal intro/outro/transition values (see below) — so
-  Stitch fails outright with no series selected, rather than falling
-  back to some blank/default intro-outro.
+### Live tab
 
-**Config window** (the main window's "Config" button): General
-(currently empty — reserved for future settings), API (the control API
-below: Enabled, Host/Port, Password), ProPresenter (connection + slide
-matching + Learn mode), OBS (connection), and Render (the trim/stitch
-defaults the Live tab's Trim/Stitch buttons use, same fields as
-Offline's Advanced). OK writes `config.json` and closes; Apply writes
-and leaves the window open; Cancel — or just closing the window — reverts
-any unsaved changes back to what's on disk, asking "You have unsaved
-changes. Cancel anyways?" first if there actually are any. Starting
-Watch or Learn auto-saves both windows' fields first, same as
-OK/Apply, just without needing an explicit click. `watch` disconnects
-ProPresenter the moment Trim is triggered and OBS the
-moment Trim resolves or recording stops (whichever's first), then exits
-once Trim has actually resolved — nothing live is left to do by then.
-Click Stop or press Ctrl+C to end it early instead, before that point.
+Pick a series, set an output path, and click Start Watch. Mark Sermon
+Start and Mark Sermon End mark the recording by hand, whether or not
+ProPresenter is connected. Trim becomes available once an end is
+marked, and works even before the recording stops. Once Trim finishes,
+Watch disconnects and Stitch becomes available.
 
-**Control API** (Config > API's "Enabled" checkbox): an optional HTTP
-API for marking sermon start/end and checking the current state from
-something other than this app itself — a phone or a separate control
-surface. Runs inside the GUI itself, independent of Start Watch/Stop —
-starts the moment the checkbox is ticked (or the GUI loads a config with
-it already on) and keeps running whether or not a watch session is
-currently active, listening on `api.host`/`api.port` (default
-`127.0.0.1:8765`):
+"Mini controls" opens a small window with just these buttons and the
+current status, for keeping the workflow visible without the full main
+window.
+
+### Offline tab
+
+Trim and stitch a recording by hand, or load an existing render state
+file to redo one. Sermon start and end fields drive Trim; "Trim
+visually" sets them by dragging a filmstrip instead of typing
+timestamps, with an embedded preview and playback. "Export to JSON"
+writes the current fields out as a render state file. "Advanced"
+holds CRF, the Subsplash preset, fast copy, audio normalization, and
+encoder settings.
+
+### Bulk Render tab
+
+An editable list of render state entries, trimmed and stitched in one
+pass. Import and export the list as JSON; entries only need to specify
+the fields they care about, the rest fill in from the loaded config.
+Add, edit, delete, and reorder entries directly in the list, or bulk
+edit several selected entries at once. Each entry is validated before
+any entry starts, and the Status column shows live, color coded
+progress per entry.
+
+### Series Manager tab
+
+Named intro/outro/transition bundles, selectable from the Live and
+Offline tabs instead of typing paths every run. Both series dropdowns
+are type ahead: typing filters the list by fuzzy match. A series can
+be hidden to keep it out of those dropdowns without deleting it.
+
+### Config window
+
+General, API, ProPresenter, OBS, and Render settings. OK saves and
+closes the window; Apply saves without closing; Cancel (or closing the
+window) discards unsaved changes, confirming first if there are any.
+
+### Control API
+
+An optional HTTP API for marking sermon start and end, or checking
+state, from outside the app. Enable it in Config > API. It listens on
+`api.host`/`api.port` (default `127.0.0.1:8765`) whenever the checkbox
+is on, independent of whether a watch session is active.
 
 | Method | Path | Does |
 |---|---|---|
-| `POST` | `/mark/start` | Same as clicking Mark Sermon Start |
-| `POST` | `/mark/end` | Same as clicking Mark Sermon End |
-| `GET` | `/state` | State ("idle" if no watch is running), recording/begin/end-marked flags, Trim/Stitch status, render-state path |
+| `POST` | `/mark/start` | Mark sermon start |
+| `POST` | `/mark/end` | Mark sermon end |
+| `GET` | `/state` | Current state, recording/mark flags, trim/stitch status, render state path |
 
-Marks are synchronous: `POST` returns 200 once actually applied, or 409
-if there's no active watch session or the mark doesn't apply in the
-current state (e.g. marking end before start). Interactive Swagger docs
-are served at `/swagger`. Secured with HTTP Basic Auth against
-`api.password` (any username accepted, only the password checked, since
-this is a single shared secret, not real user management); leave it
-blank to run with no authentication at all, logged loudly in the console
-pane every time the API starts that way.
+Requests return 200 once applied, or 409 if the action doesn't apply
+right now (for example marking end before start). Interactive docs are
+served at `/swagger`. Every request needs HTTP Basic Auth with
+`api.password` as the password (any username works); leave it blank to
+run with no authentication.
 
-## Subcommands
+## Command line
 
 ### `stitch`: crossfade three clips into one video
-
-Standalone; no config file or live connection needed.
 
 ```
 python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
@@ -194,49 +143,40 @@ python service_video.py stitch intro.mp4 main.mp4 outro.mp4 -o final.mp4
 | `-o`, `--output` | `output.mp4` | Output file path |
 | `-d`, `--transition-duration` | `1.0` | Crossfade length in seconds |
 | `-t`, `--transition` | `fade` | Any ffmpeg `xfade` transition name |
-| `--crf` | `23` | CRF/CQ quality (lower = better) |
+| `--crf` | `23` | CRF/CQ quality (lower is better) |
 | `--intro-duration`/`--outro-duration` | `5.0` | Shown length, only if that clip is a still image |
-| `--fast-copy`/`--no-fast-copy` | off | Skip re-encoding untouched footage (see below) |
+| `--fast-copy`/`--no-fast-copy` | off | Skip re-encoding untouched footage |
 | `--encoder` | `nvenc` | `software`, `nvenc`, `qsv`, `amf`, or `videotoolbox` |
 | `--encoder-preset` | encoder's own default | That encoder's speed/quality preset |
-| `--subsplash-preset` | off | Match Subsplash's own recommended settings instead of `--crf` (see below) |
+| `--subsplash-preset` | off | Match Subsplash's recommended settings instead of `--crf` |
 
-`intro`/`outro` can each be a video or a still image (jpg/png/bmp/tif/
-webp); `main` must be a video. Output paths (here, `trim.output`/
-`stitch.output`/`trim.state_output`, and internally the GUI's own
-console log filename) accept strftime placeholders anywhere in the
-path, directories included — e.g.
-`recordings/%Y-%m-%d/final_%H-%M-%S.mp4` — and any directory that
-doesn't already exist yet is created automatically.
+`intro`/`outro` can each be a video or a still image (jpg, png, bmp,
+tif, webp); `main` must be a video. Output paths accept strftime
+placeholders anywhere in the path, including directories, for example
+`recordings/%Y-%m-%d/final_%H-%M-%S.mp4`. Any directory that doesn't
+exist yet is created automatically.
 
-**Fast copy**: re-encodes only the two crossfade windows and stream-
-copies the untouched middle instead of re-encoding everything, which is
-much faster on a long clip. Off by default for `stitch`: testing found the
-re-encoded crossfade windows never end up compatible enough with the
-untouched middle to actually stream-copy, so it just adds time before
-falling back to a full re-encode anyway. `trim`'s fast copy has no such
-problem and defaults on. Always verifies its own result before trusting
-it either way, so it's never unsafe to leave on.
+**Fast copy** re-encodes only the two crossfade windows and stream
+copies the untouched middle, which is much faster on a long clip. Off
+by default for `stitch` (the re-encoded crossfade windows rarely end
+up compatible enough with the untouched middle to stream copy, so it
+adds time before falling back to a full re-encode). On by default for
+`trim`, where that problem doesn't apply. The result is always verified
+before it's trusted either way.
 
-**Encoder**: `nvenc` at CRF 23 is the default (benchmarked as a good
-speed/quality balance); falls back to `software` (libx264) automatically,
-logging why, if the hardware encoder fails to run. A hardware encoder's
-CRF/CQ scale isn't quite the same as software's; treat the number as a
-starting point and adjust by eye against your own footage.
+**Encoder**: `nvenc` at CRF 23 is the default, and falls back to
+`software` (libx264) automatically if the hardware encoder fails to
+run. A hardware encoder's CRF/CQ scale isn't quite the same as
+software's; treat the number as a starting point and adjust by eye.
 
-**Subsplash preset**: matches Subsplash's own recommended On-Demand
-1080p settings (distributed as a HandBrake preset) instead of `--crf`
-and the output's own resolution/framerate — profile High, level 4.0,
-`keyint=60`, 1920x1080 at 30fps (letterboxed/pillarboxed and upscaled as
-needed, same as any other resolution mismatch here), ~2400kbps video,
-AAC 160kbps audio, and no `+faststart`. `--encoder` still picks the
-actual encode backend; this only changes the quality-control flags and
-picture format, as a modification to the same encode command rather than
-a second pass over the finished file — so it lands close to 2400kbps,
-not as precisely as HandBrake's own 2-pass encoding would. Ignored by
-`--fast-copy` (its whole point is leaving most of the file stream-copied
-untouched, which can never comply with a specific target bitrate) — a
-full re-encode runs instead if both are set.
+**Subsplash preset** matches Subsplash's recommended On-Demand 1080p
+settings instead of `--crf` and the output's own resolution and
+framerate: profile High, level 4.0, `keyint=60`, 1920x1080 at 30fps
+(letterboxed or pillarboxed and upscaled as needed), roughly 2400kbps
+video, AAC 160kbps audio, no `+faststart`. `--encoder` still picks the
+encode backend; this only changes the quality control flags and
+picture format. Ignored by `--fast-copy`, which falls back to a full
+re-encode if both are set.
 
 ### `watch`: the live pipeline
 
@@ -244,46 +184,32 @@ full re-encode runs instead if both are set.
 python service_video.py watch [--debug]
 ```
 
-(`-c`/`--config` overrides where `config.json` is read from, if you
-don't want the hardcoded default — see "Config reference" below.)
+Use `-c`/`--config` to point at a config file other than the default
+location (see "Configuration" below).
 
-Needs OBS (obs-websocket v5, built into OBS 28+) to know when recording
-starts/stops. ProPresenter's legacy stage-display API is optional; leave
-`propresenter.host` blank to run on manual marking alone.
+Needs OBS (obs-websocket v5, built into OBS 28+) to know when
+recording starts and stops. ProPresenter's Network API is optional;
+leave `propresenter.host` blank to run on manual marking alone.
 
-State machine: wait for recording to start → wait for begin slide → wait
-for end slide → wait for recording to stop → keep running until Trim
-resolves. `watch` never trims or stitches on its own; Trim (below) is the
-only way it happens.
+State machine: wait for recording to start, wait for the begin slide,
+wait for the end slide, wait for recording to stop, then keep running
+until Trim resolves. `watch` never trims or stitches on its own; Trim
+is the only way that happens.
 
-**Manual marking**: type `mark_begin`/`mark_end` into `watch`'s stdin (or
-use the GUI's Mark Sermon Start/End buttons) to mark those moments by
-hand: the only way when ProPresenter isn't configured, and an override
-if something goes wrong with it live.
+Type `mark_begin`/`mark_end` into `watch`'s stdin (or use the GUI's
+Mark Sermon Start/End buttons) to mark those moments by hand. Once an
+end is marked, send `trim` to trim right away, even before recording
+stops. Trim disconnects ProPresenter; once it resolves, `watch`
+disconnects OBS and exits. From there, redo a failed trim or run
+stitch against the render state file `watch` printed the path to:
+`render` re-trims (and stitches, if `stitch.auto` is set); plain
+`stitch` crossfades an already trimmed clip directly.
 
-**Trim**: once an end is marked, send `trim` (the GUI's "Trim" button) to
-trim right then, even before recording stops (it reads the in-progress
-recording file; if that fails, it waits for recording to finish and
-retries once more). Triggering Trim disconnects ProPresenter (nothing
-left for it to do); once Trim resolves — succeeded or failed, no retry
-left pending — `watch` disconnects OBS too and exits, since nothing live
-is left to do either way. From there, redo a failed Trim or run Stitch
-the offline way, against the render-state file `watch` printed the path
-to: `render` re-trims (and, if `stitch.auto`, stitches); plain `stitch`
-crossfades an already-trimmed clip directly. The GUI's Live tab does this
-handoff for you automatically — its Trim/Stitch buttons keep working
-after `watch` exits, now driving the same fields/buttons as its Offline
-tab underneath.
-
-**Stitch (while still connected)**: once Trim has produced a clip this
-run, send `stitch <series name>` (the GUI's "Stitch" button, while Watch
-is still running) to crossfade it with that series' intro/outro right
-away — no need to wait for `watch` to exit first. The series name is
-whatever's selected *at the moment Stitch is clicked*, not whatever was
-selected when `watch` started; it's recorded into the render-state file
-(`stitch.series`) as part of running it. A bare `stitch` with no name
-reuses whatever's already on record there, or fails cleanly if nothing
-is (see "Series Manager" above — Stitch always needs a series).
+While still connected, send `stitch <series name>` to crossfade the
+trimmed clip with that series' intro/outro immediately, without
+waiting for `watch` to exit. A bare `stitch` with no name reuses
+whatever series is already on record for that render, or fails if
+none is.
 
 ### `learn`: find your begin/end slide UIDs
 
@@ -294,130 +220,57 @@ python service_video.py learn
 Connects to ProPresenter only. Step through your slides and it prints
 each one's UID (and text, if any) as you land on it.
 
-### `render`: redo just the trim+stitch, no live connection needed
+### `render`: redo just the trim and stitch, no live connection needed
 
-Every `watch` run writes a render-state JSON file (path configurable via
-`trim.state_output`): the recording's path, the raw begin/end timestamps,
-the trimmed clip's path once Trim has actually produced one (`null`
-until then), and the `trim`/`stitch` settings used — `stitch` here only
-ever names a *series* (`stitch.series`), resolved via `resolve_series()`
-at the moment a stitch actually runs, never literal intro/outro/
-transition values (see "Series Manager" above). Created the moment
-`watch` starts
-and kept up to date as marks land and recording stops, rather than only
-written once at the end; `render` needs it complete (not still `null`) to
-run. `watch` prints the exact command to reuse it. Edit the file (most
-often `pad_start_seconds`/`pad_end_seconds`) and rerun:
+Every `watch` run writes a render state JSON file (path configurable
+via `trim.state_output`): the recording's path, the raw begin/end
+timestamps, the trimmed clip's path once Trim has produced one, and
+the trim/stitch settings used. `watch` prints the exact command to
+reuse it. Edit the file (most often `pad_start_seconds`/
+`pad_end_seconds`) and rerun:
 
 ```
 python service_video.py render render_state_20260823_133005.json
 ```
 
-### `bulk-render`: trim/stitch many render-state files in one pass
+### `bulk-render`: trim and stitch many render state files in one pass
 
 ```
 python service_video.py bulk-render states.json --mode {trim,stitch,full}
 ```
 
-`states.json` is a JSON array of render-state objects — the same shape
-`render` above takes one of, written by `watch` or the GUI's "Export to
-JSON". `--mode trim` trims every entry and writes each result back into
-that entry's own `trimmed_path` (the array is rewritten to `states.json`
-once, at the end, so a later `--mode stitch` pass — a separate run — can
-pick it up). `--mode stitch` stitches every entry straight from its
-current `trimmed_path`, whatever's already on record; an entry with none
-yet is skipped. `--mode full` does both, per entry, before moving to the
-next. Ignores `stitch.auto` on every mode — unlike `watch`/`render`, an
-explicit `bulk-render` invocation always does what its own `--mode` says.
+`states.json` is a JSON array of render state objects, the same shape
+`render` takes one of. `--mode trim` trims every entry and writes each
+result back into that entry's `trimmed_path`. `--mode stitch` stitches
+every entry from its current `trimmed_path`; an entry with none is
+skipped. `--mode full` does both, per entry. Every mode ignores
+`stitch.auto` and always does what `--mode` says.
 
-Every entry is validated up front, before any of them starts — `--mode
-trim`/`full` check that each entry's Main clip exists, Sermon start/end
-are set and land inside the Main clip's own length with start before
-end, and (only if a Series is set) that the resulting trimmed range is
-longer than that Series' own transition duration; `--mode stitch`
-checks that its Trimmed clip exists and its Series resolves; `--mode
-full` checks the same as `stitch` except Trimmed clip (it won't exist
-yet — trim produces it); every mode checks its own output path is
-usable. Each entry prints a "verifying" status line while its checks
-run, then "ready" or "check_console" depending on the result — the
-GUI's Bulk Render tab shows these live, color-coded, in its Status
-column. If any entry fails these checks, the whole run aborts
-immediately (nothing is started at all) with a summary of which entries
-and why. Once a run is actually underway, one entry failing at that
-point (a missing file that slipped past validation somehow, a bad
-ffmpeg run) doesn't abort the rest: it's reported and skipped, and the
-process exits non-zero only at the end, with a summary of which entries
+Every entry is validated before any of them starts: that its main clip
+exists, its sermon start/end are set and land inside the main clip's
+length, its trimmed range is long enough for its series' transition,
+its series resolves, and its output paths are usable, whichever of
+these the chosen mode needs. If any entry fails validation, the whole
+run stops before anything starts, with a summary of which entries and
+why. Once a run is underway, a single entry failing (a bad ffmpeg run,
+for example) doesn't stop the rest; it's reported and skipped, and the
+process exits non-zero at the end with a summary of which entries
 failed.
 
-## Tests
+## Configuration
 
-```
-pip install -r requirements-dev.txt
-pytest tests/
-```
+`config.json` and `series.json` live in one config directory per OS,
+and console logs in a separate logs directory. Both are created
+automatically.
 
-Covers `gui.py`'s ffmpeg-facing logic (accurate seeking — see
-`accurate_seek_input_args()` — checked against actual pixel content, not
-just a returned timestamp) and the Offline tab's "Trim visually…" window
-(load/drag/nudge/Apply/Cancel, and a regression test for a real bug this
-project hit once already: the window growing/shrinking on its own with no
-further input). Generates its own small synthetic test videos with ffmpeg
-on the fly rather than committing binary fixtures — needs `ffmpeg`/
-`ffprobe` on PATH, same as the app itself.
-
-The GUI tests create real Tk windows, so they need a real or virtual X11
-display: `xvfb-run -a pytest tests/` in CI or any other headless
-environment (see `.github/workflows/ci.yml`'s `test` job for the exact
-setup on a bare Ubuntu runner); on a normal desktop, no wrapper is needed.
-`service_video.py` has no test suite of its own yet — CI only compile-
-checks and lints it (see `ci.yml`'s `lint` job).
-
-## Setup
-
-1. `pip install -r requirements.txt`
-2. In OBS: **Tools → WebSocket Server Settings**, enable it, note the port
-   (default `4455`) and password.
-3. *(Optional; skip to step 6 for manual marking only.)* In
-   ProPresenter: **Preferences → Network**, enable the network API, note
-   the port (and password, if set).
-4. Copy `config.example.json` to `config.json` at the hardcoded config
-   location for your OS (see "Config reference" below —
-   `%appdata%\subsplash-generator\config.json` on Windows,
-   `~/.config/subsplash-generator/config.json` on Mac/Linux; create the
-   folder first if it doesn't exist yet) and fill in `propresenter`/`obs`
-   host, port, password (leave `propresenter.host` blank to skip it).
-   Skip this if using `gui.py`, which creates a starter config there on
-   first run.
-5. *(Optional, requires step 3)* Find your begin/end slide UIDs:
-   ```
-   python service_video.py learn
-   ```
-   Copy the two UIDs into `begin_slide.uid` / `end_slide.uid`.
-6. Fill in `stitch.intro` / `stitch.outro` with your intro/outro paths (or,
-   in the GUI, set up a series on the Series Manager tab and pick it from
-   the Live tab's Series dropdown instead).
-7. Before a real service, dry-run `watch --debug` and confirm begin/end
-   are detected correctly (or that manual marking works, if not using
-   ProPresenter).
-
-## Config reference (`config.json`)
-
-`config.json` and `series.json` always live in the same hardcoded,
-per-user config directory — not configurable, in the GUI or otherwise:
-
-| OS | Config dir (`config.json`, `series.json`) | Logs dir (console logs) |
+| OS | Config directory | Logs directory |
 |---|---|---|
 | Windows | `%appdata%\subsplash-generator\` | `%localappdata%\subsplash-generator\` |
 | Mac/Linux | `$HOME/.config/subsplash-generator/` | `$HOME/.local/share/subsplash-generator/` |
 
-Both directories are created automatically if they don't exist yet.
-Console logs use the filename `%Y%m%d%H%M%S.log`, one new file per GUI
-session (there's no way to turn file logging off any more — the console
-pane itself always shows the same output regardless).
-
 ```jsonc
 {
-  "api": {                                // GUI-only, entirely optional; see "Control API" above
+  "api": {                                // GUI only, entirely optional
     "enabled": false,                     // optional, default false
     "host": "127.0.0.1",                  // optional, default shown
     "port": 8765,                         // optional, default shown
@@ -452,7 +305,7 @@ pane itself always shows the same output regardless).
     "auto": true,
     "output": "final.mp4",
     "crf": 23,                            // optional, default 23; ignored if subsplash_preset is true
-    "subsplash_preset": false,            // optional, default false; see "Subsplash preset" below
+    "subsplash_preset": false,            // optional, default false; see "Subsplash preset" above
     "fast_copy": false,                   // optional, default false; see "Fast copy" above (usually a no-op)
     "encoder": "nvenc",                   // optional, default "nvenc"
     "encoder_preset": null                // optional, default null (encoder's own default, p4 for nvenc)
@@ -460,30 +313,39 @@ pane itself always shows the same output regardless).
 }
 ```
 
-Notably absent from `stitch` above: `series`/`intro`/`outro`/
-`intro_duration`/`outro_duration`/`transition`/`transition_duration`.
-`config.json` never carries any of these — a stitch's intro/outro/
-transition always come from a *series* (see "Series Manager" above and
-`resolve_series()` in `service_video.py`), named only in a render-state
-file's own `stitch.series` (see "Config reference" continues below,
-and the `render`/`bulk-render` sections), never in `config.json`
-itself. This is also why Stitch always needs a series actually selected
-— there's no config-level fallback to use instead.
+`config.json` never carries `series`, `intro`, `outro`,
+`intro_duration`, `outro_duration`, `transition`, or
+`transition_duration`. A stitch's intro, outro, and transition always
+come from a series set up in the Series Manager tab (or `series.json`
+directly), referenced only by name in `stitch.series`.
 
-`pad_start_seconds`/`pad_end_seconds` accept fractional/negative values;
-`stitch.crf` applies to the final crossfaded output, separately from
-`trim.crf` (the trimmed intermediate clip). The GUI exposes one "Fast
-copy" checkbox (`trim.fast_copy`) and one "Encoder" dropdown (sets both
-`trim.encoder` and `stitch.encoder` together); see "Fast copy"/
-"Encoder" under `stitch` above for what each does.
+`pad_start_seconds`/`pad_end_seconds` accept fractional and negative
+values. `stitch.crf` applies to the final crossfaded output, separately
+from `trim.crf` for the trimmed intermediate clip. The GUI exposes one
+"Fast copy" checkbox (`trim.fast_copy`) and one "Encoder" dropdown
+(sets both `trim.encoder` and `stitch.encoder`).
 
 **Normalize audio** (`trim.normalize_audio`, on by default;
-`trim.normalize_target_lufs`, default `-16.0`): loudness-normalizes the
-trimmed clip's audio via ffmpeg's `loudnorm` filter, since a live
-recording's levels can vary service to service in a way CRF/encoder
-choice has no bearing on. Trim-only: intro/outro and the final stitched
-crossfade are untouched, on the assumption they're already mixed at their
-own intentional level. `-16` LUFS is a common streaming/YouTube target;
-`-23` is the EBU R128 broadcast standard, quieter with more headroom. A
-failed measurement just skips normalization for that render rather than
-failing it outright.
+`trim.normalize_target_lufs`, default `-16.0`) loudness normalizes the
+trimmed clip's audio via ffmpeg's `loudnorm` filter, since recording
+levels can vary from service to service. It applies to the trimmed
+clip only; the intro, outro, and final stitched crossfade are left as
+is. `-16` LUFS is a common streaming target; `-23` is the EBU R128
+broadcast standard, quieter with more headroom. A failed measurement
+skips normalization for that render rather than failing it.
+
+## Tests
+
+```
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Covers `service_video.py`'s ffmpeg-facing logic and the GUI, including
+the Offline tab's visual trim window. Generates its own small
+synthetic test videos with ffmpeg rather than committing binary
+fixtures, so `ffmpeg`/`ffprobe` need to be on PATH.
+
+The GUI tests create real Tk windows, so they need a real or virtual
+X11 display: `xvfb-run -a pytest tests/` in a headless environment; on
+a normal desktop no wrapper is needed.
