@@ -769,25 +769,29 @@ DOCK_HTML = """<!doctype html>
 <title>Service Video</title>
 <style>
   :root { color-scheme: dark; }
-  body { margin: 0; padding: 12px; background: __BG__; color: __TEXT__;
-         font: 14px system-ui, sans-serif; }
-  #status { font-size: 22px; font-weight: 700; margin: 0 0 12px; min-height: 1.3em; }
-  button, select { width: 100%; box-sizing: border-box; padding: 10px; margin: 0 0 8px;
+  body { margin: 0; padding: 6px; background: __BG__; color: __TEXT__;
+         font: 13px system-ui, sans-serif; }
+  #status { font-size: 16px; font-weight: 700; margin: 0 0 6px; min-height: 1.2em; }
+  button, select { width: 100%; box-sizing: border-box; padding: 6px; margin: 0 0 4px;
          font: inherit; color: __TEXT__; background: __SURFACE__; border: 1px solid __BORDER__;
          border-radius: 4px; cursor: pointer; }
   button.accent { background: __ACCENT__; color: __ACCENT_CONTRAST__; font-weight: 700; }
   button:disabled { background: __DISABLED__; color: __MUTED__; cursor: default; }
-  label { display: block; margin: 8px 0 4px; font-weight: 600; }
-  #error { color: __DANGER__; min-height: 1.2em; margin-top: 4px; }
+  .row { display: flex; gap: 4px; margin: 0 0 4px; }
+  .row button { margin: 0; }
+  #error { color: __DANGER__; min-height: 1.1em; margin-top: 2px; }
 </style></head><body>
 <div id="status">…</div>
-<button id="watch" class="accent" data-post="/watch/start">Start Watch</button>
-<button id="mark_start" data-post="/mark/start">Mark Sermon Start</button>
-<button id="mark_end" data-post="/mark/end">Mark Sermon End</button>
-<button id="trim" data-post="/trim">Trim</button>
-<label for="series">Series</label>
 <select id="series"></select>
-<button id="stitch" data-post="/stitch">Stitch</button>
+<button id="watch" class="accent" data-post="/watch/start">Start Watch</button>
+<div class="row">
+  <button id="mark_start" data-post="/mark/start">Mark Sermon Start</button>
+  <button id="mark_end" data-post="/mark/end">Mark Sermon End</button>
+</div>
+<div class="row">
+  <button id="trim" data-post="/trim">Trim</button>
+  <button id="stitch" data-post="/stitch">Stitch</button>
+</div>
 <div id="error"></div>
 <script>
 const token = new URLSearchParams(location.search).get("token") || "";
