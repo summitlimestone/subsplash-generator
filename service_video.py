@@ -49,6 +49,7 @@ Install dependencies first:
 
 import argparse
 import asyncio
+import copy
 import json
 import math
 import os
@@ -2179,6 +2180,42 @@ def _validate_bulk_entry(state: dict, mode: str) -> list[str]:
     return problems
 
 
+# Path fields a render-state entry can carry. A relative value means
+# "relative to the states file's own folder" (so a folder holding the states
+# file plus its recordings can be copied between machines); see
+# resolve_entry_paths(). Mirrored in gui.py, which resolves the same fields
+# when the Bulk Render tab imports a file.
+ENTRY_PATH_FIELDS = (("recording_path",), ("trimmed_path",), ("trim", "output"), ("stitch", "output"))
+
+
+def resolve_entry_paths(entry: dict, base_dir: Path) -> dict:
+    """A deep copy of `entry` with every relative path field made absolute
+    against `base_dir`. Backslashes in a relative path are treated as
+    separators, so a file written on Windows resolves anywhere."""
+    resolved = copy.deepcopy(entry)
+    for keys in ENTRY_PATH_FIELDS:
+        holder = resolved
+        for key in keys[:-1]:
+            holder = holder.get(key)
+            if not isinstance(holder, dict):
+                break
+        else:
+            value = holder.get(keys[-1])
+            if isinstance(value, str) and value.strip() and not Path(value).is_absolute():
+                holder[keys[-1]] = str(base_dir / value.replace("\\", "/"))
+    return resolved
+
+
+def _portable_path(path: str, base_dir: Path) -> str:
+    """`path` relative to `base_dir` (POSIX separators) if it lies under
+    it, else unchanged — how bulk_render() writes a fresh trimmed_path back
+    without making a portable states file machine-specific."""
+    try:
+        return Path(path).resolve().relative_to(base_dir).as_posix()
+    except ValueError:
+        return path
+
+
 def bulk_render(states_path: str, mode: str) -> int:
     """Runs trim and/or stitch (mode: "trim", "stitch", or "full") against
     every render-state dict in a JSON array at `states_path` — the Bulk
@@ -2231,7 +2268,11 @@ def bulk_render(states_path: str, mode: str) -> int:
     ready/check_console during this pass (the same live per-row Status
     column feed the real trim/stitch loop below uses — see
     BULK_ENTRY_STATUS_RE/BULK_STATUS_DISPLAY in gui.py), so a long list
-    doesn't just sit there indefinitely while every entry gets probed."""
+    doesn't just sit there indefinitely while every entry gets probed.
+
+    Relative paths in an entry are resolved against the states file's own
+    folder (see resolve_entry_paths()); for an entry whose trim output was
+    given relative, a fresh trimmed_path is written back relative too."""
     try:
         states = json.loads(Path(states_path).read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -2240,6 +2281,11 @@ def bulk_render(states_path: str, mode: str) -> int:
         sys.exit(f"{states_path!r} must contain a JSON array of render-state objects.")
     if not states:
         sys.exit(f"{states_path!r} is empty — nothing to render.")
+
+    base_dir = Path(states_path).resolve().parent
+    originals = states
+    states = [resolve_entry_paths(s, base_dir) for s in originals]
+    trimmed_now: dict[int, str] = {}
 
     validation_failures: list[tuple[int, list[str]]] = []
     for i, state in enumerate(states):
@@ -2282,6 +2328,7 @@ def bulk_render(states_path: str, mode: str) -> int:
                 print(f"[bulk-render] status entry={i + 1} state=trimming")
                 trimmed_path = _trim_from_state(state)
                 state["trimmed_path"] = trimmed_path
+                trimmed_now[i] = trimmed_path
                 print(f"\nTrimmed body clip -> {trimmed_path}")
                 print(f"[bulk-render] status entry={i + 1} state=trimmed")
             if mode in ("stitch", "full"):
@@ -2301,7 +2348,14 @@ def bulk_render(states_path: str, mode: str) -> int:
             failures.append((i, message))
 
     if mode in ("trim", "full"):
-        Path(states_path).write_text(json.dumps(states, indent=2))
+        for i, path in trimmed_now.items():
+            # Relative in, relative out: an entry written with a relative
+            # trim output (a portable folder) gets its trimmed_path back the
+            # same way; an all-absolute entry stays absolute.
+            trim_output = (originals[i].get("trim") or {}).get("output")
+            relative = isinstance(trim_output, str) and not Path(trim_output.replace("\\", "/")).is_absolute()
+            originals[i]["trimmed_path"] = _portable_path(path, base_dir) if relative else path
+        Path(states_path).write_text(json.dumps(originals, indent=2))
 
     succeeded = len(states) - len(failures)
     print(f"\n[bulk-render] {succeeded}/{len(states)} entries succeeded")

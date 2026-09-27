@@ -13,6 +13,7 @@ real series.json via the `series_name` fixture rather than embedding
 intro/outro directly in each state dict."""
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -613,3 +614,47 @@ def test_watch_live_stitch_command_updates_the_render_state_file(bulk_clips, ser
 
     saved = json.loads(state_path.read_text())
     assert saved["stitch"]["series"] == series_name
+
+
+# -- relative paths (portable states files, e.g. from Sermon Marker) ---------------
+
+def test_resolve_entry_paths_makes_relative_fields_absolute(tmp_path):
+    entry = {
+        "recording_path": "input\\2024\\a.mkv", "trimmed_path": None,
+        "trim": {"output": "output/2024-01-07_trimmed.mp4"},
+        "stitch": {"output": "/abs/final.mp4", "series": "S"},
+    }
+    resolved = sv.resolve_entry_paths(entry, tmp_path)
+    assert resolved["recording_path"] == str(tmp_path / "input" / "2024" / "a.mkv")
+    assert resolved["trimmed_path"] is None
+    assert resolved["trim"]["output"] == str(tmp_path / "output" / "2024-01-07_trimmed.mp4")
+    assert resolved["stitch"] == {"output": "/abs/final.mp4", "series": "S"}
+    assert entry["recording_path"] == "input\\2024\\a.mkv"  # the original is untouched
+
+
+def test_resolve_entry_paths_tolerates_missing_sections(tmp_path):
+    assert sv.resolve_entry_paths({"recording_path": "a.mp4"}, tmp_path) == {
+        "recording_path": str(tmp_path / "a.mp4"),
+    }
+
+
+def test_bulk_render_resolves_relative_paths_against_the_states_file(bulk_clips, series_name, tmp_path, monkeypatch):
+    folder = tmp_path / "marked"
+    (folder / "input").mkdir(parents=True)
+    shutil.copy(bulk_clips["rec1"], folder / "input" / "rec1.mp4")
+    state = _make_state(series_name, folder, 0, "input/rec1.mp4")
+    state["trim"]["output"] = "output/2024-01-07_trimmed.mp4"
+    state["stitch"]["output"] = "output/2024-01-07.mp4"
+    states_path = folder / "bulk_states.json"
+    states_path.write_text(json.dumps([state]))
+    monkeypatch.chdir(tmp_path)  # anywhere but the states file's folder
+
+    assert sv.bulk_render(str(states_path), "full") == 0
+
+    assert (folder / "output" / "2024-01-07_trimmed.mp4").is_file()
+    assert (folder / "output" / "2024-01-07.mp4").is_file()
+    [saved] = json.loads(states_path.read_text())
+    # Still portable: nothing written back as an absolute path.
+    assert saved["recording_path"] == "input/rec1.mp4"
+    assert saved["trimmed_path"] == "output/2024-01-07_trimmed.mp4"
+    assert saved["stitch"]["output"] == "output/2024-01-07.mp4"

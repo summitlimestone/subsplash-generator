@@ -179,6 +179,32 @@ this is a single shared secret, not real user management); leave it
 blank to run with no authentication at all, logged loudly in the console
 pane every time the API starts that way.
 
+## Sermon Marker
+
+`SermonMarker.exe` is a separate, standalone Windows tool for working
+through a backlog of livestream recordings and marking each sermon's
+start and end. It has ffmpeg built in, so nothing else needs to be
+installed. Download it from the Releases page (or build it with
+`python packaging/build_marker.py <ffmpeg bin folder>`), or run
+`python marker.py` from source.
+
+1. Put the exe in its own folder and run it once. It creates an `input`
+   folder next to itself.
+2. Copy the recordings into `input` (subfolders are fine), then click
+   Refresh.
+3. Click **Mark next**. Play or drag the slider to where the sermon
+   starts and click **Set start here**, then find the end and click
+   **Set end here**. Check the date (it names the finished video
+   `YYYY-MM-DD.mp4`) and type the series name, then click **Save**. The
+   next unmarked recording opens automatically.
+
+Marks are saved to `bulk_states.json` next to the exe after every
+recording, so it's safe to close at any time; reopening shows which
+recordings are already done. To render, copy the whole folder to the
+computer running `gui.py` and use **Import** on the Bulk Render tab.
+Paths in the file are relative to it, and the finished videos go in an
+`output` folder beside it.
+
 ## Subcommands
 
 ### `stitch`: crossfade three clips into one video

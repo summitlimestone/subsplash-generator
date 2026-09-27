@@ -19,3 +19,15 @@ __pycache__/
 # Test tooling (tests/, run via pytest — see README's "Tests" section)
 .venv/
 .pytest_cache/
+
+# Sermon Marker (marker.py) run from source: its recordings, progress and
+# render outputs live next to it
+/input/
+/output/
+/bulk_states.json
+/selftest.log
+
+# PyInstaller (packaging/build_marker.py)
+/build/
+/dist/
+*.spec
