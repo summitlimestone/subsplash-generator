@@ -34,6 +34,7 @@ tk` / `sudo apt install python3-tk`).
 """
 
 import ast
+import copy
 import json
 import os
 import queue
@@ -50,6 +51,11 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+# Passed to every ffmpeg/ffprobe/ffplay/subprocess launch: a windowed
+# (no-console) Windows build would otherwise flash a black console window
+# for each one.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SERVICE_SCRIPT = SCRIPT_DIR / "service_video.py"
@@ -395,7 +401,7 @@ def probe_duration(path: str) -> float | None:
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, **_NO_WINDOW,
         )
         return float(json.loads(result.stdout)["format"]["duration"])
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, ValueError):
@@ -472,7 +478,7 @@ def extract_frame_png(
                 "ffmpeg", "-y", *input_args,
                 "-frames:v", "1", "-vf", vf, "-loglevel", "error", str(out_path),
             ],
-            capture_output=True, timeout=20,
+            capture_output=True, timeout=20, **_NO_WINDOW,
         )
         return result.returncode == 0 and out_path.exists()
     except (OSError, subprocess.TimeoutExpired):
@@ -648,6 +654,201 @@ NORMALIZE_TARGET_HELP = (
 )
 
 
+def apply_style(root: tk.Misc):
+    """Flat, modern-ish look built entirely on ttk's stock 'clam' theme
+    (no external theming package — keeps the GUI's only requirement a
+    Tk-enabled Python, same as everything else in this project)."""
+    import tkinter.font as tkfont
+
+    families = set(tkfont.families())
+
+    def pick(*names):
+        for name in names:
+            if name in families:
+                return name
+        return "TkDefaultFont"
+
+    # Mirrors the site's font-family stack (-apple-system, Segoe UI,
+    # Roboto, Helvetica, Arial, sans-serif) as closely as a desktop Tk
+    # app reasonably can.
+    ui_family = pick(
+        "Segoe UI", "SF Pro Text", "Helvetica Neue", "Roboto",
+        "Helvetica", "Arial", "Cantarell", "DejaVu Sans",
+    )
+    mono_family = pick("Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier New")
+    root.ui_font = (ui_family, 10)
+    root.ui_font_bold = (ui_family, 10, "bold")
+    root.mono_font = (mono_family, 10)
+
+    p = PALETTE
+    root.configure(bg=p["bg"])
+    root.option_add("*Font", root.ui_font)
+    # ttk.Combobox's dropdown is a plain Tk Listbox under the hood, not
+    # covered by ttk styling — set it via the option database or it'd
+    # stay a stock white popup against the dark theme.
+    root.option_add("*TCombobox*Listbox.background", p["surface"])
+    root.option_add("*TCombobox*Listbox.foreground", p["text"])
+    root.option_add("*TCombobox*Listbox.selectBackground", p["accent"])
+    root.option_add("*TCombobox*Listbox.selectForeground", p["accent_contrast"])
+
+    style = ttk.Style(root)
+    style.theme_use("clam")
+
+    style.configure(".", background=p["bg"], foreground=p["text"], font=root.ui_font)
+    style.configure("TFrame", background=p["bg"])
+    style.configure("TLabel", background=p["bg"], foreground=p["text"])
+    style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
+    style.configure("Header.TLabel", background=p["bg"], foreground=p["text"], font=root.ui_font_bold)
+
+    style.configure(
+        "TLabelframe", background=p["bg"], bordercolor=p["border"],
+        lightcolor=p["border"], darkcolor=p["border"],
+        relief="solid", borderwidth=1,
+    )
+    style.configure("TLabelframe.Label", background=p["bg"], foreground=p["text"], font=root.ui_font_bold)
+
+    style.configure(
+        "TEntry", fieldbackground=p["surface"], foreground=p["text"],
+        bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
+        borderwidth=1, padding=6, insertcolor=p["text"],
+    )
+    style.map("TEntry", bordercolor=[("focus", p["accent"])])
+
+    style.configure(
+        "TCombobox", fieldbackground=p["surface"], background=p["surface"],
+        foreground=p["text"], bordercolor=p["border"],
+        lightcolor=p["border"], darkcolor=p["border"],
+        arrowcolor=p["muted"], padding=5,
+    )
+    style.map("TCombobox", fieldbackground=[("readonly", p["surface"])])
+
+    style.configure(
+        "TSpinbox", fieldbackground=p["surface"], foreground=p["text"],
+        bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
+        arrowcolor=p["muted"], borderwidth=1, padding=6, insertcolor=p["text"],
+    )
+    style.map(
+        "TSpinbox",
+        bordercolor=[("focus", p["accent"])],
+        arrowcolor=[("pressed", p["accent"])],
+    )
+
+    style.configure(
+        "TButton", background=p["surface"], foreground=p["text"],
+        bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
+        borderwidth=1, padding=(8, 4), relief="flat",
+    )
+    style.map(
+        "TButton",
+        background=[("active", "#4b4a4b"), ("disabled", p["button_disabled_bg"])],
+        foreground=[("disabled", p["muted"])],
+    )
+
+    style.configure(
+        "Accent.TButton", background=p["accent"], foreground=p["accent_contrast"],
+        bordercolor=p["accent"], lightcolor=p["accent"], darkcolor=p["accent"],
+        borderwidth=0, padding=(10, 5), font=root.ui_font_bold,
+    )
+    style.map(
+        "Accent.TButton",
+        background=[
+            ("disabled", p["button_disabled_bg"]),
+            ("pressed", p["accent_active"]),
+            ("active", p["accent_hover"]),
+        ],
+        bordercolor=[("disabled", p["button_disabled_bg"])],
+        lightcolor=[("disabled", p["button_disabled_bg"])],
+        darkcolor=[("disabled", p["button_disabled_bg"])],
+        foreground=[("disabled", p["muted"])],
+    )
+
+    style.configure(
+        "Danger.TButton", background=p["danger"], foreground="#ffffff",
+        bordercolor=p["danger"], lightcolor=p["danger"], darkcolor=p["danger"],
+        borderwidth=0, padding=(10, 5), font=root.ui_font_bold,
+    )
+    style.map(
+        "Danger.TButton",
+        background=[("disabled", p["button_disabled_bg"]), ("active", p["danger_hover"])],
+        bordercolor=[("disabled", p["button_disabled_bg"])],
+        lightcolor=[("disabled", p["button_disabled_bg"])],
+        darkcolor=[("disabled", p["button_disabled_bg"])],
+        foreground=[("disabled", p["muted"])],
+    )
+
+    style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
+    style.map("TCheckbutton", background=[("active", p["bg"])])
+    style.configure("TRadiobutton", background=p["bg"], foreground=p["text"])
+    style.map("TRadiobutton", background=[("active", p["bg"])])
+
+    style.configure(
+        "TNotebook", background=p["bg"], bordercolor=p["bg"],
+        lightcolor=p["bg"], darkcolor=p["bg"], borderwidth=0,
+    )
+    style.configure(
+        "TNotebook.Tab", background=p["bg"], foreground=p["muted"],
+        bordercolor=p["bg"], lightcolor=p["bg"], darkcolor=p["bg"],
+        padding=(14, 5), borderwidth=0, font=root.ui_font,
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", p["surface"])],
+        foreground=[("selected", p["text"])],
+        bordercolor=[("selected", p["surface"])],
+        lightcolor=[("selected", p["surface"])],
+        darkcolor=[("selected", p["surface"])],
+        # clam's stock theme maps both extra padding AND expand onto
+        # the selected tab by default, to make it grow into the pane
+        # border. Both are per-state maps set up by the theme itself,
+        # so pinning padding/expand to the same fixed value on every
+        # state here overrides that and keeps all tabs identically
+        # sized whether selected or not.
+        padding=[("selected", (14, 5)), ("!selected", (14, 5))],
+        expand=[("selected", (0, 0, 0, 0)), ("!selected", (0, 0, 0, 0))],
+    )
+
+    style.configure(
+        "Treeview", background=p["surface"], fieldbackground=p["surface"],
+        foreground=p["text"], bordercolor=p["border"],
+        lightcolor=p["surface"], darkcolor=p["surface"], borderwidth=1, rowheight=26,
+    )
+    style.configure(
+        "Treeview.Heading", background=p["bg"], foreground=p["text"],
+        bordercolor=p["border"], lightcolor=p["bg"], darkcolor=p["bg"],
+        font=root.ui_font_bold, relief="flat", borderwidth=1,
+    )
+    style.map(
+        "Treeview.Heading", background=[("active", p["bg"])],
+    )
+    style.map(
+        "Treeview", background=[("selected", p["accent"])],
+        foreground=[("selected", p["accent_contrast"])],
+    )
+
+    style.configure(
+        "TScrollbar", background=p["border"], troughcolor=p["bg"],
+        bordercolor=p["bg"], lightcolor=p["border"], darkcolor=p["border"],
+        arrowcolor=p["muted"], relief="flat",
+    )
+    style.map("TScrollbar", background=[("active", p["muted"])])
+
+    style.configure(
+        "TScale", background=p["bg"], troughcolor=p["surface"],
+        bordercolor=p["border"], lightcolor=p["accent"], darkcolor=p["accent"],
+    )
+    style.map("TScale", background=[("active", p["bg"])])
+
+    style.configure(
+        "TPanedwindow", background=p["bg"], bordercolor=p["bg"],
+        lightcolor=p["bg"], darkcolor=p["bg"],
+    )
+    style.configure(
+        "Sash", sashthickness=6, gripcount=0,
+        bordercolor=p["bg"], lightcolor=p["bg"], darkcolor=p["bg"],
+    )
+    style.configure("TSeparator", background=p["border"])
+
+
 class Tooltip:
     """A small hover tooltip for a single widget, shown after a short delay
     in a borderless Toplevel styled to match PALETTE. Plain Tk, not ttk —
@@ -734,7 +935,7 @@ class ProcessRunner:
         cmd = [sys.executable, "-u", str(SERVICE_SCRIPT), *args]
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, **_NO_WINDOW,
         )
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -1086,198 +1287,7 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
 
     def _setup_style(self):
-        """Flat, modern-ish look built entirely on ttk's stock 'clam' theme
-        (no external theming package — keeps the GUI's only requirement a
-        Tk-enabled Python, same as everything else in this project)."""
-        import tkinter.font as tkfont
-
-        families = set(tkfont.families())
-
-        def pick(*names):
-            for name in names:
-                if name in families:
-                    return name
-            return "TkDefaultFont"
-
-        # Mirrors the site's font-family stack (-apple-system, Segoe UI,
-        # Roboto, Helvetica, Arial, sans-serif) as closely as a desktop Tk
-        # app reasonably can.
-        ui_family = pick(
-            "Segoe UI", "SF Pro Text", "Helvetica Neue", "Roboto",
-            "Helvetica", "Arial", "Cantarell", "DejaVu Sans",
-        )
-        mono_family = pick("Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier New")
-        self.ui_font = (ui_family, 10)
-        self.ui_font_bold = (ui_family, 10, "bold")
-        self.mono_font = (mono_family, 10)
-
-        p = PALETTE
-        self.configure(bg=p["bg"])
-        self.option_add("*Font", self.ui_font)
-        # ttk.Combobox's dropdown is a plain Tk Listbox under the hood, not
-        # covered by ttk styling — set it via the option database or it'd
-        # stay a stock white popup against the dark theme.
-        self.option_add("*TCombobox*Listbox.background", p["surface"])
-        self.option_add("*TCombobox*Listbox.foreground", p["text"])
-        self.option_add("*TCombobox*Listbox.selectBackground", p["accent"])
-        self.option_add("*TCombobox*Listbox.selectForeground", p["accent_contrast"])
-
-        style = ttk.Style(self)
-        style.theme_use("clam")
-
-        style.configure(".", background=p["bg"], foreground=p["text"], font=self.ui_font)
-        style.configure("TFrame", background=p["bg"])
-        style.configure("TLabel", background=p["bg"], foreground=p["text"])
-        style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
-        style.configure("Header.TLabel", background=p["bg"], foreground=p["text"], font=self.ui_font_bold)
-
-        style.configure(
-            "TLabelframe", background=p["bg"], bordercolor=p["border"],
-            lightcolor=p["border"], darkcolor=p["border"],
-            relief="solid", borderwidth=1,
-        )
-        style.configure("TLabelframe.Label", background=p["bg"], foreground=p["text"], font=self.ui_font_bold)
-
-        style.configure(
-            "TEntry", fieldbackground=p["surface"], foreground=p["text"],
-            bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
-            borderwidth=1, padding=6, insertcolor=p["text"],
-        )
-        style.map("TEntry", bordercolor=[("focus", p["accent"])])
-
-        style.configure(
-            "TCombobox", fieldbackground=p["surface"], background=p["surface"],
-            foreground=p["text"], bordercolor=p["border"],
-            lightcolor=p["border"], darkcolor=p["border"],
-            arrowcolor=p["muted"], padding=5,
-        )
-        style.map("TCombobox", fieldbackground=[("readonly", p["surface"])])
-
-        style.configure(
-            "TSpinbox", fieldbackground=p["surface"], foreground=p["text"],
-            bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
-            arrowcolor=p["muted"], borderwidth=1, padding=6, insertcolor=p["text"],
-        )
-        style.map(
-            "TSpinbox",
-            bordercolor=[("focus", p["accent"])],
-            arrowcolor=[("pressed", p["accent"])],
-        )
-
-        style.configure(
-            "TButton", background=p["surface"], foreground=p["text"],
-            bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
-            borderwidth=1, padding=(8, 4), relief="flat",
-        )
-        style.map(
-            "TButton",
-            background=[("active", "#4b4a4b"), ("disabled", p["button_disabled_bg"])],
-            foreground=[("disabled", p["muted"])],
-        )
-
-        style.configure(
-            "Accent.TButton", background=p["accent"], foreground=p["accent_contrast"],
-            bordercolor=p["accent"], lightcolor=p["accent"], darkcolor=p["accent"],
-            borderwidth=0, padding=(10, 5), font=self.ui_font_bold,
-        )
-        style.map(
-            "Accent.TButton",
-            background=[
-                ("disabled", p["button_disabled_bg"]),
-                ("pressed", p["accent_active"]),
-                ("active", p["accent_hover"]),
-            ],
-            bordercolor=[("disabled", p["button_disabled_bg"])],
-            lightcolor=[("disabled", p["button_disabled_bg"])],
-            darkcolor=[("disabled", p["button_disabled_bg"])],
-            foreground=[("disabled", p["muted"])],
-        )
-
-        style.configure(
-            "Danger.TButton", background=p["danger"], foreground="#ffffff",
-            bordercolor=p["danger"], lightcolor=p["danger"], darkcolor=p["danger"],
-            borderwidth=0, padding=(10, 5), font=self.ui_font_bold,
-        )
-        style.map(
-            "Danger.TButton",
-            background=[("disabled", p["button_disabled_bg"]), ("active", p["danger_hover"])],
-            bordercolor=[("disabled", p["button_disabled_bg"])],
-            lightcolor=[("disabled", p["button_disabled_bg"])],
-            darkcolor=[("disabled", p["button_disabled_bg"])],
-            foreground=[("disabled", p["muted"])],
-        )
-
-        style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
-        style.map("TCheckbutton", background=[("active", p["bg"])])
-        style.configure("TRadiobutton", background=p["bg"], foreground=p["text"])
-        style.map("TRadiobutton", background=[("active", p["bg"])])
-
-        style.configure(
-            "TNotebook", background=p["bg"], bordercolor=p["bg"],
-            lightcolor=p["bg"], darkcolor=p["bg"], borderwidth=0,
-        )
-        style.configure(
-            "TNotebook.Tab", background=p["bg"], foreground=p["muted"],
-            bordercolor=p["bg"], lightcolor=p["bg"], darkcolor=p["bg"],
-            padding=(14, 5), borderwidth=0, font=self.ui_font,
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", p["surface"])],
-            foreground=[("selected", p["text"])],
-            bordercolor=[("selected", p["surface"])],
-            lightcolor=[("selected", p["surface"])],
-            darkcolor=[("selected", p["surface"])],
-            # clam's stock theme maps both extra padding AND expand onto
-            # the selected tab by default, to make it grow into the pane
-            # border. Both are per-state maps set up by the theme itself,
-            # so pinning padding/expand to the same fixed value on every
-            # state here overrides that and keeps all tabs identically
-            # sized whether selected or not.
-            padding=[("selected", (14, 5)), ("!selected", (14, 5))],
-            expand=[("selected", (0, 0, 0, 0)), ("!selected", (0, 0, 0, 0))],
-        )
-
-        style.configure(
-            "Treeview", background=p["surface"], fieldbackground=p["surface"],
-            foreground=p["text"], bordercolor=p["border"],
-            lightcolor=p["surface"], darkcolor=p["surface"], borderwidth=1, rowheight=26,
-        )
-        style.configure(
-            "Treeview.Heading", background=p["bg"], foreground=p["text"],
-            bordercolor=p["border"], lightcolor=p["bg"], darkcolor=p["bg"],
-            font=self.ui_font_bold, relief="flat", borderwidth=1,
-        )
-        style.map(
-            "Treeview.Heading", background=[("active", p["bg"])],
-        )
-        style.map(
-            "Treeview", background=[("selected", p["accent"])],
-            foreground=[("selected", p["accent_contrast"])],
-        )
-
-        style.configure(
-            "TScrollbar", background=p["border"], troughcolor=p["bg"],
-            bordercolor=p["bg"], lightcolor=p["border"], darkcolor=p["border"],
-            arrowcolor=p["muted"], relief="flat",
-        )
-        style.map("TScrollbar", background=[("active", p["muted"])])
-
-        style.configure(
-            "TScale", background=p["bg"], troughcolor=p["surface"],
-            bordercolor=p["border"], lightcolor=p["accent"], darkcolor=p["accent"],
-        )
-        style.map("TScale", background=[("active", p["bg"])])
-
-        style.configure(
-            "TPanedwindow", background=p["bg"], bordercolor=p["bg"],
-            lightcolor=p["bg"], darkcolor=p["bg"],
-        )
-        style.configure(
-            "Sash", sashthickness=6, gripcount=0,
-            bordercolor=p["bg"], lightcolor=p["bg"], darkcolor=p["bg"],
-        )
-        style.configure("TSeparator", background=p["border"])
+        apply_style(self)
 
     # ------------------------------------------------------------------
     # Layout — main window
@@ -2435,7 +2445,13 @@ class App(tk.Tk):
         # anything left out (a whole "trim"/"stitch" section included)
         # is filled in from the currently loaded config.json, same as a
         # blank "+ Add entry…" would use (see _fill_bulk_entry_defaults()).
-        self.bulk_states = [_fill_bulk_entry_defaults(self, s) for s in data]
+        # Relative paths mean "relative to this file's folder" (e.g. a
+        # Sermon Marker folder copied over from another machine) — resolved
+        # before defaults are filled, so config-default outputs stay as-is.
+        base_dir = Path(path).resolve().parent
+        self.bulk_states = [
+            _fill_bulk_entry_defaults(self, resolve_entry_paths(s, base_dir)) for s in data
+        ]
         self._bulk_states_path = path
         self._refresh_bulk_render_tree()
         self._log(f"[gui] imported {len(data)} bulk render entries from {path}")
@@ -3948,6 +3964,28 @@ class SeriesEditWindow(tk.Toplevel):
         self.destroy()
 
 
+# Mirrors service_video.py's ENTRY_PATH_FIELDS/resolve_entry_paths() —
+# duplicated rather than imported, same as expand_output_path().
+ENTRY_PATH_FIELDS = (("recording_path",), ("trimmed_path",), ("trim", "output"), ("stitch", "output"))
+
+
+def resolve_entry_paths(entry: dict, base_dir: Path) -> dict:
+    """A deep copy of a render-state `entry` with every relative path field
+    made absolute against `base_dir` (backslashes treated as separators)."""
+    resolved = copy.deepcopy(entry)
+    for keys in ENTRY_PATH_FIELDS:
+        holder = resolved
+        for key in keys[:-1]:
+            holder = holder.get(key)
+            if not isinstance(holder, dict):
+                break
+        else:
+            value = holder.get(keys[-1])
+            if isinstance(value, str) and value.strip() and not Path(value).is_absolute():
+                holder[keys[-1]] = str(base_dir / value.replace("\\", "/"))
+    return resolved
+
+
 def _blank_bulk_entry(app: "App") -> dict:
     """A fresh render-state dict for the Bulk Render tab's "+ Add
     entry…" — same series-only shape (see resolve_series() in
@@ -4682,7 +4720,7 @@ def build_svg_icon(svg_template: str, color: str, size: int) -> tk.PhotoImage | 
                 "ffmpeg", "-y", "-i", svg_path, "-vf", f"scale={size}:{size}",
                 "-frames:v", "1", "-loglevel", "error", out_path,
             ],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, **_NO_WINDOW,
         )
         if result.returncode != 0 or not Path(out_path).exists():
             return None
@@ -4779,13 +4817,21 @@ class InteractiveTrimWindow(tk.Toplevel):
     fields on the Offline tab stay editable after Apply too."""
 
     def __init__(
-        self, app: App, source_path: str, start_seconds: float, end_seconds: float,
-        on_apply: Callable[[float, float], None],
+        self, app: tk.Tk, source_path: str, start_seconds: float, end_seconds: float,
+        on_apply: Callable[[float, float], "bool | None"],
+        apply_text: str = "Apply",
+        build_extra: Callable[[ttk.Frame], None] | None = None,
     ):
+        """`on_apply` returning False keeps the window open (e.g. a
+        caller-side validation failure); anything else closes it.
+        `build_extra`, if given, adds caller-specific widgets to a row
+        just above the buttons."""
         super().__init__(app)
         self.app = app
         self.source_path = source_path
         self.on_apply = on_apply
+        self.apply_text = apply_text
+        self.build_extra = build_extra
         self.title(f"Trim visually — {Path(source_path).name}")
         self.configure(bg=PALETTE["bg"])
         self.resizable(True, True)
@@ -4860,6 +4906,17 @@ class InteractiveTrimWindow(tk.Toplevel):
         self.play_pause_btn.pack(side="left")
         self.play_selection_btn = ttk.Button(btn_row, text="Play selection", command=self._play_selection)
         self.play_selection_btn.pack(side="left", padx=(8, 0))
+        # Mark at whatever's on screen right now (paused, or mid-playback):
+        # the natural way to find a moment is to watch for it, not to drag
+        # a handle across a two-hour filmstrip.
+        self.set_start_btn = ttk.Button(
+            btn_row, text="Set start here", command=lambda: self._set_handle_at_playhead("start"),
+        )
+        self.set_start_btn.pack(side="left", padx=(16, 0))
+        self.set_end_btn = ttk.Button(
+            btn_row, text="Set end here", command=lambda: self._set_handle_at_playhead("end"),
+        )
+        self.set_end_btn.pack(side="left", padx=(8, 0))
         if not self._audio_ok:
             for btn in (self.play_pause_btn, self.play_selection_btn):
                 Tooltip(
@@ -4869,11 +4926,18 @@ class InteractiveTrimWindow(tk.Toplevel):
                     font=self.app.ui_font,
                 )
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side="right")
-        ttk.Button(btn_row, text="Apply", style="Accent.TButton", command=self._apply).pack(side="right", padx=(0, 8))
+        ttk.Button(btn_row, text=self.apply_text, style="Accent.TButton", command=self._apply).pack(
+            side="right", padx=(0, 8)
+        )
+
+        if self.build_extra:
+            extra = ttk.Frame(outer)
+            extra.pack(side="bottom", fill="x", pady=(0, 8))
+            self.build_extra(extra)
 
         self.hint_label = ttk.Label(
             outer,
-            text="Drag handles to trim. Click one, then ←/→ to nudge (Shift for finer).",
+            text="Play or scrub to a moment, then Set start/end here. Or drag a handle; ←/→ nudges it (Shift for finer).",
             style="Muted.TLabel", wraplength=TRIM_STRIP_W, justify="left",
         )
         self.hint_label.pack(side="bottom", anchor="w", pady=(2, 8))
@@ -5043,7 +5107,7 @@ class InteractiveTrimWindow(tk.Toplevel):
             "-f", "rawvideo", "-loglevel", "error", "-",
         ]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **_NO_WINDOW)
         except OSError:
             return
         if gen != self._play_generation:
@@ -5088,7 +5152,7 @@ class InteractiveTrimWindow(tk.Toplevel):
         means silent playback; it can't take the rest of the app down."""
         cmd = ["ffplay", "-nodisp", "-loglevel", "error", *accurate_seek_input_args(self.source_path, start_t)]
         try:
-            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_NO_WINDOW)
         except OSError:
             return None
 
@@ -5125,18 +5189,21 @@ class InteractiveTrimWindow(tk.Toplevel):
         # Unset/stale timestamps from the text fields (e.g. still the
         # "00:00:00.000" default, or left over from a different file)
         # collapse to the full clip rather than a zero-length selection.
-        if self.end <= self.start or self.end > duration + 0.01:
+        full_clip = self.end <= self.start or self.end > duration + 0.01
+        if full_clip:
             self.start, self.end = 0.0, duration
         self.start = max(0.0, min(self.start, duration))
         self.end = max(self.start, min(self.end, duration))
-        self.playhead = self.end
+        # Nothing marked yet: start at the beginning, where watching for
+        # the start naturally begins. Otherwise show the existing end.
+        self.playhead = self.start if full_clip else self.end
         self.canvas.delete("loading_text")
         self._draw_handles()
         self._update_readout()
         self.seekbar.configure(to=duration)
         self.seekbar.state(["!disabled"])
         self.seekbar.set(self.playhead)
-        self._request_preview("end", self.end)
+        self._request_preview("playhead" if full_clip else "end", self.playhead)
 
     def _on_thumb(self, gen: int, index: int, strip_w: int, path: str | None):
         if gen != self._filmstrip_generation:
@@ -5330,6 +5397,22 @@ class InteractiveTrimWindow(tk.Toplevel):
         self._schedule_preview(self.active_handle)
         return "break"  # keep Tk from also treating this as focus traversal
 
+    def _set_handle_at_playhead(self, handle: str):
+        if self.duration is None:
+            return
+        t = max(0.0, min(self.playhead, self.duration))
+        if handle == "start":
+            self.start = t
+            if self.end < t:
+                self.end = self.duration
+        else:
+            self.end = t
+            if self.start > t:
+                self.start = 0.0
+        self.active_handle = handle
+        self._draw_handles()
+        self._update_readout()
+
     def _schedule_preview(self, handle: str):
         if self._preview_job:
             self.after_cancel(self._preview_job)
@@ -5407,7 +5490,8 @@ class InteractiveTrimWindow(tk.Toplevel):
         if self.duration is None:
             messagebox.showwarning("Trim visually", "Still loading — wait for the filmstrip before applying.")
             return
-        self.on_apply(self.start, self.end)
+        if self.on_apply(self.start, self.end) is False:
+            return
         self._close()
 
     def _cancel(self):

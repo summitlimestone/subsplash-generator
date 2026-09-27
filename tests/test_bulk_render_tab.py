@@ -739,3 +739,23 @@ def test_fill_bulk_entry_defaults_keeps_an_explicit_null(app):
     # rather than the "key missing entirely" one.
     entry = gui._fill_bulk_entry_defaults(app, {"recording_path": None})
     assert entry["recording_path"] is None
+
+
+def test_import_resolves_relative_paths_against_the_files_folder(app, tmp_path, monkeypatch):
+    app.vars["trim_output"].set("configured_trim.mp4")
+    folder = tmp_path / "marked"
+    folder.mkdir()
+    path = folder / "bulk_states.json"
+    path.write_text(json.dumps([{
+        "recording_path": "input\\a.mkv", "raw_begin_offset": "00:00:01.000", "raw_end_offset": "00:00:09.000",
+        "stitch": {"series": "S", "output": "output/2024-01-07.mp4"},
+    }]))
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **_k: str(path))
+
+    app._import_bulk_states()
+
+    [entry] = app.bulk_states
+    assert entry["recording_path"] == str(folder / "input" / "a.mkv")
+    assert entry["stitch"]["output"] == str(folder / "output" / "2024-01-07.mp4")
+    # Filled in from config, not from the file, so left exactly as configured.
+    assert entry["trim"]["output"] == "configured_trim.mp4"
