@@ -141,7 +141,7 @@ exists yet at its hardcoded location (see "Config reference" below).
 
 **Config window** (the main window's "Config" button): General
 (currently empty — reserved for future settings), API (the control API
-below: Enabled, Host/Port, Password), ProPresenter (connection + slide
+below: Enabled, Host/Port, Token), ProPresenter (connection + slide
 matching + Learn mode), OBS (connection), and Render (the trim/stitch
 defaults the Live tab's Trim/Stitch buttons use, same fields as
 Offline's Advanced). OK writes `config.json` and closes; Apply writes
@@ -156,28 +156,48 @@ once Trim has actually resolved — nothing live is left to do by then.
 Click Stop or press Ctrl+C to end it early instead, before that point.
 
 **Control API** (Config > API's "Enabled" checkbox): an optional HTTP
-API for marking sermon start/end and checking the current state from
-something other than this app itself — a phone or a separate control
-surface. Runs inside the GUI itself, independent of Start Watch/Stop —
-starts the moment the checkbox is ticked (or the GUI loads a config with
-it already on) and keeps running whether or not a watch session is
-currently active, listening on `api.host`/`api.port` (default
-`127.0.0.1:8765`):
+API and web control panel, for driving the Live workflow from something
+other than this app's own window — OBS itself (as a dock), a phone, or a
+separate control surface. Runs inside the GUI itself, independent of
+Start Watch/Stop — starts the moment the checkbox is ticked (or the GUI
+loads a config with it already on) and keeps running whether or not a
+watch session is currently active, listening on `api.host`/`api.port`
+(default `127.0.0.1:8765`):
 
 | Method | Path | Does |
 |---|---|---|
+| `GET` | `/` | The web control panel (see below) |
+| `POST` | `/watch/start` | Same as clicking Start Watch |
 | `POST` | `/mark/start` | Same as clicking Mark Sermon Start |
 | `POST` | `/mark/end` | Same as clicking Mark Sermon End |
-| `GET` | `/state` | State ("idle" if no watch is running), recording/begin/end-marked flags, Trim/Stitch status, render-state path |
+| `POST` | `/trim` | Same as clicking the Live tab's Trim |
+| `POST` | `/stitch` | Same as clicking Stitch, with the currently selected series (or `{"series": "name"}` to pick one first) |
+| `GET` | `/series` | The series the Live tab's dropdown offers, and which is selected |
+| `PUT` | `/series` | Select a series: `{"name": "..."}` |
+| `GET` | `/state` | State ("idle" if no watch is running), recording/begin/end-marked flags, Trim/Stitch status, render-state path — plus the status line's text/color, which of the five buttons are enabled, and the series list/selection |
 
-Marks are synchronous: `POST` returns 200 once actually applied, or 409
-if there's no active watch session or the mark doesn't apply in the
-current state (e.g. marking end before start). Interactive Swagger docs
-are served at `/swagger`. Secured with HTTP Basic Auth against
-`api.password` (any username accepted, only the password checked, since
-this is a single shared secret, not real user management); leave it
-blank to run with no authentication at all, logged loudly in the console
-pane every time the API starts that way.
+Each action is checked against the matching GUI button's own enabled
+state and then runs the exact same handler, so the API can never do
+something the button wouldn't. Actions are synchronous: `POST` returns
+200 once actually applied, or 409 if it doesn't apply right now (no
+active watch session, Trim before an end is marked, Stitch with no series
+selected, ...). Interactive Swagger docs are served at `/swagger`.
+
+**Auth**: every route requires the shared token in `api.token` (Config >
+API > Token), sent as an `Authorization: Bearer <token>` header or as
+`?token=<token>` in the URL. It's generated automatically the first time
+(including for a config that predates it, which used a Basic-auth
+`api.password` — no longer used); Regenerate replaces it, taking effect
+on Apply/OK.
+
+**OBS dock**: enable the API, click Config > API > **Copy dock URL**, then
+in OBS use Docks → Custom Browser Docks and paste it in as the URL
+(anything as the name). The panel shows the same five buttons and status
+as Mini controls plus a Series dropdown for Stitch, kept in sync with the
+GUI. It needs the GUI running with the API enabled — it's a remote
+control for this app, not a replacement for it. If an action needs a
+dialog answered in the GUI itself (e.g. a validation error), the request
+times out with 503 and the dialog waits for whoever's at the GUI.
 
 ## Subcommands
 
@@ -421,7 +441,7 @@ pane itself always shows the same output regardless).
     "enabled": false,                     // optional, default false
     "host": "127.0.0.1",                  // optional, default shown
     "port": 8765,                         // optional, default shown
-    "password": ""                        // optional, default "" (no authentication)
+    "token": "..."                        // generated automatically if missing; required on every request
   },
   "propresenter": {                       // entirely optional; leave "host" "" to run on manual marking alone
     "host": "192.168.1.50",
