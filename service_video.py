@@ -2195,6 +2195,34 @@ def _validate_bulk_entry(state: dict, mode: str) -> list[str]:
     return problems
 
 
+def _find_duplicate_bulk_outputs(states: list[dict], mode: str) -> dict[int, list[str]]:
+    """Entries whose trim/stitch output is the same file as an earlier
+    entry's, keyed by entry index. Without this, a batch where every entry
+    kept the default output name would silently overwrite one file over and
+    over. Paths with strftime placeholders are skipped, since they expand
+    to a different name per entry anyway."""
+    sections = []
+    if mode in ("trim", "full"):
+        sections.append(("trim", "body_trimmed.mp4", "Trimmed clip output path"))
+    if mode in ("stitch", "full"):
+        sections.append(("stitch", "final.mp4", "Output path"))
+    problems: dict[int, list[str]] = {}
+    for section, default, label in sections:
+        seen: dict[str, int] = {}
+        for i, state in enumerate(states):
+            output = (state.get(section) or {}).get("output") or default
+            if _STRFTIME_CODES.search(output):
+                continue
+            key = os.path.normcase(os.path.abspath(output))
+            if key in seen:
+                problems.setdefault(i, []).append(
+                    f"{label} {output!r} is the same file as entry #{seen[key] + 1}'s; each entry needs its own."
+                )
+            else:
+                seen[key] = i
+    return problems
+
+
 def bulk_render(states_path: str, mode: str) -> int:
     """Runs trim and/or stitch (mode: "trim", "stitch", or "full") against
     every render-state dict in a JSON array at `states_path` — the Bulk
@@ -2257,10 +2285,11 @@ def bulk_render(states_path: str, mode: str) -> int:
     if not states:
         sys.exit(f"{states_path!r} is empty — nothing to render.")
 
+    duplicate_problems = _find_duplicate_bulk_outputs(states, mode)
     validation_failures: list[tuple[int, list[str]]] = []
     for i, state in enumerate(states):
         print(f"[bulk-render] status entry={i + 1} state=verifying")
-        problems = _validate_bulk_entry(state, mode)
+        problems = _validate_bulk_entry(state, mode) + duplicate_problems.get(i, [])
         if problems:
             validation_failures.append((i, problems))
             print(f"[bulk-render] status entry={i + 1} state=check_console")
@@ -2310,8 +2339,14 @@ def bulk_render(states_path: str, mode: str) -> int:
                 print(f"[bulk-render] status entry={i + 1} state=stitching")
                 _stitch_from_state(state, trimmed_path)
                 print(f"[bulk-render] status entry={i + 1} state=stitched")
-        except SystemExit as e:
-            message = e.code if isinstance(e.code, str) else f"exit code {e.code}"
+        except (SystemExit, Exception) as e:
+            # Exception too, not just SystemExit: an unexpected error in one
+            # entry must not abort the batch and skip the trimmed_path
+            # write-back for every entry that already finished.
+            if isinstance(e, SystemExit):
+                message = e.code if isinstance(e.code, str) else f"exit code {e.code}"
+            else:
+                message = f"{type(e).__name__}: {e}"
             print(f"[bulk-render] entry {i + 1} FAILED: {message}", file=sys.stderr)
             print(f"[bulk-render] status entry={i + 1} state=failed_{phase}")
             failures.append((i, message))

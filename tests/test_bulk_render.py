@@ -613,3 +613,55 @@ def test_watch_live_stitch_command_updates_the_render_state_file(bulk_clips, ser
 
     saved = json.loads(state_path.read_text())
     assert saved["stitch"]["series"] == series_name
+
+
+def test_bulk_render_rejects_two_entries_writing_the_same_output(bulk_clips, series_name, tmp_path):
+    states_path = tmp_path / "states.json"
+    first = _make_state(series_name, tmp_path, 0, bulk_clips["rec1"])
+    second = _make_state(series_name, tmp_path, 1, bulk_clips["rec2"])
+    second["trim"]["output"] = first["trim"]["output"]
+    second["stitch"]["output"] = first["stitch"]["output"]
+    states_path.write_text(json.dumps([first, second]))
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "full")
+
+    message = str(exc_info.value.code)
+    assert "#2" in message and "entry #1" in message
+    assert not (tmp_path / "trim0.mp4").exists()
+
+
+def test_find_duplicate_bulk_outputs_ignores_strftime_paths_and_unused_sections(tmp_path):
+    states = [
+        {"trim": {"output": "body_%H%M%S.mp4"}, "stitch": {"output": "same.mp4"}},
+        {"trim": {"output": "body_%H%M%S.mp4"}, "stitch": {"output": "same.mp4"}},
+    ]
+    assert sv._find_duplicate_bulk_outputs(states, "trim") == {}
+    assert list(sv._find_duplicate_bulk_outputs(states, "stitch")) == [1]
+
+
+def test_bulk_render_keeps_going_after_an_unexpected_exception(bulk_clips, series_name, tmp_path, monkeypatch):
+    states_path = tmp_path / "states.json"
+    states = [
+        _make_state(series_name, tmp_path, 0, bulk_clips["rec1"]),
+        _make_state(series_name, tmp_path, 1, bulk_clips["rec2"]),
+    ]
+    states_path.write_text(json.dumps(states))
+    real_trim = sv._trim_from_state
+    calls = []
+
+    def flaky_trim(state):
+        calls.append(state)
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        return real_trim(state)
+
+    monkeypatch.setattr(sv, "_trim_from_state", flaky_trim)
+
+    with pytest.raises(SystemExit) as exc_info:
+        sv.bulk_render(str(states_path), "trim")
+
+    assert "RuntimeError: boom" in str(exc_info.value.code)
+    saved = json.loads(states_path.read_text())
+    assert saved[0]["trimmed_path"] == str(tmp_path / "trim0.mp4")
+    assert saved[1]["trimmed_path"] is None
