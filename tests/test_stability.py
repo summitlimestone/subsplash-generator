@@ -154,3 +154,41 @@ def test_process_runner_round_trips_non_ascii_output(tmp_path, monkeypatch):
         time.sleep(0.05)
     assert exited == [0]
     assert lines == ["slide: ♪ 찬양 →"]
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_config_save_does_not_restart_an_unchanged_api(app, pump):
+    pytest.importorskip("uvicorn")
+    app.vars["api_port"].set(str(_free_port()))
+    app.vars["api_enabled"].set(True)
+    server = app._api_server
+    pump(lambda: server.started, timeout=10)
+
+    assert app._write_config()
+    assert app._api_server is server
+
+    app.vars["api_port"].set(str(_free_port()))
+    assert app._write_config()
+    assert app._api_server is not server
+    app.vars["api_enabled"].set(False)
+
+
+def test_api_bind_failure_is_reported(app, pump):
+    pytest.importorskip("uvicorn")
+    import socket
+
+    with socket.socket() as blocker:
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen()
+        app.vars["api_port"].set(str(blocker.getsockname()[1]))
+        app.vars["api_enabled"].set(True)
+        pump(lambda: "control API failed to start" in app.console.get("1.0", "end"), timeout=10)
+    assert app._api_server is None
+    app.vars["api_enabled"].set(False)

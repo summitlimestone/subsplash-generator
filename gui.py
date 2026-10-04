@@ -1003,6 +1003,7 @@ class App(tk.Tk):
         # itself (or the GUI's own open/close), not with Start Watch/Stop.
         self._api_server = None
         self._api_thread: threading.Thread | None = None
+        self._api_running_settings: tuple | None = None
         # See _handle_progress_line(): whether the most recently parsed
         # line was a "[progress] step N/M" marker (or a progress field
         # following one) — while true, key=value lines get swallowed
@@ -2731,10 +2732,19 @@ class App(tk.Tk):
         host/port/password takes effect without needing an explicit
         untick-retick)."""
         if self.vars["api_enabled"].get():
+            # Every config save lands here, including Start Watch's
+            # autosave. Restarting when nothing API-related changed would
+            # drop open connections, and kill the very request that
+            # clicked Start Watch through the API.
+            if self._api_server is not None and self._api_settings() == self._api_running_settings:
+                return
             self._stop_api()  # restart-in-place if already running, picking up new host/port/password
             self._start_api()
         else:
             self._stop_api()
+
+    def _api_settings(self) -> tuple:
+        return tuple(self.vars[key].get().strip() for key in ("api_host", "api_port", "api_password"))
 
     def _start_api(self):
         try:
@@ -2753,9 +2763,23 @@ class App(tk.Tk):
             return
         app = _build_api_app(self)
         self._api_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+        self._api_running_settings = self._api_settings()
         self._api_thread = threading.Thread(target=self._api_server.run, daemon=True)
         self._api_thread.start()
+        self.after(2000, self._check_api_started, self._api_server)
         self._log(f"[gui] control API listening on http://{host}:{port} — Swagger UI: http://{host}:{port}/swagger")
+
+    def _check_api_started(self, server):
+        """uvicorn exits its thread quietly when it can't bind (port
+        already in use, bad host), so say so instead of leaving the
+        "listening" line above as the last word."""
+        if server is self._api_server and not server.started and not self._api_thread.is_alive():
+            self._log(
+                "[gui] control API failed to start — is that host/port already in use? "
+                "Check Config > API."
+            )
+            self._api_server = None
+            self._api_thread = None
 
     def _stop_api(self):
         if self._api_server is not None:
