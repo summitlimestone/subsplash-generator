@@ -329,6 +329,7 @@ def test_stitch_live_sends_the_currently_selected_series(app, monkeypatch):
     sent = []
     monkeypatch.setattr(app.runner, "send_line", lambda line: sent.append(line))
     monkeypatch.setattr(app.runner, "running", lambda: True)
+    app._current_command = "watch"
 
     app._stitch_live()
 

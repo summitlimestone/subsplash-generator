@@ -40,6 +40,7 @@ import queue
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -333,6 +334,15 @@ def parse_timestamp(value) -> float:
         total = int(hours) * 3600 + int(minutes) * 60 + int(secs) + float(frac or 0.0)
         return -total if negative else total
     raise ValueError
+
+
+def clamp_crf(value, default: int = 23) -> int:
+    """A loaded CRF as a valid slider value (0-51), tolerating a
+    hand-edited file's string or garbage value instead of crashing."""
+    try:
+        return max(0, min(51, round(float(value))))
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def to_timestamp(text: str, field: str) -> float:
@@ -732,9 +742,16 @@ class ProcessRunner:
         if args and args[0] in ("watch", "render", "stitch"):
             args = [*args, "--machine-progress"]
         cmd = [sys.executable, "-u", str(SERVICE_SCRIPT), *args]
+        # UTF-8 both ways, not the platform default: on Windows that's a
+        # legacy codepage, and the child would crash printing (say) a slide
+        # text or file path containing a character outside it.
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        # Its own process group on POSIX, so stop() can take ffmpeg
+        # children down with it (see stop()).
+        group_kwargs = {} if os.name == "nt" else {"start_new_session": True}
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, env=env, **group_kwargs,
         )
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -747,6 +764,21 @@ class ProcessRunner:
         self._on_exit(returncode)
 
     def stop(self):
+        """Kills the subprocess and everything it started. Terminating just
+        the Python process would leave a running ffmpeg orphaned, still
+        writing its output file."""
+        if not self.running():
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)], capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
         if self.running():
             self.proc.terminate()
 
@@ -841,7 +873,7 @@ def _build_api_app(app: "App"):
         decides whether this mark applies right now and, if so, actually
         sends it — the exact same decision _update_live_buttons() makes
         for the Mark Sermon Start/End buttons themselves."""
-        if not app.runner.running():
+        if not app._watch_running():
             return {"ok": False, "reason": "no active watch session"}
         if not app._live_mark_applicable(which):
             return {"ok": False, "reason": f"mark not valid in the current state ({app._live_raw_state})"}
@@ -1581,7 +1613,12 @@ class App(tk.Tk):
         except (OSError, ValueError) as e:
             messagebox.showerror("Series", f"Could not read {SERIES_PATH}: {e}")
             data = []
-        self.series = data if isinstance(data, list) else []
+        # Every series needs a name; a hand-edited entry without one would
+        # otherwise crash each dropdown that lists them.
+        self.series = [
+            s for s in (data if isinstance(data, list) else [])
+            if isinstance(s, dict) and isinstance(s.get("name"), str)
+        ]
 
     def _save_series(self):
         SERIES_PATH.write_text(json.dumps(self.series, indent=2), encoding="utf-8")
@@ -2114,8 +2151,14 @@ class App(tk.Tk):
         except (OSError, ValueError) as e:
             messagebox.showerror("Load from JSON", f"Could not read {path}: {e}")
             return
-        trim_cfg = state.get("trim", {})
-        stitch_cfg = state.get("stitch", {})
+        if not isinstance(state, dict):
+            messagebox.showerror(
+                "Load from JSON",
+                f"{path} isn't a single render-state object (a bulk states list goes on the Bulk Render tab).",
+            )
+            return
+        trim_cfg = state.get("trim") or {}
+        stitch_cfg = state.get("stitch") or {}
         # Restore by series name if the one this file last saved still
         # exists — the normal case, and _wire_series_selector()'s own
         # trace (fired by the .set() below) fills in st_intro/outro/
@@ -2144,7 +2187,7 @@ class App(tk.Tk):
         # still reflects it.
         crf_val = stitch_cfg.get("crf", trim_cfg.get("crf"))
         if crf_val is not None:
-            self.vars["st_crf"].set(max(0, min(51, round(crf_val))))
+            self.vars["st_crf"].set(clamp_crf(crf_val))
         if "fast_copy" in trim_cfg:
             self.vars["st_trim_fast_copy"].set(bool(trim_cfg["fast_copy"]))
         # Trim-only (no stitch equivalent — see _run_render()), so no
@@ -2702,9 +2745,13 @@ class App(tk.Tk):
                 "the control API won't start (pip install fastapi uvicorn)"
             )
             return
-        app = _build_api_app(self)
         host = self.vars["api_host"].get().strip() or "127.0.0.1"
-        port = to_int(self.vars["api_port"].get().strip() or "8765", "API port")
+        try:
+            port = to_int(self.vars["api_port"].get().strip() or "8765", "API port")
+        except ValueError as e:
+            self._log(f"[gui] control API not started: {e}")
+            return
+        app = _build_api_app(self)
         self._api_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
         self._api_thread = threading.Thread(target=self._api_server.run, daemon=True)
         self._api_thread.start()
@@ -2802,7 +2849,7 @@ class App(tk.Tk):
         self.vars["trim_state_output"].set(trim.get("state_output", DEFAULT_STATE_OUTPUT))
         self.vars["trim_pad_start"].set(str(trim.get("pad_start_seconds", 0)))
         self.vars["trim_pad_end"].set(str(trim.get("pad_end_seconds", 0)))
-        self.vars["trim_crf"].set(max(0, min(51, round(trim.get("crf", 23)))))
+        self.vars["trim_crf"].set(clamp_crf(trim.get("crf", 23)))
         self.vars["trim_fast_copy"].set(bool(trim.get("fast_copy", True)))
         self.vars["trim_normalize_audio"].set(bool(trim.get("normalize_audio", True)))
         self.vars["trim_normalize_target_lufs"].set(str(trim.get("normalize_target_lufs", -16.0)))
@@ -2928,6 +2975,7 @@ class App(tk.Tk):
                 # still settable by hand if that ever changes.
                 "fast_copy": False,
                 "encoder": v["encoder"].get(),
+                "encoder_preset": v["encoder_preset"].get() or None,
             },
         }
 
@@ -3060,26 +3108,44 @@ class App(tk.Tk):
         return True
 
     def _drain_queue(self):
+        # Always reschedules, and a handler error only costs that one
+        # message: an exception escaping here would otherwise stop the
+        # console (and every live button update) for the rest of the session.
         try:
             while True:
-                kind, payload = self._queue.get_nowait()
-                if kind == "line":
-                    if not self._handle_progress_line(payload):
-                        self._log(payload)
-                    if self._current_command == "learn":
-                        self._handle_learn_line(payload)
-                    elif self._current_command == "watch":
-                        self._handle_watch_line(payload)
-                    elif self._current_command == "trim":
-                        self._handle_offline_trim_line(payload)
-                    elif self._current_command and self._current_command.startswith("bulk_"):
-                        self._handle_bulk_render_line(payload)
-                elif kind == "exit":
-                    self._on_process_exit(payload)
-        except queue.Empty:
-            pass
-        self._sync_mini_live_controls()
-        self.after(50, self._drain_queue)
+                try:
+                    kind, payload = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._dispatch_queue_item(kind, payload)
+                except Exception as e:
+                    self._log(f"[gui] internal error handling process output: {type(e).__name__}: {e}")
+            self._sync_mini_live_controls()
+        finally:
+            self.after(50, self._drain_queue)
+
+    def _dispatch_queue_item(self, kind: str, payload):
+        if kind == "line":
+            if not self._handle_progress_line(payload):
+                self._log(payload)
+            if self._current_command == "learn":
+                self._handle_learn_line(payload)
+            elif self._current_command == "watch":
+                self._handle_watch_line(payload)
+            elif self._current_command == "trim":
+                self._handle_offline_trim_line(payload)
+            elif self._current_command and self._current_command.startswith("bulk_"):
+                self._handle_bulk_render_line(payload)
+        elif kind == "exit":
+            try:
+                self._on_process_exit(payload)
+            finally:
+                # Never leave the GUI stuck "running" with every Start
+                # button disabled because post-run handling failed.
+                if self._current_command is not None:
+                    self._current_command = None
+                    self._set_busy(False)
 
     def _on_process_exit(self, code: int):
         label = self._current_command or "process"
@@ -3301,6 +3367,13 @@ class App(tk.Tk):
             if which == "trim":
                 self._live_trim_resolved = True
 
+    def _watch_running(self) -> bool:
+        """Whether the running subprocess (if any) is `watch`, the only one
+        that reads trim/stitch/mark commands from stdin. Anything else
+        running means a Live click should go through the normal
+        Busy-guarded _start() path instead of being silently swallowed."""
+        return self.runner.running() and self._current_command == "watch"
+
     def _mark_sermon_start(self):
         self.runner.send_line("mark_begin")
         self._log("[gui] sent: mark sermon start")
@@ -3322,7 +3395,7 @@ class App(tk.Tk):
         # validation error) are what let _on_process_exit() keep updating
         # it here the same way _handle_trim_stitch_status() did while
         # watch() was still running.
-        if self.runner.running():
+        if self._watch_running():
             self.runner.send_line("trim")
             self._log("[gui] sent: trim")
         else:
@@ -3346,7 +3419,7 @@ class App(tk.Tk):
                 "Stitch", "Select a series first — Stitch needs one to know which intro/outro to use.",
             )
             return
-        if self.runner.running():
+        if self._watch_running():
             # Sends whatever's *currently* selected, not whatever this
             # watch() run started with — see watch()'s own 'stitch'
             # manual-command handling (service_video.py), which records
@@ -4011,6 +4084,18 @@ def _fill_bulk_entry_defaults(app: "App", entry: dict) -> dict:
     return merged
 
 
+def _display_timestamp(value) -> str:
+    """A stored offset as HH:MM:SS.mmm for an editable field. A missing or
+    unparseable one shows as zero rather than failing to open the editor,
+    where it can then be fixed."""
+    if value is None:
+        return "00:00:00.000"
+    try:
+        return format_timestamp(parse_timestamp(value))
+    except ValueError:
+        return "00:00:00.000"
+
+
 class BulkEntryEditWindow(tk.Toplevel):
     """Edit form for one Bulk Render entry (see App._build_bulk_render_tab()) —
     a fresh instance every time (like SeriesEditWindow), since it's
@@ -4236,16 +4321,10 @@ class BulkEntryEditWindow(tk.Toplevel):
         self.recording_var.set(state.get("recording_path") or "")
         self.trimmed_var.set(state.get("trimmed_path") or "")
         self.output_var.set(stitch_cfg.get("output") or "final.mp4")
-        self.start_var.set(
-            format_timestamp(parse_timestamp(state["raw_begin_offset"]))
-            if state.get("raw_begin_offset") is not None else "00:00:00.000"
-        )
-        self.end_var.set(
-            format_timestamp(parse_timestamp(state["raw_end_offset"]))
-            if state.get("raw_end_offset") is not None else "00:00:00.000"
-        )
+        self.start_var.set(_display_timestamp(state.get("raw_begin_offset")))
+        self.end_var.set(_display_timestamp(state.get("raw_end_offset")))
         crf_default = stitch_cfg.get("crf", trim_cfg.get("crf", 23))
-        self.crf_var.set(max(0, min(51, round(crf_default))))
+        self.crf_var.set(clamp_crf(crf_default))
         self.subsplash_preset_var.set(bool(stitch_cfg.get("subsplash_preset", False)))
         self.fast_copy_var.set(bool(trim_cfg.get("fast_copy", True)))
         self.normalize_audio_var.set(bool(trim_cfg.get("normalize_audio", True)))
@@ -4269,6 +4348,9 @@ class BulkEntryEditWindow(tk.Toplevel):
             state = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as e:
             messagebox.showerror("Load from JSON", f"Could not read {path}: {e}")
+            return
+        if not isinstance(state, dict):
+            messagebox.showerror("Load from JSON", f"{path} isn't a single render-state object.")
             return
         self._load_state_into_fields(state)
 
