@@ -1067,7 +1067,7 @@ class App(tk.Tk):
         self._open_log_file()
 
         if not CONFIG_PATH.is_file():
-            CONFIG_PATH.write_text(json.dumps(default_config(), indent=2))
+            CONFIG_PATH.write_text(json.dumps(default_config(), indent=2), encoding="utf-8")
             self._log(
                 f"[gui] no config.json found — created a starter one at "
                 f"{CONFIG_PATH} with sensible defaults. Open Config and fill "
@@ -1575,16 +1575,16 @@ class App(tk.Tk):
 
     def _load_series(self):
         if not SERIES_PATH.is_file():
-            SERIES_PATH.write_text(json.dumps([], indent=2))
+            SERIES_PATH.write_text(json.dumps([], indent=2), encoding="utf-8")
         try:
-            data = json.loads(SERIES_PATH.read_text())
-        except (OSError, json.JSONDecodeError) as e:
+            data = json.loads(SERIES_PATH.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
             messagebox.showerror("Series", f"Could not read {SERIES_PATH}: {e}")
             data = []
         self.series = data if isinstance(data, list) else []
 
     def _save_series(self):
-        SERIES_PATH.write_text(json.dumps(self.series, indent=2))
+        SERIES_PATH.write_text(json.dumps(self.series, indent=2), encoding="utf-8")
 
     def _series_names(self, include_hidden: bool = False) -> list[str]:
         """Visible (non-hidden) series names by default — what a Series
@@ -2110,8 +2110,8 @@ class App(tk.Tk):
 
     def _load_render_state_json(self, path: str):
         try:
-            state = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError) as e:
+            state = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
             messagebox.showerror("Load from JSON", f"Could not read {path}: {e}")
             return
         trim_cfg = state.get("trim", {})
@@ -2424,8 +2424,8 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError) as e:
+            data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
             messagebox.showerror("Import", f"Could not read {path}: {e}")
             return
         if not (isinstance(data, list) and all(isinstance(s, dict) for s in data)):
@@ -2450,7 +2450,7 @@ class App(tk.Tk):
         )
         if not path:
             return
-        Path(path).write_text(json.dumps(self.bulk_states, indent=2))
+        Path(path).write_text(json.dumps(self.bulk_states, indent=2), encoding="utf-8")
         self._bulk_states_path = path
         self._log(f"[gui] exported {len(self.bulk_states)} bulk render entries -> {path}")
 
@@ -2766,9 +2766,9 @@ class App(tk.Tk):
             messagebox.showerror("Load config", f"File not found: {CONFIG_PATH}")
             return
         try:
-            cfg = json.loads(CONFIG_PATH.read_text())
-        except json.JSONDecodeError as e:
-            messagebox.showerror("Load config", f"Invalid JSON: {e}")
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Load config", f"Could not read {CONFIG_PATH}: {e}")
             return
 
         api = cfg.get("api", {})
@@ -2944,7 +2944,7 @@ class App(tk.Tk):
         except ValueError as e:
             messagebox.showerror("Config error", str(e))
             return False
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         self._sync_api_to_config()
         self._last_saved_config = cfg
         self._log(f"[gui] saved config -> {CONFIG_PATH}")
@@ -3108,8 +3108,8 @@ class App(tk.Tk):
             # every row back to blank right after finishing.
             if self._bulk_run_temp_path:
                 try:
-                    self.bulk_states = json.loads(Path(self._bulk_run_temp_path).read_text())
-                except (OSError, json.JSONDecodeError) as e:
+                    self.bulk_states = json.loads(Path(self._bulk_run_temp_path).read_text(encoding="utf-8-sig"))
+                except (OSError, ValueError) as e:
                     self._log(f"[gui] could not re-read bulk render results: {e}")
                 Path(self._bulk_run_temp_path).unlink(missing_ok=True)
                 self._bulk_run_temp_path = None
@@ -3374,12 +3374,12 @@ class App(tk.Tk):
             state_path = self.render_state_var.get().strip()
             if state_path:
                 try:
-                    state = json.loads(Path(state_path).read_text())
+                    state = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
                     stitch_cfg = state.setdefault("stitch", {})
                     stitch_cfg["series"] = series
                     stitch_cfg["output"] = output
-                    Path(state_path).write_text(json.dumps(state, indent=2))
-                except (OSError, json.JSONDecodeError) as e:
+                    Path(state_path).write_text(json.dumps(state, indent=2), encoding="utf-8")
+                except (OSError, ValueError) as e:
                     self._log(f"[gui] could not update render-state file's series: {e}")
             self._run_stitch()
             if self.runner.running():
@@ -3621,7 +3621,7 @@ class App(tk.Tk):
         )
         if not path:
             return
-        Path(path).write_text(json.dumps(render_state, indent=2))
+        Path(path).write_text(json.dumps(render_state, indent=2), encoding="utf-8")
         self._log(f"[gui] exported render-state JSON -> {path}")
 
     def _on_close(self):
@@ -4266,8 +4266,8 @@ class BulkEntryEditWindow(tk.Toplevel):
         if not path:
             return
         try:
-            state = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError) as e:
+            state = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
             messagebox.showerror("Load from JSON", f"Could not read {path}: {e}")
             return
         self._load_state_into_fields(state)
@@ -4365,7 +4365,7 @@ class BulkEntryEditWindow(tk.Toplevel):
         )
         if not path:
             return
-        Path(path).write_text(json.dumps(state, indent=2))
+        Path(path).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 class BulkEditWindow(tk.Toplevel):

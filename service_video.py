@@ -210,6 +210,16 @@ def _render_step_total(trim_cfg: dict, stitch_cfg: dict) -> int:
 # Crossfade stitching (intro + body + outro -> one video)
 # --------------------------------------------------------------------------
 
+def _parse_frame_rate(value: str | None) -> float | None:
+    """ffprobe's "30000/1001"-style rate as a float, or None for a
+    missing/zero/malformed one (e.g. "0/0")."""
+    try:
+        fps = float(Fraction(value))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return fps if fps > 0 else None
+
+
 def probe(path: str) -> dict:
     """Return duration, width, height, fps, video codec, and whether an
     audio stream exists for a media file, via ffprobe.
@@ -242,7 +252,7 @@ def probe(path: str) -> dict:
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-show_entries", "stream=width,height,r_frame_rate,codec_type,codec_name",
+        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,codec_type,codec_name",
         "-of", "json",
         path,
     ]
@@ -254,17 +264,21 @@ def probe(path: str) -> dict:
         sys.exit(f"ffprobe failed on {path!r}:\n{result.stderr}")
 
     data = json.loads(result.stdout)
-    duration_raw = data["format"].get("duration")
+    duration_raw = data.get("format", {}).get("duration")
     duration = float(duration_raw) if duration_raw is not None else None
 
     video_stream = next(
-        (s for s in data["streams"] if s.get("codec_type") == "video"), None
+        (s for s in data.get("streams", []) if s.get("codec_type") == "video"), None
     )
     if video_stream is None:
         sys.exit(f"{path!r} has no video stream.")
 
-    has_audio = any(s.get("codec_type") == "audio" for s in data["streams"])
-    fps = float(Fraction(video_stream["r_frame_rate"]))
+    has_audio = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
+    # avg_frame_rate only as a fallback for a stream that declares no
+    # nominal rate at all (r_frame_rate "0/0").
+    fps = _parse_frame_rate(video_stream.get("r_frame_rate")) or _parse_frame_rate(video_stream.get("avg_frame_rate"))
+    if not fps:
+        sys.exit(f"Could not determine {path!r}'s frame rate.")
 
     return {
         "duration": duration,
@@ -633,7 +647,7 @@ def _run_concat(parts: list[Path], output: str, faststart: bool = False, verify_
     the same way a failed ffmpeg call raises CalledProcessError, so
     callers can catch both the same way and fall back."""
     list_path = Path(output).with_name(f".{Path(output).stem}.concat.txt")
-    list_path.write_text("".join(f"file {_concat_list_entry(p)}\n" for p in parts))
+    list_path.write_text("".join(f"file {_concat_list_entry(p)}\n" for p in parts), encoding="utf-8")
     try:
         cmd = ["ffmpeg", "-y", "-nostdin", *_ffmpeg_output_args(), "-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy"]
         if faststart:
@@ -1225,6 +1239,8 @@ def stitch(
         clips.append({"duration": duration, "width": dims["width"], "height": dims["height"], "has_audio": False})
 
     for name, clip in zip(("intro", "main", "outro"), clips):
+        if clip["duration"] is None:
+            sys.exit(f"Could not read the {name} clip's duration (is the file complete?).")
         if clip["duration"] <= transition_duration:
             sys.exit(
                 f"{name} clip is only {clip['duration']:.2f}s, which is too short "
@@ -1891,10 +1907,10 @@ def resolve_series(name: str) -> dict:
     if not name:
         sys.exit("No series selected — Stitch needs one to know which intro/outro to use.")
     try:
-        series = json.loads(SERIES_PATH.read_text())
+        series = json.loads(SERIES_PATH.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         sys.exit(f"No series.json found at {SERIES_PATH} — set up a series in the GUI's Series Manager tab first.")
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
         sys.exit(f"Could not read {SERIES_PATH} for series {name!r}: {e}")
     for s in series:
         if s.get("name") == name:
@@ -2233,8 +2249,8 @@ def bulk_render(states_path: str, mode: str) -> int:
     BULK_ENTRY_STATUS_RE/BULK_STATUS_DISPLAY in gui.py), so a long list
     doesn't just sit there indefinitely while every entry gets probed."""
     try:
-        states = json.loads(Path(states_path).read_text())
-    except (OSError, json.JSONDecodeError) as e:
+        states = json.loads(Path(states_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
         sys.exit(f"Could not read {states_path!r} as JSON: {e}")
     if not isinstance(states, list) or not all(isinstance(s, dict) for s in states):
         sys.exit(f"{states_path!r} must contain a JSON array of render-state objects.")
@@ -2301,7 +2317,7 @@ def bulk_render(states_path: str, mode: str) -> int:
             failures.append((i, message))
 
     if mode in ("trim", "full"):
-        Path(states_path).write_text(json.dumps(states, indent=2))
+        Path(states_path).write_text(json.dumps(states, indent=2), encoding="utf-8")
 
     succeeded = len(states) - len(failures)
     print(f"\n[bulk-render] {succeeded}/{len(states)} entries succeeded")
@@ -2349,7 +2365,7 @@ def _write_render_state(
         "trim": trim_cfg,
         "stitch": stitch_cfg,
     }
-    state_path.write_text(json.dumps(render_state, indent=2))
+    state_path.write_text(json.dumps(render_state, indent=2), encoding="utf-8")
     print(f"[watcher] wrote render state -> {state_path}")
     print(f"[watcher] to redo just the trim/stitch later (no OBS/ProPresenter needed): python {Path(__file__).name} render {state_path}")
     return render_state
@@ -2378,10 +2394,18 @@ def find_active_recording_file(directory: str, max_age_seconds: float = 120.0) -
         candidates = [p for p in Path(directory).iterdir() if p.suffix.lower() in RECORDING_EXTENSIONS]
     except OSError:
         return None
-    if not candidates:
+    # A file can vanish between iterdir() and stat() (OBS remuxing,
+    # someone tidying the folder), so stat each one defensively.
+    mtimes = []
+    for p in candidates:
+        try:
+            mtimes.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    if not mtimes:
         return None
-    newest = max(candidates, key=lambda p: p.stat().st_mtime)
-    if time.time() - newest.stat().st_mtime > max_age_seconds:
+    newest_mtime, newest = max(mtimes)
+    if time.time() - newest_mtime > max_age_seconds:
         return None
     return str(newest)
 
@@ -2893,7 +2917,12 @@ def main():
         return
 
     if args.command == "render":
-        state = json.loads(Path(args.state_json).read_text())
+        try:
+            state = json.loads(Path(args.state_json).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
+            sys.exit(f"Could not read {args.state_json!r} as JSON: {e}")
+        if not isinstance(state, dict):
+            sys.exit(f"{args.state_json!r} must contain a single render-state JSON object.")
         render(state)
         return
 
@@ -2904,7 +2933,10 @@ def main():
     cfg_path = Path(args.config)
     if not cfg_path.is_file():
         sys.exit(f"Config file not found: {cfg_path}. Copy config.example.json and edit it.")
-    cfg = json.loads(cfg_path.read_text())
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        sys.exit(f"Could not read config file {cfg_path}: {e}")
     # ProPresenter is optional for 'watch' (see watch()'s docstring-level
     # comment on start_propresenter_thread) — but 'learn' exists solely to
     # observe ProPresenter's own slide feed, so it still needs a host.
